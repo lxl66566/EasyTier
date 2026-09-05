@@ -1,10 +1,9 @@
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::cell::UnsafeCell;
 use std::fmt;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
 };
 use std::time::Duration;
 use tokio_util::task::AbortOnDropHandle;
@@ -481,92 +480,10 @@ impl Default for LabelSet {
     }
 }
 
-/// UnsafeCounter provides a high-performance counter using UnsafeCell
-#[derive(Debug)]
-pub struct UnsafeCounter {
-    value: UnsafeCell<u64>,
-}
-
-impl Default for UnsafeCounter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl UnsafeCounter {
-    pub fn new() -> Self {
-        Self {
-            value: UnsafeCell::new(0),
-        }
-    }
-
-    pub fn new_with_value(initial: u64) -> Self {
-        Self {
-            value: UnsafeCell::new(initial),
-        }
-    }
-
-    /// Increment the counter by the given amount
-    /// # Safety
-    /// This method is unsafe because it uses UnsafeCell. The caller must ensure
-    /// that no other thread is accessing this counter simultaneously.
-    pub unsafe fn add(&self, delta: u64) {
-        let ptr = self.value.get();
-        unsafe {
-            *ptr = (*ptr).saturating_add(delta);
-        }
-    }
-
-    /// Increment the counter by 1
-    /// # Safety
-    /// This method is unsafe because it uses UnsafeCell. The caller must ensure
-    /// that no other thread is accessing this counter simultaneously.
-    pub unsafe fn inc(&self) {
-        unsafe {
-            self.add(1);
-        }
-    }
-
-    /// Get the current value of the counter
-    /// # Safety
-    /// This method is unsafe because it uses UnsafeCell. The caller must ensure
-    /// that no other thread is modifying this counter simultaneously.
-    pub unsafe fn get(&self) -> u64 {
-        let ptr = self.value.get();
-        unsafe { *ptr }
-    }
-
-    /// Reset the counter to zero
-    /// # Safety
-    /// This method is unsafe because it uses UnsafeCell. The caller must ensure
-    /// that no other thread is accessing this counter simultaneously.
-    pub unsafe fn reset(&self) {
-        let ptr = self.value.get();
-        unsafe {
-            *ptr = 0;
-        }
-    }
-
-    /// Set the counter to a specific value
-    /// # Safety
-    /// This method is unsafe because it uses UnsafeCell. The caller must ensure
-    /// that no other thread is accessing this counter simultaneously.
-    pub unsafe fn set(&self, value: u64) {
-        let ptr = self.value.get();
-        unsafe {
-            *ptr = value;
-        }
-    }
-}
-
-// UnsafeCounter is Send + Sync because the safety is guaranteed by the caller
-unsafe impl Send for UnsafeCounter {}
-unsafe impl Sync for UnsafeCounter {}
-
 /// MetricData contains both the counter and its last active cleanup epoch.
 #[derive(Debug)]
 struct MetricData {
-    counter: UnsafeCounter,
+    counter: AtomicU64,
     activity_epoch: Arc<AtomicU32>,
     last_updated_epoch: AtomicU32,
 }
@@ -575,7 +492,7 @@ impl MetricData {
     fn new(activity_epoch: Arc<AtomicU32>) -> Self {
         let last_updated_epoch = activity_epoch.load(Ordering::Relaxed);
         Self {
-            counter: UnsafeCounter::new(),
+            counter: AtomicU64::new(0),
             activity_epoch,
             last_updated_epoch: AtomicU32::new(last_updated_epoch),
         }
@@ -601,10 +518,6 @@ fn cleanup_metrics(counters: &DashMap<MetricKey, Arc<MetricData>>, current_epoch
     counters.shrink_to_fit();
 }
 
-// MetricData is Send + Sync because the safety is guaranteed by the caller
-unsafe impl Send for MetricData {}
-unsafe impl Sync for MetricData {}
-
 /// MetricKey uniquely identifies a metric with its name and labels
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MetricKey {
@@ -629,8 +542,8 @@ impl fmt::Display for MetricKey {
     }
 }
 
-/// CounterHandle provides a safe interface to a MetricData
-/// It ensures thread-local access patterns for performance
+/// CounterHandle is a cheap Clone handle to a shared MetricData; clones may be
+/// used concurrently from different threads / tasks.
 #[derive(Clone)]
 pub struct CounterHandle {
     metric_data: Arc<MetricData>,
@@ -647,38 +560,29 @@ impl CounterHandle {
 
     /// Increment the counter by the given amount
     pub fn add(&self, delta: u64) {
-        unsafe {
-            self.metric_data.counter.add(delta);
-        }
+        self.metric_data.counter.fetch_add(delta, Ordering::Relaxed);
         self.metric_data.touch();
     }
 
     /// Increment the counter by 1
     pub fn inc(&self) {
-        unsafe {
-            self.metric_data.counter.inc();
-        }
-        self.metric_data.touch();
+        self.add(1);
     }
 
     /// Get the current value of the counter
     pub fn get(&self) -> u64 {
-        unsafe { self.metric_data.counter.get() }
+        self.metric_data.counter.load(Ordering::Relaxed)
     }
 
     /// Reset the counter to zero
     pub fn reset(&self) {
-        unsafe {
-            self.metric_data.counter.reset();
-        }
+        self.metric_data.counter.store(0, Ordering::Relaxed);
         self.metric_data.touch();
     }
 
     /// Set the counter to a specific value
     pub fn set(&self, value: u64) {
-        unsafe {
-            self.metric_data.counter.set(value);
-        }
+        self.metric_data.counter.store(value, Ordering::Relaxed);
         self.metric_data.touch();
     }
 }
@@ -775,7 +679,7 @@ impl StatsManager {
             let key = entry.key();
             let metric_data = entry.value();
 
-            let value = unsafe { metric_data.counter.get() };
+            let value = metric_data.counter.load(Ordering::Relaxed);
 
             metrics.push(MetricSnapshot {
                 name: key.name,
@@ -1021,7 +925,7 @@ mod tests {
             let key = MetricKey::new(name, labels.clone());
 
             if let Some(metric_data) = self.counters.get(&key) {
-                let value = unsafe { metric_data.counter.get() };
+                let value = metric_data.counter.load(Ordering::Relaxed);
                 Some(MetricSnapshot {
                     name,
                     labels: labels.clone(),
@@ -1117,23 +1021,6 @@ mod tests {
             instance_labels.to_key(),
             "from_instance_id=9b7d4368-b688-4897-a1f4-b6caaed9e8a6,network_name=default,to_instance_id=87ede5a2-9c3d-492d-9bbe-989b9d07e742"
         );
-    }
-
-    #[tokio::test]
-    async fn test_unsafe_counter() {
-        let counter = UnsafeCounter::new();
-
-        unsafe {
-            assert_eq!(counter.get(), 0);
-            counter.inc();
-            assert_eq!(counter.get(), 1);
-            counter.add(5);
-            assert_eq!(counter.get(), 6);
-            counter.set(10);
-            assert_eq!(counter.get(), 10);
-            counter.reset();
-            assert_eq!(counter.get(), 0);
-        }
     }
 
     #[tokio::test]
