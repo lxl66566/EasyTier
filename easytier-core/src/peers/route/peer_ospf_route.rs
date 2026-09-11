@@ -1374,26 +1374,30 @@ impl SyncedRouteInfo {
         peer_infos: &[RoutePeerInfo],
         raw_peer_infos: &[RawRoutePeerInfo],
     ) -> Result<(), Error> {
-        let mut need_inc_version = false;
-        for (idx, route_info) in peer_infos.iter().enumerate() {
-            let mut route_info = route_info.clone();
-            let raw_route_info = &raw_peer_infos[idx];
+        // validate the whole batch
+        let dst_peer_route_id = self
+            .peer_infos
+            .read()
+            .get(&dst_peer_id)
+            .map(|x| x.peer_route_id);
+        for route_info in peer_infos.iter() {
             self.check_duplicate_peer_id(
                 my_peer_id,
                 my_peer_route_id,
                 dst_peer_id,
                 if route_info.peer_id == dst_peer_id {
-                    self.peer_infos
-                        .read()
-                        .get(&dst_peer_id)
-                        .map(|x| x.peer_route_id)
+                    dst_peer_route_id
                 } else {
                     None
                 },
-                &route_info,
+                route_info,
             )?;
+        }
 
-            let mut guard = self.peer_infos.write();
+        let mut need_inc_version = false;
+        let mut guard = self.peer_infos.write();
+        for (idx, route_info) in peer_infos.iter().enumerate() {
+            let mut route_info = route_info.clone();
             // time between peers may not be synchronized, so update last_update to local now.
             // note only last_update with larger version will be updated to local saved peer info.
             route_info.last_update = Some(Timestamp::now());
@@ -1402,11 +1406,12 @@ impl SyncedRouteInfo {
                 .is_none_or(|old| route_info.version > old.version)
             {
                 self.raw_peer_infos
-                    .insert(route_info.peer_id, raw_route_info.clone());
+                    .insert(route_info.peer_id, raw_peer_infos[idx].clone());
                 guard.insert(route_info.peer_id, route_info);
                 need_inc_version = true;
             }
         }
+        drop(guard);
         if need_inc_version {
             self.version.inc();
         }
@@ -5624,6 +5629,46 @@ mod tests {
         );
 
         assert_eq!(ret.unwrap_err(), Error::DuplicatePeerId);
+    }
+
+    #[test]
+    fn duplicate_peer_id_rejects_whole_batch_atomically() {
+        let service_impl = test_service_impl(1);
+        let version_before = service_impl.synced_route_info.version.get();
+        // a valid info followed by a fabricated duplicate of our own peer id:
+        // nothing from the batch may be applied.
+        let valid_info = RoutePeerInfo {
+            peer_id: 3,
+            version: 1,
+            peer_route_id: 30,
+            ..Default::default()
+        };
+        let duplicate_info = RoutePeerInfo {
+            peer_id: 1,
+            version: 100,
+            peer_route_id: service_impl.my_peer_route_id + 1,
+            ..Default::default()
+        };
+        let infos = vec![valid_info.clone(), duplicate_info.clone()];
+
+        let ret = service_impl.synced_route_info.update_peer_infos(
+            1,
+            service_impl.my_peer_route_id,
+            2,
+            &infos,
+            &infos.iter().map(raw_route_peer_info).collect::<Vec<_>>(),
+        );
+
+        assert_eq!(ret.unwrap_err(), Error::DuplicatePeerId);
+        assert!(
+            !service_impl
+                .synced_route_info
+                .peer_infos
+                .read()
+                .contains_key(&3)
+        );
+        assert!(service_impl.synced_route_info.raw_peer_infos.is_empty());
+        assert_eq!(service_impl.synced_route_info.version.get(), version_before);
     }
 
     #[tokio::test]
