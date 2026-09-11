@@ -1340,10 +1340,15 @@ impl SyncedRouteInfo {
             if info.peer_route_id != my_peer_route_id
                 && info.version > self.get_peer_info_version_with_default(info.peer_id)
             {
-                // if dst peer send to us with higher version info of my peer, our peer id is duplicated
-                // TODO: handle this better. restart peer manager?
-                panic!("my peer id is duplicated");
-                // return Err(Error::DuplicatePeerId);
+                // if dst peer send to us with higher version info of my peer, our peer id is duplicated.
+                // any peer can fabricate such an info, so reject the sync instead of aborting.
+                tracing::error!(
+                    ?my_peer_id,
+                    peer_route_id = info.peer_route_id,
+                    version = info.version,
+                    "my peer id is duplicated with remote peer"
+                );
+                return Err(Error::DuplicatePeerId);
             }
         } else if info.peer_id == dst_peer_id {
             let Some(dst_peer_route_id) = dst_peer_route_id else {
@@ -3489,9 +3494,16 @@ impl PeerRouteServiceImpl {
                             "stale non-initiator route sync rejected"
                         );
                     } else if err == Error::DuplicatePeerId as i32 {
-                        if !self.context.feature_flags().is_public_server {
-                            panic!("duplicate peer id");
-                        }
+                        // any peer can fabricate this error code to abort us,
+                        // so treat it as a normal sync failure instead.
+                        tracing::error!(
+                            ?my_peer_id,
+                            ?dst_peer_id,
+                            "sync_route_info failed: reported as duplicate peer id"
+                        );
+                        session
+                            .need_sync_initiator_info
+                            .store(true, Ordering::Relaxed);
                     } else {
                         tracing::error!(?ret, ?my_peer_id, ?dst_peer_id, "sync_route_info failed");
                         session
@@ -5589,6 +5601,29 @@ mod tests {
             7
         );
         assert_eq!(session.dst_saved_foreign_network_versions.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_my_peer_id_in_peer_infos_is_rejected() {
+        let service_impl = test_service_impl(1);
+        // a remote peer claims a higher version of our own peer id with a
+        // different route id; this must be rejected instead of panicking.
+        let info = RoutePeerInfo {
+            peer_id: 1,
+            version: 100,
+            peer_route_id: service_impl.my_peer_route_id + 1,
+            ..Default::default()
+        };
+
+        let ret = service_impl.synced_route_info.update_peer_infos(
+            1,
+            service_impl.my_peer_route_id,
+            2,
+            std::slice::from_ref(&info),
+            &[raw_route_peer_info(&info)],
+        );
+
+        assert_eq!(ret.unwrap_err(), Error::DuplicatePeerId);
     }
 
     #[tokio::test]
