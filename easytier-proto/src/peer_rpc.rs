@@ -223,11 +223,19 @@ impl From<RoutePeerInfo> for crate::api::instance::Route {
 }
 
 impl RouteConnBitmap {
+    // the bitmap encodes a peer_ids.len() x peer_ids.len() adjacency matrix.
+    pub fn required_bitmap_len(peer_count: usize) -> usize {
+        (peer_count * peer_count).div_ceil(8)
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.bitmap.len() >= Self::required_bitmap_len(self.peer_ids.len())
+    }
+
     pub fn get_bit(&self, idx: usize) -> bool {
-        let byte_idx = idx / 8;
-        let bit_idx = idx % 8;
-        let byte = self.bitmap[byte_idx];
-        (byte >> bit_idx) & 1 == 1
+        self.bitmap
+            .get(idx / 8)
+            .is_some_and(|&byte| (byte >> (idx % 8)) & 1 == 1)
     }
 
     pub fn get_connected_peers(&self, peer_idx: usize) -> BTreeSet<PeerId> {
@@ -244,6 +252,50 @@ impl RouteConnBitmap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conn_bitmap_out_of_range_bit_reads_false() {
+        let conn_bitmap = RouteConnBitmap {
+            bitmap: vec![],
+            peer_ids: vec![PeerIdVersion {
+                peer_id: 1,
+                version: 1,
+            }],
+        };
+        assert!(!conn_bitmap.is_valid());
+        assert!(!conn_bitmap.get_bit(0));
+        assert!(!conn_bitmap.get_connected_peers(0).contains(&1));
+    }
+
+    #[test]
+    fn conn_bitmap_is_valid_requires_full_matrix_bytes() {
+        let peer_ids = vec![
+            PeerIdVersion {
+                peer_id: 1,
+                version: 1,
+            },
+            PeerIdVersion {
+                peer_id: 2,
+                version: 1,
+            },
+        ];
+        assert_eq!(RouteConnBitmap::required_bitmap_len(2), 1);
+        assert_eq!(RouteConnBitmap::required_bitmap_len(3), 2);
+        assert!(
+            RouteConnBitmap {
+                bitmap: vec![0; 1],
+                peer_ids: peer_ids.clone()
+            }
+            .is_valid()
+        );
+        assert!(
+            !RouteConnBitmap {
+                bitmap: vec![],
+                peer_ids
+            }
+            .is_valid()
+        );
+    }
 
     #[test]
     fn test_peer_group_info_new() {

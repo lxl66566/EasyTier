@@ -1433,6 +1433,15 @@ impl SyncedRouteInfo {
     }
 
     fn update_conn_info_with_bitmap(&self, conn_bitmap: &RouteConnBitmap) {
+        if !conn_bitmap.is_valid() {
+            tracing::warn!(
+                bitmap_len = conn_bitmap.bitmap.len(),
+                expected_len = RouteConnBitmap::required_bitmap_len(conn_bitmap.peer_ids.len()),
+                "ignore malformed conn bitmap"
+            );
+            return;
+        }
+
         self.fill_empty_peer_info(&conn_bitmap.peer_ids.iter().map(|x| x.peer_id).collect());
 
         let mut need_inc_version = false;
@@ -2176,13 +2185,17 @@ impl SyncRouteSession {
         dst_peer_id: PeerId,
     ) {
         for item in foreign_network.infos.iter() {
-            if item.key.as_ref().unwrap().peer_id == dst_peer_id {
+            let (Some(key), Some(value)) = (&item.key, &item.value) else {
+                continue;
+            };
+            if key.peer_id == dst_peer_id {
                 continue;
             }
+
             self.dst_saved_foreign_network_versions
-                .entry(item.key.clone().unwrap())
+                .entry(key.clone())
                 .or_default()
-                .set_if_larger(item.value.as_ref().unwrap().version);
+                .set_if_larger(value.version);
         }
     }
 
@@ -2924,7 +2937,7 @@ impl PeerRouteServiceImpl {
         }
 
         let mut conn_bitmap = RouteConnBitmap {
-            bitmap: vec![0; (all_peer_ids.len() * all_peer_ids.len()).div_ceil(8)],
+            bitmap: vec![0; RouteConnBitmap::required_bitmap_len(all_peer_ids.len())],
             peer_ids: all_peer_ids
                 .iter()
                 .map(|x| PeerIdVersion {
@@ -5498,6 +5511,84 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn malformed_conn_bitmap_is_ignored() {
+        let service_impl = test_service_impl(2);
+        let conn_bitmap = RouteConnBitmap {
+            bitmap: vec![],
+            peer_ids: vec![PeerIdVersion {
+                peer_id: 1,
+                version: 1,
+            }],
+        };
+
+        service_impl
+            .synced_route_info
+            .update_conn_info_with_bitmap(&conn_bitmap);
+
+        assert_eq!(service_impl.synced_route_info.version.get(), 0);
+        assert!(
+            service_impl
+                .synced_route_info
+                .get_connected_peers::<BTreeSet<_>>(1)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn update_dst_saved_foreign_network_version_skips_absent_fields() {
+        let session = SyncRouteSession::new(1, 2);
+        let key = ForeignNetworkRouteInfoKey {
+            peer_id: 3,
+            network_name: "net".to_string(),
+        };
+        let foreign_network = RouteForeignNetworkInfos {
+            infos: vec![
+                route_foreign_network_infos::Info::default(),
+                route_foreign_network_infos::Info {
+                    key: Some(key.clone()),
+                    value: None,
+                },
+                route_foreign_network_infos::Info {
+                    key: None,
+                    value: Some(ForeignNetworkRouteInfoEntry {
+                        version: 3,
+                        ..Default::default()
+                    }),
+                },
+                route_foreign_network_infos::Info {
+                    key: Some(ForeignNetworkRouteInfoKey {
+                        peer_id: 2,
+                        network_name: "net".to_string(),
+                    }),
+                    value: Some(ForeignNetworkRouteInfoEntry {
+                        version: 5,
+                        ..Default::default()
+                    }),
+                },
+                route_foreign_network_infos::Info {
+                    key: Some(key.clone()),
+                    value: Some(ForeignNetworkRouteInfoEntry {
+                        version: 7,
+                        ..Default::default()
+                    }),
+                },
+            ],
+        };
+
+        session.update_dst_saved_foreign_network_version(&foreign_network, 2);
+
+        assert_eq!(
+            session
+                .dst_saved_foreign_network_versions
+                .get(&key)
+                .unwrap()
+                .get(),
+            7
+        );
+        assert_eq!(session.dst_saved_foreign_network_versions.len(), 1);
     }
 
     #[tokio::test]
