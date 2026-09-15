@@ -27,6 +27,7 @@ use crate::{
         conn::peer_conn::PeerConnId,
         peer_manager::{PeerManagerCore, PortablePeerManagerConfig, RouteAlgoType},
         public_ipv6::CorePublicIpv6Runtime,
+        virtual_ip::special_ipv4_range_conflict,
     },
     tunnel::ring::create_ring_tunnel_pair,
 };
@@ -215,14 +216,26 @@ impl AttachedPeerRuntime {
             None,
             Arc::new(()),
         )?);
-        if let Err(error) = peer_manager
-            .follow_network_policy(network_runtime_config, config.groups)
-            .await
+        let attached_peer_id = peer_manager.my_peer_id();
+        // Reserve the prefix before any connection is established so a
+        // rejected candidate never enters routing. Every failure path below
+        // must release the reservation again.
+        if let Err(error) =
+            network_peer_manager.register_attached_peer_prefix(attached_peer_id, config.virtual_ip)
         {
             peer_manager.clear_resources().await;
             return Err(error);
         }
+        if let Err(error) = peer_manager
+            .follow_network_policy(network_runtime_config, config.groups)
+            .await
+        {
+            network_peer_manager.unregister_attached_peer_prefix(attached_peer_id);
+            peer_manager.clear_resources().await;
+            return Err(error);
+        }
         if let Err(error) = peer_manager.run().await {
+            network_peer_manager.unregister_attached_peer_prefix(attached_peer_id);
             peer_manager.clear_resources().await;
             return Err(error.into());
         }
@@ -398,6 +411,13 @@ fn build_peer_snapshot(
     if address == client_network.first_address() || address == client_network.last_address() {
         anyhow::bail!("unusable attached-peer IPv4 address: {}", config.virtual_ip);
     }
+    if let Some(range) = special_ipv4_range_conflict(config.virtual_ip) {
+        anyhow::bail!(
+            "unusable attached-peer IPv4 address {}: {} range",
+            config.virtual_ip,
+            range.label()
+        );
+    }
 
     let mut snapshot = network.peer.as_ref().clone();
     snapshot.runtime.core.node.peer_id = None;
@@ -474,6 +494,7 @@ async fn cleanup_partial(
     network_connection: Option<(PeerId, PeerConnId)>,
     attached_connection: Option<(PeerId, PeerConnId)>,
 ) {
+    network_peer_manager.unregister_attached_peer_prefix(attached_peer_manager.my_peer_id());
     if let (Some((attached_peer_id, network_conn_id)), Some((network_peer_id, attached_conn_id))) =
         (network_connection, attached_connection)
     {
@@ -965,7 +986,7 @@ mod tests {
             store.clone(),
             AttachedPeerConfig {
                 name: "second".to_owned(),
-                virtual_ip: attached_ipv4(Ipv4Addr::new(10, 82, 0, 3)),
+                virtual_ip: attached_ipv4(Ipv4Addr::new(10, 83, 0, 3)),
                 groups: Vec::new(),
                 identity_private_key: [2; 32],
             },
@@ -993,7 +1014,7 @@ mod tests {
         wait_for_route(
             &network_peer_manager,
             second.peer_id(),
-            Ipv4Addr::new(10, 82, 0, 3),
+            Ipv4Addr::new(10, 83, 0, 3),
             true,
         )
         .await;
@@ -1025,6 +1046,69 @@ mod tests {
         second.close().await;
         assert_eq!(store.peer_change_subscriber_count(), peer_subscribers);
         assert_eq!(store.service_change_subscriber_count(), service_subscribers);
+        network_peer_manager.clear_resources().await;
+    }
+
+    #[tokio::test]
+    async fn attached_peer_connect_rejects_overlapping_virtual_ip() {
+        let (network_peer_manager, store) = peer_manager();
+        network_peer_manager.run().await.unwrap();
+        let connect = |name: &str, virtual_ip: cidr::Ipv4Inet| {
+            AttachedPeerRuntime::connect(
+                network_peer_manager.clone(),
+                store.clone(),
+                AttachedPeerConfig {
+                    name: name.to_owned(),
+                    virtual_ip,
+                    groups: Vec::new(),
+                    identity_private_key: [8; 32],
+                },
+            )
+        };
+        let first = connect("first", attached_ipv4(Ipv4Addr::new(10, 82, 0, 2)))
+            .await
+            .unwrap();
+
+        // Same /24, different host address.
+        let error = connect("same-net", attached_ipv4(Ipv4Addr::new(10, 82, 0, 3)))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("overlaps"), "unexpected error: {error}");
+
+        // Nested /16 covering the reserved /24.
+        let error = connect("nested", "10.82.5.9/16".parse().unwrap())
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("overlaps"), "unexpected error: {error}");
+
+        // Special-purpose ranges are rejected before any reservation.
+        let error = connect("loopback", "127.0.0.5/8".parse().unwrap())
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("unusable attached-peer IPv4 address"),
+            "unexpected error: {error}"
+        );
+
+        // Disjoint prefixes coexist.
+        let second = connect("second", attached_ipv4(Ipv4Addr::new(10, 83, 0, 2)))
+            .await
+            .unwrap();
+
+        // Closing releases the reservation, so the same prefix connects again.
+        first.close().await;
+        let reconnected = connect("first-again", attached_ipv4(Ipv4Addr::new(10, 82, 0, 2)))
+            .await
+            .unwrap();
+
+        reconnected.close().await;
+        second.close().await;
         network_peer_manager.clear_resources().await;
     }
 

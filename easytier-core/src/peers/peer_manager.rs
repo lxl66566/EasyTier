@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
         Arc, Weak,
@@ -11,6 +11,7 @@ use std::{
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use parking_lot::Mutex as StdMutex;
 use quanta::Instant;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
@@ -79,6 +80,7 @@ use super::{
         route_peer_info_instance_id, traffic_kind,
     },
     util::shrink_dashmap,
+    virtual_ip::ipv4_assignments_overlap,
 };
 use crate::foundation::stats::{CounterHandle, LabelSet, LabelType, MetricName, StatsManager};
 use crate::proto::peer_rpc::{
@@ -778,6 +780,11 @@ pub struct PeerManagerCore {
     traffic_metrics: Arc<TrafficMetricRecorder>,
     network_name: String,
     counters: PeerManagerTrafficCounters,
+    /// Virtual-IP prefixes reserved by locally attached peers, keyed by the
+    /// attached peer id. Attached peers advertise their prefix into mesh
+    /// routing, so two overlapping reservations would make prefix routing
+    /// ambiguous. Remote peers' routes are intentionally not covered.
+    attached_peer_prefixes: StdMutex<BTreeMap<PeerId, cidr::Ipv4Inet>>,
 }
 
 fn check_resolved_remote_addr_not_from_virtual_network(
@@ -1151,11 +1158,40 @@ impl PeerManagerCore {
             traffic_metrics,
             network_name,
             counters: self_tx_counters,
+            attached_peer_prefixes: StdMutex::new(BTreeMap::new()),
         }
     }
 
     pub fn my_peer_id(&self) -> PeerId {
         self.my_peer_id
+    }
+
+    /// Atomically reserves the virtual-IP prefix of a locally attached peer.
+    /// Fails when the prefix overlaps one already reserved by another
+    /// attached peer; `attach`/`cleanup` pairs must keep the registry
+    /// balanced.
+    pub(crate) fn register_attached_peer_prefix(
+        &self,
+        peer_id: PeerId,
+        prefix: cidr::Ipv4Inet,
+    ) -> anyhow::Result<()> {
+        let mut prefixes = self.attached_peer_prefixes.lock();
+        let conflict = prefixes
+            .iter()
+            .find(|(id, other)| **id != peer_id && ipv4_assignments_overlap(**other, prefix))
+            .map(|(id, other)| (*id, *other));
+        if let Some((other_id, other)) = conflict {
+            anyhow::bail!(
+                "attached peer virtual IP {prefix} overlaps {other} reserved by peer {other_id}"
+            );
+        }
+        prefixes.insert(peer_id, prefix);
+        Ok(())
+    }
+
+    /// Releases the virtual-IP prefix reservation of a locally attached peer.
+    pub(crate) fn unregister_attached_peer_prefix(&self, peer_id: PeerId) {
+        self.attached_peer_prefixes.lock().remove(&peer_id);
     }
 
     pub(crate) fn credential_manager(&self) -> Arc<CredentialManager> {
