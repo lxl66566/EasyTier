@@ -13,7 +13,11 @@
  * failure; functions returning `char *` return NULL on failure. Call
  * easytier_ios_last_error() on the same thread to retrieve details.
  *
- * Threading: all functions are safe to call from any thread. The last-error
+ * Threading: functions may be called from any thread, but the lifecycle
+ * entry points (easytier_ios_run_instance, easytier_ios_retain_instances,
+ * easytier_ios_delete_instance, easytier_ios_collect_network_infos) block
+ * for seconds while instances start or stop. Never call those from the iOS
+ * main thread or any thread under a watchdog deadline. The last-error
  * buffer is thread-local, so query it on the thread that received the
  * failure.
  */
