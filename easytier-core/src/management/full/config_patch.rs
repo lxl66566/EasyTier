@@ -48,6 +48,17 @@ where
     let managed_credentials = patch.managed_credentials.take();
     let patch_for_host = patch_without_managed_credentials(&patch);
 
+    // Managed credentials are durable secret authority. Without a
+    // persistence backend the install would be memory-only and silently
+    // revert to the previous credentials on restart while the controller
+    // believes the replacement is in effect, so reject up front instead.
+    if managed_credentials.is_some() && persistence.is_none() {
+        anyhow::bail!(
+            "managed credential patch rejected: no durable configuration persistence is \
+             configured, the replacement would not survive a restart"
+        );
+    }
+
     // Preserve the existing ordered partial-commit contract: earlier valid
     // sub-patches remain applied if a later sub-patch fails.
     let patch_result: anyhow::Result<(bool, bool)> = async {
