@@ -20,6 +20,8 @@ mod ring;
 #[cfg(all(target_os = "wasi", feature = "wasi-crypto-offload"))]
 mod wasi_host;
 
+pub(crate) mod replay_window;
+
 pub mod xor;
 
 // The disabled backends keep the same error Interface as the AEAD backends.

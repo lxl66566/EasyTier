@@ -1,9 +1,6 @@
-use std::{
-    sync::{
-        Arc, Mutex, RwLock,
-        atomic::{AtomicBool, AtomicU32, Ordering},
-    },
-    time::{SystemTime, UNIX_EPOCH},
+use std::sync::{
+    Arc, Mutex, RwLock,
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 use anyhow::anyhow;
@@ -15,7 +12,9 @@ use zerocopy::FromBytes;
 
 use crate::{
     packet::{StandardAeadTail, ZCPacket},
-    tunnel::encrypt::{Encryptor, create_encryptor},
+    tunnel::encrypt::{
+        Encryptor, create_encryptor, replay_window::ReplayWindow256, replay_window::now_ms,
+    },
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -61,102 +60,6 @@ impl EpochKeySlot {
         } else {
             self.recv_cipher.as_ref().unwrap().clone()
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct ReplayWindow256 {
-    max_seq: u64,
-    bitmap: [u8; 32],
-    valid: bool,
-}
-
-impl ReplayWindow256 {
-    fn clear(&mut self) {
-        self.max_seq = 0;
-        self.bitmap.fill(0);
-        self.valid = false;
-    }
-
-    fn test_bit(&self, idx: usize) -> bool {
-        let byte = idx / 8;
-        let bit = idx % 8;
-        (self.bitmap[byte] >> bit) & 1 == 1
-    }
-
-    fn set_bit(&mut self, idx: usize) {
-        let byte = idx / 8;
-        let bit = idx % 8;
-        self.bitmap[byte] |= 1u8 << bit;
-    }
-
-    fn shift_right(&mut self, shift: usize) {
-        if shift == 0 {
-            return;
-        }
-        let total_bits = 256usize;
-        if shift >= total_bits {
-            self.bitmap.fill(0);
-            return;
-        }
-
-        let byte_shift = shift / 8;
-        let bit_shift = shift % 8;
-
-        if byte_shift > 0 {
-            for i in (0..self.bitmap.len()).rev() {
-                self.bitmap[i] = if i >= byte_shift {
-                    self.bitmap[i - byte_shift]
-                } else {
-                    0
-                };
-            }
-        }
-
-        if bit_shift > 0 {
-            let mut carry = 0u8;
-            for b in self.bitmap.iter_mut() {
-                let new_carry = *b >> (8 - bit_shift);
-                *b = (*b << bit_shift) | carry;
-                carry = new_carry;
-            }
-        }
-    }
-
-    fn accept(&mut self, seq: u64) -> bool {
-        if !self.valid {
-            self.valid = true;
-            self.max_seq = seq;
-            self.set_bit(0);
-            return true;
-        }
-
-        if seq > self.max_seq {
-            let shift = (seq - self.max_seq) as usize;
-            self.shift_right(shift);
-            self.max_seq = seq;
-            self.set_bit(0);
-            return true;
-        }
-
-        let delta = (self.max_seq - seq) as usize;
-        if delta >= 256 {
-            return false;
-        }
-        if self.test_bit(delta) {
-            return false;
-        }
-        self.set_bit(delta);
-        true
-    }
-
-    fn can_accept(&self, seq: u64) -> bool {
-        if !self.valid || seq > self.max_seq {
-            return true;
-        }
-
-        let delta = (self.max_seq - seq) as usize;
-        delta < 256 && !self.test_bit(delta)
     }
 }
 
@@ -777,13 +680,6 @@ impl SecureDatagramSession {
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1053,7 +949,7 @@ mod tests {
         for i in 0..10u64 {
             assert!(w.accept(i), "seq {i} should be accepted");
         }
-        assert_eq!(w.max_seq, 9);
+        assert_eq!(w.max_seq(), 9);
 
         for i in 0..10u64 {
             assert!(!w.accept(i), "seq {i} should be rejected as replay");
