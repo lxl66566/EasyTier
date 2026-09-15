@@ -49,7 +49,10 @@ expiry behavior.
 Relay eligibility comes from the transport-authenticated credential identity
 and grant, not self-reported route metadata. The advertisement Module does not
 support changing a credential's relay permission in place; such a permission
-change is a credential revocation and new authenticated Session.
+change is a credential revocation and new authenticated Session. A relay must
+also be reachable in the advertising peer's current route table; when that
+reachability is lost, the covered physical edges return to the advertised row
+in the same route-table rebuild that observed the change.
 
 ## Attached peer
 

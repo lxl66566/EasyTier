@@ -2393,6 +2393,10 @@ struct PeerRouteServiceImpl {
     applied_interface_peers_generation: AtomicU64,
     applied_interface_peers: std::sync::Mutex<BTreeSet<PeerId>>,
     self_conn_info_withdrawn: AtomicBool,
+    // Set when the advertised row was re-derived outside update_my_conn_info
+    // (relay reachability flipped during a route table rebuild). Consumers
+    // swap it out so the change reaches sync_now.
+    advertised_row_rederived: AtomicBool,
 
     last_update_my_foreign_network: AtomicCell<Option<Instant>>,
 
@@ -2467,6 +2471,7 @@ impl PeerRouteServiceImpl {
             applied_interface_peers_generation: AtomicU64::new(0),
             applied_interface_peers: std::sync::Mutex::new(BTreeSet::new()),
             self_conn_info_withdrawn: AtomicBool::new(false),
+            advertised_row_rederived: AtomicBool::new(false),
 
             last_update_my_foreign_network: AtomicCell::new(None),
 
@@ -2662,6 +2667,12 @@ impl PeerRouteServiceImpl {
                         .suppressed_non_reusable_credential_peers
                         .contains_key(peer_id)
                 })
+                // An unreachable relay cannot forward the projected traffic:
+                // keep the physical edges in the advertised row until the
+                // route table can reach the relay again, otherwise covered
+                // leaves stay blackholed until the relay's stale conn row is
+                // reaped by clear_expired_peer (~90-150s).
+                .filter(|peer_id| self.route_table.peer_reachable(*peer_id))
                 .filter(|peer_id| {
                     let Some(Some(public_key)) = snapshot.public_keys.get(peer_id) else {
                         return false;
@@ -2922,6 +2933,10 @@ impl PeerRouteServiceImpl {
 
         // update route table first because we want to filter out unreachable peers.
         self.update_route_table();
+        // A rebuilt route table can flip relay reachability, which changes
+        // projection eligibility. Re-derive the advertised row before the
+        // bitmap is cached so the fresh row is what gets propagated.
+        self.reconcile_advertised_row_after_route_rebuild();
 
         let synced_version = self.synced_route_info.version.get();
 
@@ -2986,6 +3001,32 @@ impl PeerRouteServiceImpl {
         {
             *locked = conn_bitmap;
         }
+    }
+
+    // Re-derive the advertised row after a route table rebuild flipped the
+    // reachability of a relay candidate. Runs inline in the rebuild path so
+    // the corrected row is published immediately instead of waiting for the
+    // next periodic pass or for clear_expired_peer to reap the dead relay's
+    // rows.
+    fn reconcile_advertised_row_after_route_rebuild(&self) -> bool {
+        if !self.peer_relay_projection_enabled()
+            || self.self_conn_info_withdrawn.load(Ordering::Acquire)
+        {
+            return false;
+        }
+
+        let snapshot = self.cached_interface_peer_snapshot.lock().unwrap().clone();
+        // A pending interface rescan means this cache is stale; the routine's
+        // next update_my_conn_info pass re-derives with fresh interface data.
+        if snapshot.generation != self.interface_peers_generation.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let changed = self.reconcile_my_conn_info(&snapshot, false);
+        if changed {
+            self.advertised_row_rederived.store(true, Ordering::Release);
+        }
+        changed
     }
 
     fn build_route_info(&self, session: &SyncRouteSession) -> Option<Vec<RoutePeerInfo>> {
@@ -3148,7 +3189,11 @@ impl PeerRouteServiceImpl {
 
     async fn update_my_infos(&self) -> bool {
         let my_peer_info_updated = self.update_my_peer_info();
-        let my_conn_info_updated = self.update_my_conn_info().await;
+        // Fold in advertised-row changes produced by route table rebuilds
+        // since the last pass (relay reachability flips), so they also drive
+        // the trust refresh and sync_now below.
+        let mut my_conn_info_updated = self.advertised_row_rederived.swap(false, Ordering::AcqRel);
+        my_conn_info_updated |= self.update_my_conn_info().await;
         let my_foreign_network_updated = self.update_my_foreign_network().await;
         let mut untrusted_changed = false;
         if my_peer_info_updated || my_conn_info_updated {
@@ -3164,6 +3209,9 @@ impl PeerRouteServiceImpl {
         if my_peer_info_updated {
             self.update_peer_info_last_update();
         }
+        // Catch re-derives triggered by this pass's own rebuilds (including
+        // nested ones inside the trust refresh).
+        my_conn_info_updated |= self.advertised_row_rederived.swap(false, Ordering::AcqRel);
         my_peer_info_updated
             || my_conn_info_updated
             || my_foreign_network_updated
@@ -3194,7 +3242,10 @@ impl PeerRouteServiceImpl {
             self.update_peer_info_last_update();
         }
 
-        my_peer_info_updated || !untrusted.is_empty() || public_ipv6_state_updated
+        my_peer_info_updated
+            || !untrusted.is_empty()
+            || public_ipv6_state_updated
+            || self.advertised_row_rederived.swap(false, Ordering::AcqRel)
     }
 
     fn refresh_credential_trusts(&self) -> Vec<PeerId> {
@@ -4111,6 +4162,13 @@ impl RouteSessionManager {
             }
         }
 
+        // The rebuild above may have re-derived our advertised row (relay
+        // reachability flipped); propagate it without waiting for the next
+        // periodic pass.
+        let relay_projection_row_changed = service_impl
+            .advertised_row_rederived
+            .swap(false, Ordering::AcqRel);
+
         tracing::debug!(
             "handling sync_route_info rpc: from_peer_id: {:?}, is_initiator: {:?}, peer_infos: {:?}, conn_info: {:?}, synced_route_info: {:?} session: {:?}, new_route_table: {:?}",
             from_peer_id,
@@ -4134,7 +4192,7 @@ impl RouteSessionManager {
         // needs to be propagated to other peers.  Previously this was
         // unconditional, which created an A→B→A→B ping-pong storm even when
         // there was nothing new to propagate.
-        if need_update_route_table || foreign_network_changed {
+        if need_update_route_table || foreign_network_changed || relay_projection_row_changed {
             self.sync_now("sync_route_info");
         }
 
@@ -5002,6 +5060,16 @@ mod tests {
         );
     }
 
+    // Relay eligibility now requires reachability in the route table, so
+    // tests must cache the interface snapshot and build the route table
+    // before deriving the advertised row.
+    fn cache_interface_snapshot(
+        service_impl: &PeerRouteServiceImpl,
+        snapshot: &InterfacePeerSnapshot,
+    ) {
+        *service_impl.cached_interface_peer_snapshot.lock().unwrap() = Arc::new(snapshot.clone());
+    }
+
     async fn test_route_with_admin_peer(
         context: ArcPeerContext,
     ) -> (Arc<PeerRoute>, Arc<PeerRpcManager>) {
@@ -5116,6 +5184,9 @@ mod tests {
         install_credential_grant(&service_impl, leaf_a_key, false);
         install_credential_grant(&service_impl, leaf_b_key, false);
         install_conn_row(&service_impl, 2, [3, 4]);
+        install_conn_row(&service_impl, 1, [2, 3, 4, 5]);
+        cache_interface_snapshot(&service_impl, &snapshot);
+        service_impl.update_route_table();
 
         assert!(service_impl.reconcile_my_conn_info(&snapshot, false));
         assert_eq!(
@@ -5125,7 +5196,6 @@ mod tests {
             Some(BTreeSet::from([2, 5]))
         );
 
-        *service_impl.cached_interface_peer_snapshot.lock().unwrap() = Arc::new(snapshot.clone());
         let local_snapshot = service_impl.local_route_snapshot();
         assert_eq!(
             local_snapshot
@@ -5161,10 +5231,15 @@ mod tests {
             ),
             (4, PeerIdentityType::Credential, Some(vec![4; 32])),
         ]);
+        install_peer_info(&service_impl, 1, vec![1; 32], false);
         install_peer_info(&service_impl, 2, forged_relay_key.clone(), false);
         install_credential_grant(&service_impl, authenticated_key, false);
         install_credential_grant(&service_impl, forged_relay_key, true);
         install_conn_row(&service_impl, 2, [4]);
+        // Make the relay candidate reachable so the rejection below is
+        // attributed to the public key mismatch, not reachability.
+        cache_interface_snapshot(&service_impl, &snapshot);
+        service_impl.update_route_table();
 
         assert_eq!(
             service_impl.derive_advertised_connected_peers(&snapshot),
@@ -5198,6 +5273,7 @@ mod tests {
             (4, PeerIdentityType::Credential, Some(vec![4; 32])),
             (5, PeerIdentityType::Credential, Some(vec![5; 32])),
         ]);
+        install_peer_info(&service_impl, 1, vec![1; 32], false);
         for relay_peer_id in [2, 3] {
             install_peer_info(
                 &service_impl,
@@ -5209,6 +5285,9 @@ mod tests {
         }
         install_conn_row(&service_impl, 2, [4]);
         install_conn_row(&service_impl, 3, [4, 5]);
+        install_conn_row(&service_impl, 1, snapshot.peers.clone());
+        cache_interface_snapshot(&service_impl, &snapshot);
+        service_impl.update_route_table();
 
         assert!(service_impl.reconcile_my_conn_info(&snapshot, false));
         let first_version = service_impl
@@ -5226,15 +5305,107 @@ mod tests {
             Some(BTreeSet::from([2, 3]))
         );
 
-        service_impl.synced_route_info.conn_map.write().remove(&2);
-        assert!(!service_impl.reconcile_my_conn_info(&snapshot, false));
+        // Relay 2 dies: its route info disappears but its conn row lingers
+        // until clear_expired_peer reaps it. Relay 3 still covers 4 and 5, so
+        // the advertised row is unchanged.
+        service_impl.synced_route_info.peer_infos.write().remove(&2);
+        service_impl.update_route_table_and_cached_local_conn_bitmap();
+        assert!(
+            !service_impl
+                .advertised_row_rederived
+                .swap(false, Ordering::AcqRel)
+        );
+        assert!(
+            service_impl
+                .synced_route_info
+                .conn_map
+                .read()
+                .contains_key(&2)
+        );
 
-        service_impl.synced_route_info.conn_map.write().remove(&3);
-        assert!(service_impl.reconcile_my_conn_info(&snapshot, false));
+        // Relay 3 dies too: no relay is reachable anymore, the physical edges
+        // must return to the advertised row immediately (inline in the
+        // rebuild, not on the next periodic pass).
+        service_impl.synced_route_info.peer_infos.write().remove(&3);
+        service_impl.update_route_table_and_cached_local_conn_bitmap();
+        assert!(
+            service_impl
+                .advertised_row_rederived
+                .swap(false, Ordering::AcqRel)
+        );
         let self_row = service_impl.synced_route_info.conn_map.read();
         let self_row = self_row.get(&1).unwrap();
         assert_eq!(self_row.connected_peers, snapshot.peers);
         assert_eq!(self_row.version.get(), first_version + 1);
+    }
+
+    // Regression for the relay blackout: a dead relay's conn row lingers
+    // until clear_expired_peer reaps it (~90-150s). The advertised row must
+    // follow route-table reachability instead, restoring the physical edges
+    // inline in the rebuild that observed the relay becoming unreachable.
+    #[test]
+    fn peer_relay_projection_tracks_relay_reachability_without_row_expiry() {
+        let service_impl = test_peer_relay_service_impl(1);
+        let snapshot = interface_peer_snapshot([
+            (2, PeerIdentityType::Credential, Some(vec![2; 32])),
+            (4, PeerIdentityType::Credential, Some(vec![4; 32])),
+        ]);
+        install_peer_info(&service_impl, 1, vec![1; 32], false);
+        install_peer_info(&service_impl, 4, vec![4; 32], false);
+        install_credential_grant(&service_impl, vec![2; 32], true);
+        // The relay's conn row covers leaf 4 during the whole test; only its
+        // reachability changes.
+        install_conn_row(&service_impl, 2, [4]);
+        cache_interface_snapshot(&service_impl, &snapshot);
+
+        // Relay info not synced yet: unreachable, physical edges advertised.
+        assert!(service_impl.reconcile_my_conn_info(&snapshot, false));
+        assert_eq!(
+            service_impl
+                .synced_route_info
+                .get_connected_peers::<BTreeSet<_>>(1),
+            Some(BTreeSet::from([2, 4]))
+        );
+
+        // Relay info arrives through a sync: reachability engages the
+        // projection without waiting for a periodic pass.
+        install_peer_info(&service_impl, 2, vec![2; 32], false);
+        service_impl.update_route_table_and_cached_local_conn_bitmap();
+        assert!(
+            service_impl
+                .advertised_row_rederived
+                .swap(false, Ordering::AcqRel)
+        );
+        assert_eq!(
+            service_impl
+                .synced_route_info
+                .get_connected_peers::<BTreeSet<_>>(1),
+            Some(BTreeSet::from([2]))
+        );
+
+        // Relay dies: only its route info disappears, its conn row is still
+        // present. The physical edge must come back immediately.
+        service_impl.synced_route_info.peer_infos.write().remove(&2);
+        service_impl.update_route_table_and_cached_local_conn_bitmap();
+        assert!(
+            service_impl
+                .advertised_row_rederived
+                .swap(false, Ordering::AcqRel)
+        );
+        assert_eq!(
+            service_impl
+                .synced_route_info
+                .get_connected_peers::<BTreeSet<_>>(1),
+            Some(BTreeSet::from([2, 4]))
+        );
+        assert!(
+            service_impl
+                .synced_route_info
+                .conn_map
+                .read()
+                .get(&2)
+                .is_some_and(|row| row.connected_peers.contains(&4))
+        );
     }
 
     #[test]
@@ -5269,13 +5440,17 @@ mod tests {
     #[test]
     fn peer_relay_projection_refreshes_local_topology_when_advertisement_is_unchanged() {
         let service_impl = test_peer_relay_service_impl(1);
+        install_peer_info(&service_impl, 1, vec![1; 32], false);
         install_peer_info(&service_impl, 2, vec![2; 32], false);
         install_credential_grant(&service_impl, vec![2; 32], true);
         install_conn_row(&service_impl, 2, [3, 4]);
+        install_conn_row(&service_impl, 1, [2, 3]);
         let first = interface_peer_snapshot([
             (2, PeerIdentityType::Credential, Some(vec![2; 32])),
             (3, PeerIdentityType::Credential, Some(vec![3; 32])),
         ]);
+        cache_interface_snapshot(&service_impl, &first);
+        service_impl.update_route_table();
         assert!(service_impl.reconcile_my_conn_info(&first, false));
         let self_version = service_impl
             .synced_route_info
@@ -5291,6 +5466,7 @@ mod tests {
             (2, PeerIdentityType::Credential, Some(vec![2; 32])),
             (4, PeerIdentityType::Credential, Some(vec![4; 32])),
         ]);
+        cache_interface_snapshot(&service_impl, &second);
         assert!(service_impl.reconcile_my_conn_info(&second, true));
         assert_eq!(
             service_impl
@@ -5324,6 +5500,7 @@ mod tests {
             list_peers_calls: list_peers_calls.clone(),
             get_peer_identity_type_calls: Arc::new(AtomicU32::new(0)),
         }));
+        install_peer_info(&service_impl, 1, vec![1; 32], false);
         install_peer_info(&service_impl, 2, vec![2; 32], false);
         install_credential_grant(&service_impl, vec![2; 32], true);
 
@@ -5336,8 +5513,16 @@ mod tests {
             Some(BTreeSet::from([2, 4]))
         );
 
+        // The relay's forwarded conn row arrives through a sync, which
+        // rebuilds the route table: the advertised row must be re-derived
+        // inline without rescanning the interface.
         install_conn_row(&service_impl, 2, [4]);
-        assert!(service_impl.update_my_conn_info().await);
+        service_impl.update_route_table_and_cached_local_conn_bitmap();
+        assert!(
+            service_impl
+                .advertised_row_rederived
+                .swap(false, Ordering::AcqRel)
+        );
         assert_eq!(list_peers_calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             service_impl
@@ -5707,6 +5892,7 @@ mod tests {
             list_peers_calls: list_peers_calls.clone(),
             get_peer_identity_type_calls: Arc::new(AtomicU32::new(0)),
         }));
+        install_peer_info(&service_impl, 1, vec![1; 32], false);
         install_peer_info(&service_impl, 2, vec![2; 32], false);
         install_credential_grant(&service_impl, vec![2; 32], true);
         install_conn_row(&service_impl, 2, [3]);
@@ -5719,6 +5905,9 @@ mod tests {
                 .get_connected_peers::<BTreeSet<_>>(1),
             Some(BTreeSet::from([2, 3]))
         );
+
+        // Projection requires the relay to be reachable in the route table.
+        service_impl.update_route_table();
 
         context.enabled.store(true, Ordering::Relaxed);
 
