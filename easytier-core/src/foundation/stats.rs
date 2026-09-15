@@ -1,6 +1,6 @@
+use atomic_shim::AtomicU64;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::cell::UnsafeCell;
 use std::fmt;
 use std::sync::{
     Arc, Mutex,
@@ -481,10 +481,14 @@ impl Default for LabelSet {
     }
 }
 
-/// UnsafeCounter provides a high-performance counter using UnsafeCell
+/// Lock-free counter safe for concurrent use from multiple threads.
+///
+/// All operations are atomic with `Relaxed` ordering, which suffices for pure
+/// counting. The `unsafe` markers are retained only for API compatibility with
+/// the previous `UnsafeCell`-based implementation.
 #[derive(Debug)]
 pub struct UnsafeCounter {
-    value: UnsafeCell<u64>,
+    value: AtomicU64,
 }
 
 impl Default for UnsafeCounter {
@@ -496,31 +500,26 @@ impl Default for UnsafeCounter {
 impl UnsafeCounter {
     pub fn new() -> Self {
         Self {
-            value: UnsafeCell::new(0),
+            value: AtomicU64::new(0),
         }
     }
 
     pub fn new_with_value(initial: u64) -> Self {
         Self {
-            value: UnsafeCell::new(initial),
+            value: AtomicU64::new(initial),
         }
     }
 
     /// Increment the counter by the given amount
-    /// # Safety
-    /// This method is unsafe because it uses UnsafeCell. The caller must ensure
-    /// that no other thread is accessing this counter simultaneously.
+    ///
+    /// `fetch_add` wraps around on overflow instead of saturating; u64 counters
+    /// cannot realistically overflow (about 584 years of 1 ns increments), so
+    /// wrap-around is acceptable here.
     pub unsafe fn add(&self, delta: u64) {
-        let ptr = self.value.get();
-        unsafe {
-            *ptr = (*ptr).saturating_add(delta);
-        }
+        self.value.fetch_add(delta, Ordering::Relaxed);
     }
 
     /// Increment the counter by 1
-    /// # Safety
-    /// This method is unsafe because it uses UnsafeCell. The caller must ensure
-    /// that no other thread is accessing this counter simultaneously.
     pub unsafe fn inc(&self) {
         unsafe {
             self.add(1);
@@ -528,40 +527,20 @@ impl UnsafeCounter {
     }
 
     /// Get the current value of the counter
-    /// # Safety
-    /// This method is unsafe because it uses UnsafeCell. The caller must ensure
-    /// that no other thread is modifying this counter simultaneously.
     pub unsafe fn get(&self) -> u64 {
-        let ptr = self.value.get();
-        unsafe { *ptr }
+        self.value.load(Ordering::Relaxed)
     }
 
     /// Reset the counter to zero
-    /// # Safety
-    /// This method is unsafe because it uses UnsafeCell. The caller must ensure
-    /// that no other thread is accessing this counter simultaneously.
     pub unsafe fn reset(&self) {
-        let ptr = self.value.get();
-        unsafe {
-            *ptr = 0;
-        }
+        self.value.store(0, Ordering::Relaxed);
     }
 
     /// Set the counter to a specific value
-    /// # Safety
-    /// This method is unsafe because it uses UnsafeCell. The caller must ensure
-    /// that no other thread is accessing this counter simultaneously.
     pub unsafe fn set(&self, value: u64) {
-        let ptr = self.value.get();
-        unsafe {
-            *ptr = value;
-        }
+        self.value.store(value, Ordering::Relaxed);
     }
 }
-
-// UnsafeCounter is Send + Sync because the safety is guaranteed by the caller
-unsafe impl Send for UnsafeCounter {}
-unsafe impl Sync for UnsafeCounter {}
 
 /// MetricData contains both the counter and its last active cleanup epoch.
 #[derive(Debug)]
@@ -600,10 +579,6 @@ fn cleanup_metrics(counters: &DashMap<MetricKey, Arc<MetricData>>, current_epoch
     });
     counters.shrink_to_fit();
 }
-
-// MetricData is Send + Sync because the safety is guaranteed by the caller
-unsafe impl Send for MetricData {}
-unsafe impl Sync for MetricData {}
 
 /// MetricKey uniquely identifies a metric with its name and labels
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1172,6 +1147,34 @@ mod tests {
         assert_eq!(labeled_metric.name, MetricName::PeerRpcClientTx);
         assert_eq!(labeled_metric.value, 3);
         assert_eq!(labeled_metric.labels, labels);
+    }
+
+    #[test]
+    fn concurrent_counter_handle_add_loses_no_updates() {
+        // Regression test for the former `UnsafeCell`-based counter: handles are
+        // cloned into multiple components in production, so `add` must be an
+        // atomic read-modify-write.
+        const THREADS: u64 = 8;
+        const ADDS_PER_THREAD: u64 = 100_000;
+
+        let stats = StatsManager::new();
+        let handle = stats.get_counter(MetricName::TrafficBytesTx, LabelSet::new());
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS as usize));
+
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let handle = handle.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..ADDS_PER_THREAD {
+                        handle.add(1);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(handle.get(), THREADS * ADDS_PER_THREAD);
     }
 
     #[tokio::test]
