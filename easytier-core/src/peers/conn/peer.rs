@@ -285,6 +285,19 @@ impl Peer {
         self.conns.iter().any(|entry| !entry.value().is_closed())
     }
 
+    /// True if any live conn's handshake declared the header-AAD feature.
+    ///
+    /// One declaring conn is enough: a peer running a build with the feature
+    /// opens header-bound packets regardless of which connection (or relay
+    /// path) a packet actually takes, because the receiving side selects the
+    /// AAD from the per-packet wire marker.
+    pub fn supports_header_aad(&self) -> bool {
+        self.conns.iter().any(|entry| {
+            let conn = entry.value();
+            !conn.is_closed() && conn.supports_header_aad()
+        })
+    }
+
     pub fn has_directly_connected_conn(&self) -> bool {
         self.conns
             .iter()

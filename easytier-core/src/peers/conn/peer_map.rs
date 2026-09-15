@@ -143,6 +143,14 @@ impl PeerMap {
         peer_id == self.my_peer_id || self.peer_map.contains_key(&peer_id)
     }
 
+    /// Whether the destination peer negotiated header-AAD on any direct conn.
+    /// Unknown peers (no direct conn, e.g. pure relay destinations) return
+    /// false, keeping their traffic in the legacy empty-AAD format.
+    pub fn peer_supports_header_aad(&self, peer_id: PeerId) -> bool {
+        self.get_peer_by_id(peer_id)
+            .is_some_and(|peer| peer.supports_header_aad())
+    }
+
     pub(crate) fn has_direct_attached_peer(&self, peer_id: PeerId) -> bool {
         self.get_peer_by_id(peer_id)
             .is_some_and(|peer| peer.has_direct_attached_conn())
