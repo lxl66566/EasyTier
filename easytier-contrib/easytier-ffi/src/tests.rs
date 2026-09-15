@@ -658,6 +658,55 @@ fn delete_network_instance_rejects_an_ambiguous_name() {
 }
 
 #[test]
+fn collect_network_infos_strips_control_characters_in_instance_name() {
+    // Regression: a NUL inside an instance name used to reach
+    // CString::new(...).unwrap() in collect_network_infos and, with
+    // panic=abort, kill the whole process. The config layer now strips
+    // control characters on read.
+    let instance_id = Uuid::new_v4();
+    let cfg = TomlConfigLoader::new_from_str(r#"instance_name = "a\u0000b""#).unwrap();
+    cfg.set_id(instance_id);
+    ffi_context()
+        .manager
+        .run_network_instance(cfg, ConfigFileControl::STATIC_CONFIG)
+        .unwrap();
+
+    let mut infos = vec![
+        KeyValuePair {
+            key: std::ptr::null(),
+            value: std::ptr::null(),
+        };
+        16
+    ];
+    let count = unsafe { collect_network_infos(infos.as_mut_ptr(), infos.len()) };
+    assert!(count > 0, "collect failed: {:?}", take_last_error());
+
+    let mut found = false;
+    for info in infos.iter().take(count as usize) {
+        let key = unsafe { CStr::from_ptr(info.key) }
+            .to_string_lossy()
+            .into_owned();
+        if key == "ab" {
+            found = true;
+        }
+    }
+
+    free_key_value_pairs(&infos[..count as usize]);
+    ffi_context()
+        .runtime
+        .block_on(
+            ffi_context()
+                .manager
+                .delete_network_instances([instance_id]),
+        )
+        .unwrap();
+    assert!(
+        found,
+        "sanitized instance name missing from collected infos"
+    );
+}
+
+#[test]
 fn config_server_callback_context_rejects_nested_blocking_ffi_calls() {
     let _callback_scope = ConfigServerCallbackScope::enter();
     assert_eq!(is_config_server_client_connected(), 0);
