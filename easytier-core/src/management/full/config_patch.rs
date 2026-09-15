@@ -518,6 +518,23 @@ mod managed_credential_tests {
     }
 }
 
+/// `patch_vec` appends blindly on Add, so a retried request whose response
+/// was lost would add the same entry twice (e.g. a second identical
+/// port-forward whose bind then fails). Drop duplicates after patching,
+/// keeping the first occurrence.
+fn patch_vec_idempotent<T: PartialEq + Clone>(current: &mut Vec<T>, patches: Vec<Patchable<T>>) {
+    config::patch_vec(current, patches);
+    let mut unique: Vec<T> = Vec::with_capacity(current.len());
+    current.retain(|value| {
+        if unique.contains(value) {
+            false
+        } else {
+            unique.push(value.clone());
+            true
+        }
+    });
+}
+
 /// Reports whether the call may have modified `config`.
 fn patch_port_forwards(config: &TomlConfig, patches: Vec<PortForwardPatch>) -> bool {
     if patches.is_empty() {
@@ -532,7 +549,7 @@ fn patch_port_forwards(config: &TomlConfig, patches: Vec<PortForwardPatch>) -> b
         })
         .collect::<Vec<_>>();
     trace_patchables(&patches);
-    config::patch_vec(&mut current, patches);
+    patch_vec_idempotent(&mut current, patches);
     config.set_port_forwards(current);
     true
 }
@@ -558,7 +575,7 @@ fn patch_acl(config: &TomlConfig, patch: Option<AclPatch>) -> anyhow::Result<boo
             .map(Into::into)
             .collect::<Vec<_>>();
         trace_patchables(&patches);
-        config::patch_vec(&mut acl.tcp_whitelist, patches);
+        patch_vec_idempotent(&mut acl.tcp_whitelist, patches);
     }
     if !patch.udp_whitelist.is_empty() {
         let patches = patch
@@ -567,7 +584,7 @@ fn patch_acl(config: &TomlConfig, patch: Option<AclPatch>) -> anyhow::Result<boo
             .map(Into::into)
             .collect::<Vec<_>>();
         trace_patchables(&patches);
-        config::patch_vec(&mut acl.udp_whitelist, patches);
+        patch_vec_idempotent(&mut acl.udp_whitelist, patches);
     }
     acl.build()?;
     config.set_acl(acl.acl);
@@ -582,6 +599,28 @@ fn patch_proxy_networks(
     patches: Vec<ProxyNetworkPatch>,
 ) -> anyhow::Result<bool> {
     let changed = !patches.is_empty();
+    // Two-phase: verify every add before touching the config so a failing
+    // entry cannot leave a partially applied (and then committed) prefix.
+    // The check mirrors the one in `TomlConfig::add_proxy_cidr`, which can no
+    // longer be reached with invalid input afterwards.
+    for patch in &patches {
+        let Ok(ConfigPatchAction::Add) = ConfigPatchAction::try_from(patch.action) else {
+            continue;
+        };
+        let (Some(cidr), Some(mapped_cidr)) = (
+            patch.cidr.map(cidr::Ipv4Cidr::from),
+            patch.mapped_cidr.map(cidr::Ipv4Cidr::from),
+        ) else {
+            continue;
+        };
+        if cidr.network_length() != mapped_cidr.network_length() {
+            anyhow::bail!(
+                "Mapped CIDR must have the same network length as the original CIDR: {} != {}",
+                cidr.network_length(),
+                mapped_cidr.network_length()
+            );
+        }
+    }
     for patch in patches {
         match ConfigPatchAction::try_from(patch.action) {
             Ok(ConfigPatchAction::Add) => {
@@ -616,7 +655,7 @@ fn patch_routes(config: &TomlConfig, patches: Vec<RoutePatch>) -> bool {
     let mut current = config.get_routes().unwrap_or_default();
     let patches = patches.into_iter().map(Into::into).collect::<Vec<_>>();
     trace_patchables(&patches);
-    config::patch_vec(&mut current, patches);
+    patch_vec_idempotent(&mut current, patches);
     config.set_routes((!current.is_empty()).then_some(current));
     true
 }
@@ -629,7 +668,7 @@ fn patch_exit_nodes_config(config: &TomlConfig, patches: Vec<ExitNodePatch>) -> 
     let mut current = config.get_exit_nodes();
     let patches = patches.into_iter().map(Into::into).collect::<Vec<_>>();
     trace_patchables(&patches);
-    config::patch_vec(&mut current, patches);
+    patch_vec_idempotent(&mut current, patches);
     config.set_exit_nodes(current);
     true
 }
@@ -642,7 +681,7 @@ fn patch_mapped_listeners(config: &TomlConfig, patches: Vec<UrlPatch>) -> bool {
     let mut current = config.get_mapped_listeners();
     let patches = patches.into_iter().map(Into::into).collect::<Vec<_>>();
     trace_patchables(&patches);
-    config::patch_vec(&mut current, patches);
+    patch_vec_idempotent(&mut current, patches);
     config.set_mapped_listeners((!current.is_empty()).then_some(current));
     true
 }
@@ -749,6 +788,61 @@ mod tests {
     use super::*;
     use crate::config::toml::{VpnPortalClientConfig, VpnPortalConfig};
     use easytier_proto::api::manage::VpnPortalClientConfig as ClientPb;
+    use easytier_proto::common::{PortForwardConfigPb, SocketType};
+
+    fn port_forward_add(bind_addr: &str, dst_addr: &str) -> PortForwardPatch {
+        PortForwardPatch {
+            action: ConfigPatchAction::Add as i32,
+            cfg: Some(PortForwardConfigPb {
+                bind_addr: Some(bind_addr.parse::<std::net::SocketAddr>().unwrap().into()),
+                dst_addr: Some(dst_addr.parse::<std::net::SocketAddr>().unwrap().into()),
+                socket_type: SocketType::Tcp as i32,
+            }),
+        }
+    }
+
+    fn proxy_add(cidr: &str, mapped_cidr: Option<&str>) -> ProxyNetworkPatch {
+        ProxyNetworkPatch {
+            action: ConfigPatchAction::Add as i32,
+            cidr: Some(cidr.parse::<cidr::Ipv4Inet>().unwrap().into()),
+            mapped_cidr: mapped_cidr.map(|cidr| cidr.parse::<cidr::Ipv4Inet>().unwrap().into()),
+        }
+    }
+
+    #[test]
+    fn port_forward_add_is_idempotent() {
+        let config = TomlConfig::default();
+        let forward = port_forward_add("127.0.0.1:18080", "10.144.144.2:8080");
+
+        // A duplicate within one request and a retry after a lost response
+        // must both end up as a single forward; the second bind would fail.
+        assert!(patch_port_forwards(
+            &config,
+            vec![forward.clone(), forward.clone()]
+        ));
+        assert!(patch_port_forwards(&config, vec![forward]));
+        assert_eq!(config.get_port_forwards().len(), 1);
+    }
+
+    #[test]
+    fn proxy_network_patch_failure_applies_no_prefix() {
+        let config = TomlConfig::default();
+
+        let error = patch_proxy_networks(
+            &config,
+            vec![
+                proxy_add("10.90.0.0/24", None),
+                proxy_add("10.91.0.0/24", Some("10.92.0.0/16")),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Mapped CIDR"));
+        assert!(
+            config.get_proxy_cidrs().is_empty(),
+            "a failing list patch must not leave a partially applied prefix"
+        );
+    }
 
     fn portal_config() -> TomlConfig {
         let config = TomlConfig::default();
