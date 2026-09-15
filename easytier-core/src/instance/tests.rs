@@ -1074,6 +1074,93 @@ network_secret = "network-secret"
         instance.stop().await;
     }
 
+    #[cfg(feature = "management")]
+    #[tokio::test]
+    async fn failed_patch_error_is_not_masked_by_runtime_re_sync_failure() {
+        use easytier_proto::api::config::{
+            AclPatch, ConfigPatchAction, InstanceConfigPatch, ProxyNetworkPatch,
+        };
+
+        struct StoppingPersistence {
+            instance: std::sync::Weak<CoreInstance<TestHost>>,
+        }
+
+        #[async_trait]
+        impl crate::management::ConfigPatchPersistence for StoppingPersistence {
+            async fn persist(
+                &self,
+                _instance_id: uuid::Uuid,
+                _config: &TomlConfig,
+            ) -> anyhow::Result<()> {
+                // Simulate the instance moving to Stopping mid-request, after
+                // the ACL section committed but before the failing section
+                // and the trailing runtime re-sync.
+                if let Some(instance) = self.instance.upgrade() {
+                    instance.set_state(CoreInstanceState::Stopping);
+                }
+                Ok(())
+            }
+        }
+
+        let (packet_sink, _packet_receiver) = tokio::sync::mpsc::channel(16);
+        let config = TomlConfig::new_from_str(
+            r#"
+instance_name = "unmasked-patch-error"
+
+[network_identity]
+network_name = "unmasked-network"
+network_secret = "network-secret"
+"#,
+        )
+        .unwrap();
+        let instance =
+            CoreInstance::from_toml(config, adapters(None, Arc::new(packet_sink))).unwrap();
+        instance.start().await.unwrap();
+        let persistence = StoppingPersistence {
+            instance: Arc::downgrade(&instance),
+        };
+
+        let error = crate::management::apply_config_patch(
+            &instance,
+            InstanceConfigPatch {
+                acl: Some(AclPatch {
+                    acl: Some(crate::proto::acl::Acl::default()),
+                    ..Default::default()
+                }),
+                proxy_networks: vec![
+                    ProxyNetworkPatch {
+                        action: ConfigPatchAction::Add as i32,
+                        cidr: Some("10.90.0.0/24".parse::<cidr::Ipv4Inet>().unwrap().into()),
+                        mapped_cidr: None,
+                    },
+                    ProxyNetworkPatch {
+                        action: ConfigPatchAction::Add as i32,
+                        cidr: Some("10.91.0.0/24".parse::<cidr::Ipv4Inet>().unwrap().into()),
+                        mapped_cidr: Some("10.92.0.0/16".parse::<cidr::Ipv4Inet>().unwrap().into()),
+                    },
+                ],
+                ..Default::default()
+            },
+            Some(&persistence),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Mapped CIDR"),
+            "the patch error must be reported, got: {error:#}"
+        );
+        assert!(
+            !error.to_string().contains("stopping"),
+            "runtime re-sync failure must not mask the patch error: {error:#}"
+        );
+        // The partial-commit contract still holds for the earlier section.
+        assert!(instance.toml_config().unwrap().get_acl().is_some());
+
+        instance.set_state(CoreInstanceState::Running);
+        instance.stop().await;
+    }
+
     #[cfg(all(feature = "management", feature = "vpn-portal"))]
     #[tokio::test]
     async fn portal_client_patch_restores_durable_state_after_failures() {
