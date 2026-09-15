@@ -298,6 +298,17 @@ impl Peer {
         })
     }
 
+    /// True if any live conn's handshake declared the kdf-v2 feature. Same
+    /// per-packet-marker argument as [`Self::supports_header_aad`]: the
+    /// receiver picks the decryptor from the wire marker, so one declaring
+    /// conn is enough regardless of the path a packet takes.
+    pub fn supports_kdf_v2(&self) -> bool {
+        self.conns.iter().any(|entry| {
+            let conn = entry.value();
+            !conn.is_closed() && conn.supports_kdf_v2()
+        })
+    }
+
     pub fn has_directly_connected_conn(&self) -> bool {
         self.conns
             .iter()

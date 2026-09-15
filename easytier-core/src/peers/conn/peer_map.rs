@@ -151,6 +151,13 @@ impl PeerMap {
             .is_some_and(|peer| peer.supports_header_aad())
     }
 
+    /// Whether the destination peer negotiated the argon2id KDF on any direct
+    /// conn. Unknown peers return false and stay on the v1 SipHash keys.
+    pub fn peer_supports_kdf_v2(&self, peer_id: PeerId) -> bool {
+        self.get_peer_by_id(peer_id)
+            .is_some_and(|peer| peer.supports_kdf_v2())
+    }
+
     pub(crate) fn has_direct_attached_peer(&self, peer_id: PeerId) -> bool {
         self.get_peer_by_id(peer_id)
             .is_some_and(|peer| peer.has_direct_attached_conn())

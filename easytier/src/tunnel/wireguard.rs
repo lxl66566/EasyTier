@@ -62,6 +62,15 @@ pub struct WgConfig {
 
 impl WgConfig {
     pub fn new_from_network_identity(network_name: &str, network_secret: &str) -> Self {
+        // TODO(crypto-review S1.1): this key is derived with the fast
+        // SipHash `generate_digest_from_str`, so a captured WireGuard
+        // handshake allows high-rate offline guessing of weak network
+        // secrets. Switching to argon2id needs no negotiation (both ends
+        // derive deterministically), but it would silently break wg://
+        // tunnels between mixed versions: boringtun handshakes carry no
+        // capability channel to version the derivation, so an upgraded node
+        // and an old node would derive different keys. Left unchanged for
+        // now; revisit with an explicit key-format opt-in or a config flag.
         let mut secret = [0u8; 32];
         super::generate_digest_from_str(network_name, network_secret, &mut secret);
         Self::new_internal(secret, secret)

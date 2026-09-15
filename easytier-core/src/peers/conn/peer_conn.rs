@@ -71,11 +71,19 @@ const VERSION: u32 = 1;
 /// (empty-AAD) packets on their direct connections.
 pub const HEADER_AAD_FEATURE: &str = "header-aad-v1";
 
+/// Handshake feature: this node derives legacy data-plane keys from the
+/// network secret with argon2id (crypto-review S1.1). Packets to a peer that
+/// declared it are sealed under the argon2id keys and marked
+/// [`crate::packet::KDF_V2_MARKER`]; other destinations keep the v1 SipHash
+/// keys.
+pub const KDF_V2_FEATURE: &str = "kdf-v2";
+
 /// Features declared in every handshake message of this build.
 fn handshake_features() -> Vec<String> {
     vec![
         LIVENESS_ECHO_FEATURE.to_owned(),
         HEADER_AAD_FEATURE.to_owned(),
+        KDF_V2_FEATURE.to_owned(),
     ]
 }
 
@@ -1470,9 +1478,20 @@ impl PeerConn {
     /// True when the remote's handshake declared [`HEADER_AAD_FEATURE`], i.e.
     /// it can decrypt packets whose header is bound into the AEAD AAD.
     pub fn supports_header_aad(&self) -> bool {
+        self.remote_supports(HEADER_AAD_FEATURE)
+    }
+
+    /// True when the remote's handshake declared [`KDF_V2_FEATURE`], i.e. it
+    /// derives its legacy data-plane keys with argon2id and can open
+    /// [`crate::packet::KDF_V2_MARKER`]-marked packets.
+    pub fn supports_kdf_v2(&self) -> bool {
+        self.remote_supports(KDF_V2_FEATURE)
+    }
+
+    fn remote_supports(&self, feature: &str) -> bool {
         self.info
             .as_ref()
-            .is_some_and(|info| info.features.iter().any(|f| f == HEADER_AAD_FEATURE))
+            .is_some_and(|info| info.features.iter().any(|f| f == feature))
     }
 
     pub fn get_stats(&self) -> PeerConnStats {

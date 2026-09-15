@@ -207,15 +207,22 @@ pub struct PeerManagerHeader {
 }
 pub const PEER_MANAGER_HEADER_SIZE: usize = std::mem::size_of::<PeerManagerHeader>();
 
-/// Value of [`PeerManagerHeader::reserved`] marking an encrypted packet whose
+/// Bit of [`PeerManagerHeader::reserved`] marking an encrypted packet whose
 /// AEAD tag covers the canonical header bytes (see
 /// [`PeerManagerHeader::aad_bytes`]).
 ///
 /// The reserved byte carries disjoint meanings on disjoint packet classes:
-/// liveness tokens on unencrypted Ping/Pong, this marker on encrypted packets.
-/// Peers predating header authentication always leave it zero on encrypted
-/// packets, so the marker doubles as the receiver-side format selector.
-pub const HEADER_AAD_MARKER: u8 = 1;
+/// liveness tokens on unencrypted Ping/Pong, a bitfield of format selectors
+/// on encrypted packets. Peers predating header authentication always leave
+/// it zero on encrypted packets, so the marker doubles as the receiver-side
+/// format selector.
+pub const HEADER_AAD_MARKER: u8 = 1 << 0;
+
+/// Bit of [`PeerManagerHeader::reserved`] marking a packet sealed under the
+/// argon2id-derived legacy data-plane key (negotiated `kdf-v2` feature,
+/// crypto-review S1.1). Receivers pick their decryptor from this bit; peers
+/// predating `kdf-v2` never set or read it.
+pub const KDF_V2_MARKER: u8 = 1 << 1;
 
 impl PeerManagerHeader {
     pub fn is_encrypted(&self) -> bool {
@@ -336,12 +343,31 @@ impl PeerManagerHeader {
     /// Only meaningful on encrypted packets; see [`HEADER_AAD_MARKER`].
     ///
     /// The liveness filter stores its probe/echo token in `reserved` together
-    /// with a `LIVENESS_*` flag, so a bare `reserved == marker` check would
-    /// misread a liveness token that happens to equal the marker. Genuine
-    /// header-AAD packets never carry liveness flags: the liveness filter
-    /// leaves encrypted headers untouched.
+    /// with a `LIVENESS_*` flag, so a bare bit check would misread a liveness
+    /// token that happens to have the bit set. Genuine header-AAD packets
+    /// never carry liveness flags: the liveness filter leaves encrypted
+    /// headers untouched.
     pub fn is_header_aad(&self) -> bool {
-        self.reserved == HEADER_AAD_MARKER
+        self.has_format_marker(HEADER_AAD_MARKER)
+    }
+
+    pub fn set_header_aad(&mut self, on: bool) {
+        self.set_format_marker(HEADER_AAD_MARKER, on);
+    }
+
+    /// True when the sender sealed this packet under the argon2id-derived
+    /// data-plane key; see [`KDF_V2_MARKER`]. Same liveness caveat as
+    /// [`Self::is_header_aad`].
+    pub fn is_kdf_v2(&self) -> bool {
+        self.has_format_marker(KDF_V2_MARKER)
+    }
+
+    pub fn set_kdf_v2(&mut self, on: bool) {
+        self.set_format_marker(KDF_V2_MARKER, on);
+    }
+
+    fn has_format_marker(&self, marker: u8) -> bool {
+        self.reserved & marker != 0
             && !PeerManagerHeaderFlags::from_bits(self.flags)
                 .unwrap()
                 .intersects(
@@ -349,8 +375,14 @@ impl PeerManagerHeader {
                 )
     }
 
-    pub fn set_header_aad(&mut self, on: bool) {
-        self.reserved = if on { HEADER_AAD_MARKER } else { 0 };
+    /// Sets one format-selector bit while leaving the others (and any
+    /// liveness token) alone, so the markers compose on one packet.
+    fn set_format_marker(&mut self, marker: u8, on: bool) {
+        self.reserved = if on {
+            self.reserved | marker
+        } else {
+            self.reserved & !marker
+        };
     }
 
     /// Canonical header bytes to bind into the AEAD AAD.

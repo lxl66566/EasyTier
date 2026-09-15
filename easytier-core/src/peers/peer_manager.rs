@@ -43,8 +43,9 @@ use crate::{
     tunnel::{
         Tunnel,
         encrypt::{
-            AeadBinding, Encryptor, NullCipher, create_legacy_encryptor, derive_key_128,
-            derive_key_256, validate_algorithm,
+            AeadBinding, Encryptor, KdfSuite, NegotiatedKdfEncryptor, NullCipher,
+            create_legacy_encryptor, derive_key_128, derive_key_256, derive_key_pair_argon2id,
+            validate_algorithm,
         },
     },
 };
@@ -165,8 +166,9 @@ impl PeerRpcManagerTransport for RpcTransport {
             // if dst is directly connected, it's must not public server
             .unwrap_or(!peers.has_peer(dst_peer_id));
         if !is_dst_peer_public_server && !self.is_secure_mode_enabled {
+            let options = legacy_seal_options(peers.as_ref(), dst_peer_id);
             self.encryptor
-                .encrypt(&mut msg, legacy_aad_binding(peers.as_ref(), dst_peer_id))
+                .encrypt_with_suite(&mut msg, options.binding, options.kdf)
                 .with_context(|| "encrypt failed")?;
         }
         // send to self and this packet will be forwarded in peer_recv loop
@@ -191,18 +193,33 @@ pub(crate) fn get_next_hop_policy(is_latency_first: bool) -> NextHopPolicy {
     }
 }
 
-/// AAD binding for a legacy-encrypted packet sent to `dst_peer_id`.
+/// Sender-side crypto choices for legacy data-plane packets, selected per
+/// destination from the handshake features it negotiated (crypto-review
+/// S1.1 / S1.5).
 ///
-/// Bind the header only when the destination negotiated the header-AAD
-/// handshake feature, so peers predating header authentication always receive
-/// the legacy empty-AAD format they can decrypt. Destinations without a
-/// direct connection (pure relay targets) cannot be negotiated with and stay
-/// legacy as well.
-fn legacy_aad_binding(peers: &PeerMap, dst_peer_id: PeerId) -> AeadBinding {
-    if peers.peer_supports_header_aad(dst_peer_id) {
-        AeadBinding::Header
-    } else {
-        AeadBinding::None
+/// Both choices key off the destination's declared capabilities: bind the
+/// header into the AEAD AAD and seal under the argon2id keys only when the
+/// destination declared `header-aad-v1` / `kdf-v2`. Peers without a direct
+/// connection (pure relay targets) cannot be negotiated with and stay on the
+/// legacy format and keys.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LegacySealOptions {
+    pub binding: AeadBinding,
+    pub kdf: KdfSuite,
+}
+
+fn legacy_seal_options(peers: &PeerMap, dst_peer_id: PeerId) -> LegacySealOptions {
+    LegacySealOptions {
+        binding: if peers.peer_supports_header_aad(dst_peer_id) {
+            AeadBinding::Header
+        } else {
+            AeadBinding::None
+        },
+        kdf: if peers.peer_supports_kdf_v2(dst_peer_id) {
+            KdfSuite::V2Argon2id
+        } else {
+            KdfSuite::V1SipHash
+        },
     }
 }
 
@@ -923,11 +940,25 @@ impl PeerManagerCore {
             .unwrap_or_default();
         let encryptor: Arc<dyn Encryptor> = if flags.enable_encryption {
             validate_algorithm(&flags.encryption_algorithm)?;
-            create_legacy_encryptor(
-                &flags.encryption_algorithm,
-                derive_key_128(secret),
-                derive_key_256(secret),
-            )
+            // Both KDF suites are built up front so per-packet selection is a
+            // cheap branch: v1 SipHash keys for peers predating `kdf-v2`,
+            // argon2id keys (derived once and cached) for peers that
+            // declared it. The wire marker tells the receiver which suite a
+            // packet was sealed under, so no per-connection encryptor state
+            // is needed (crypto-review S1.1).
+            let v2_keys = derive_key_pair_argon2id(secret);
+            Arc::new(NegotiatedKdfEncryptor::new(
+                create_legacy_encryptor(
+                    &flags.encryption_algorithm,
+                    derive_key_128(secret),
+                    derive_key_256(secret),
+                ),
+                Some(create_legacy_encryptor(
+                    &flags.encryption_algorithm,
+                    v2_keys.key_128,
+                    v2_keys.key_256,
+                )),
+            ))
         } else {
             Arc::new(NullCipher)
         };
@@ -2487,7 +2518,7 @@ pub(crate) async fn try_compress_and_encrypt(
     encryptor: &Arc<dyn Encryptor + 'static>,
     msg: &mut ZCPacket,
     secure_mode_enabled: bool,
-    binding: AeadBinding,
+    options: LegacySealOptions,
 ) -> Result<(), Error> {
     let compressor = DefaultCompressor {};
     compressor
@@ -2496,7 +2527,7 @@ pub(crate) async fn try_compress_and_encrypt(
         .with_context(|| "compress failed")?;
     if !secure_mode_enabled {
         encryptor
-            .encrypt(msg, binding)
+            .encrypt_with_suite(msg, options.binding, options.kdf)
             .with_context(|| "encrypt failed")?;
     }
     Ok(())
@@ -2710,7 +2741,7 @@ impl PeerOutboundPacketRouter {
             &self.encryptor,
             &mut msg,
             self.is_secure_mode_enabled,
-            legacy_aad_binding(self.peers.as_ref(), dst_peer_id),
+            legacy_seal_options(self.peers.as_ref(), dst_peer_id),
         )
         .await?;
 
@@ -2938,14 +2969,16 @@ impl PeerOutboundPacketRouter {
                 hdr.set_no_proxy(true);
             }
 
-            if !self.is_secure_mode_enabled
-                && let Err(e) = self
+            if !self.is_secure_mode_enabled {
+                let options = legacy_seal_options(self.peers.as_ref(), *peer_id);
+                if let Err(e) = self
                     .encryptor
-                    .encrypt(&mut msg, legacy_aad_binding(self.peers.as_ref(), *peer_id))
+                    .encrypt_with_suite(&mut msg, options.binding, options.kdf)
                     .with_context(|| "encrypt failed")
-            {
-                errs.push(e.into());
-                continue;
+                {
+                    errs.push(e.into());
+                    continue;
+                }
             }
 
             self.counters
@@ -3224,7 +3257,7 @@ impl PeerPacketRouter {
                         &self.encryptor,
                         &mut ret,
                         self.secure_mode_enabled,
-                        legacy_aad_binding(self.peers.as_ref(), to_peer_id),
+                        legacy_seal_options(self.peers.as_ref(), to_peer_id),
                     )
                     .await;
                 }
