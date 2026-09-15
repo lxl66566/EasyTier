@@ -432,6 +432,20 @@ pub(crate) async fn add_new_peer_conn(
     let my_digest_empty = network_secret_digest_is_empty(local_identity);
     let peer_digest_empty = network_secret_digest_is_empty(&peer_identity);
 
+    // Legacy conns from secret-gated networks must present secret knowledge
+    // (static digest, or the challenge proof that gets backfilled into the
+    // digest after verification). A zeros digest on a non-secure conn is a
+    // peer that proved nothing: without this check the name-only comparison
+    // below would admit it (crypto-review S1.2). Secure-mode conns keep the
+    // name-only path — credential peers authenticate via their noise key
+    // instead, and old protocol versions always send a non-zero digest even
+    // for open networks.
+    if !local_secure_mode && !my_digest_empty && peer_digest_empty {
+        return Err(Error::SecretKeyError(
+            "peer did not prove knowledge of the network secret".to_string(),
+        ));
+    }
+
     let identity_ok = if my_digest_empty || peer_digest_empty {
         // Credential node: only check network_name
         local_identity.network_name == peer_identity.network_name

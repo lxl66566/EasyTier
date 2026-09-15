@@ -895,6 +895,13 @@ impl PeerContext for CorePeerContext {
     fn secret_digest(&self, network_identity: &NetworkIdentity) -> Vec<u8> {
         let snapshot = self.snapshot();
         if snapshot.hmac_secret_digest {
+            // Superseded by the negotiated `secret-challenge-v1` handshake
+            // (crypto-review S1.2): this opt-in MAC of a fixed message has
+            // the same offline guessing cost as the raw digest and never
+            // covered the initiator's message. Kept working because peers on
+            // old builds with the same flag derive the identical value; for
+            // feature-declaring peers the digest stays zeroed on the wire
+            // and this value is only used for the local post-proof backfill.
             snapshot
                 .runtime
                 .network_identity

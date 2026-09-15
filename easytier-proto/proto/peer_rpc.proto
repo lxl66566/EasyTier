@@ -309,6 +309,12 @@ service PeerCenterRpc {
       returns (GetGlobalPeerMapResponse);
 }
 
+// Legacy peer-connection handshake. The same message type carries all three
+// rounds when both sides declared the `secret-challenge-v1` feature:
+//   msg1 (initiator): zeros digest + challenge_nonce;
+//   msg2 (responder): zeros digest + challenge_nonce + secret_proof;
+//   msg3 (initiator): zeros digest + secret_proof.
+// Peers without the feature keep exchanging the static network_secret_digest.
 message HandshakeRequest {
   uint32 magic = 1;
   uint32 my_peer_id = 2;
@@ -316,6 +322,8 @@ message HandshakeRequest {
   repeated string features = 4;
   string network_name = 5;
   bytes network_secret_digest = 6;
+  bytes challenge_nonce = 7;
+  bytes secret_proof = 8;
 }
 
 message KcpConnData {

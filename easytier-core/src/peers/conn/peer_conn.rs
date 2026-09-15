@@ -78,13 +78,94 @@ pub const HEADER_AAD_FEATURE: &str = "header-aad-v1";
 /// keys.
 pub const KDF_V2_FEATURE: &str = "kdf-v2";
 
+/// Handshake feature: this node authenticates the network secret with a
+/// per-connection HMAC challenge-response instead of transmitting the static
+/// digest (crypto-review S1.2). When both sides declare it, the legacy
+/// handshake carries fresh nonces and transcript proofs and never puts the
+/// digest on the wire, so a passive eavesdropper no longer obtains an
+/// equivalent password.
+///
+/// Residual risk (documented): an active attacker can still relay a captured
+/// proof between live endpoints, and can strip the feature to force a
+/// featureless peer into the old static-digest flow. Fully authenticating
+/// endpoints requires secure mode's noise transcript proof.
+pub const SECRET_CHALLENGE_FEATURE: &str = "secret-challenge-v1";
+
+/// Size of the fresh per-connection nonces and proofs, matching
+/// [`NetworkSecretDigest`] and HMAC-SHA256 output.
+const CHALLENGE_FIELD_LEN: usize = 32;
+
 /// Features declared in every handshake message of this build.
 fn handshake_features() -> Vec<String> {
     vec![
         LIVENESS_ECHO_FEATURE.to_owned(),
         HEADER_AAD_FEATURE.to_owned(),
         KDF_V2_FEATURE.to_owned(),
+        SECRET_CHALLENGE_FEATURE.to_owned(),
     ]
+}
+
+/// Which side of a legacy handshake a challenge proof is computed for; the
+/// role tag keeps initiator and responder proofs domain-separated over the
+/// same transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChallengeRole {
+    Initiator,
+    Responder,
+}
+
+impl ChallengeRole {
+    fn tag(self) -> &'static [u8] {
+        match self {
+            ChallengeRole::Initiator => b":initiator",
+            ChallengeRole::Responder => b":responder",
+        }
+    }
+}
+
+/// Canonical transcript covered by legacy handshake challenge proofs
+/// (crypto-review S1.2).
+///
+/// Variable-length fields are length-prefixed so the concatenation is
+/// unambiguous. Both nonces are covered, which makes every proof valid for
+/// exactly one handshake: replaying a captured message against a fresh
+/// connection fails because the fresh side contributed a new nonce.
+fn challenge_transcript(
+    role: ChallengeRole,
+    network_name: &str,
+    initiator_peer_id: PeerId,
+    responder_peer_id: PeerId,
+    initiator_nonce: &[u8],
+    responder_nonce: &[u8],
+) -> Vec<u8> {
+    fn put_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
+        buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(bytes);
+    }
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"easytier-legacy-hs-challenge-v1");
+    buf.extend_from_slice(role.tag());
+    put_len_prefixed(&mut buf, network_name.as_bytes());
+    buf.extend_from_slice(&initiator_peer_id.to_be_bytes());
+    buf.extend_from_slice(&responder_peer_id.to_be_bytes());
+    put_len_prefixed(&mut buf, initiator_nonce);
+    put_len_prefixed(&mut buf, responder_nonce);
+    buf
+}
+
+/// Secret material carried by one legacy handshake message.
+#[derive(Debug)]
+enum HandshakeSecret {
+    /// Static digest comparison, the pre-challenge protocol. `send` is false
+    /// when the remote identity is unknown or foreign; the field is zeroed.
+    Static { send: bool },
+    /// One round of the `secret-challenge-v1` flow; the digest field is
+    /// zeroed so the equivalent-password never leaves the node.
+    Challenge {
+        nonce: [u8; CHALLENGE_FIELD_LEN],
+        proof: Option<[u8; CHALLENGE_FIELD_LEN]>,
+    },
 }
 
 /// The proof of client secret.
@@ -550,7 +631,7 @@ impl PeerConn {
 
     async fn send_handshake(
         &self,
-        send_secret_digest: bool,
+        secret: HandshakeSecret,
         metric_network_name: &str,
     ) -> Result<(), Error> {
         let network = self.context.network_identity();
@@ -563,15 +644,24 @@ impl PeerConn {
             ..Default::default()
         };
 
-        // only send network secret digest if the network is the same
-        if send_secret_digest {
-            req.network_secret_digest
-                .extend_from_slice(&network.secret_digest().unwrap_or_default());
-        } else {
-            // fill zero
-            req.network_secret_digest
-                .extend_from_slice(&[0u8; std::mem::size_of::<NetworkSecretDigest>()]);
+        let mut digest = [0u8; std::mem::size_of::<NetworkSecretDigest>()];
+        match secret {
+            // only send network secret digest if the network is the same
+            HandshakeSecret::Static { send } => {
+                if send {
+                    digest.copy_from_slice(&network.secret_digest().unwrap_or_default());
+                }
+            }
+            HandshakeSecret::Challenge { nonce, proof } => {
+                req.challenge_nonce = nonce.to_vec();
+                if let Some(proof) = proof {
+                    req.secret_proof = proof.to_vec();
+                }
+                // The digest stays zeroed: it is an equivalent password and
+                // must not go on the wire (crypto-review S1.2).
+            }
         }
+        req.network_secret_digest = digest.to_vec();
 
         let hs_req = req.encode_to_vec();
         let mut zc_packet = ZCPacket::new_with_payload(hs_req.as_bytes());
@@ -591,6 +681,183 @@ impl PeerConn {
         // yield to send the response packet
         tokio::task::yield_now().await;
 
+        Ok(())
+    }
+
+    /// Whether the local network is actually gated by a secret. Open
+    /// networks keep the static-digest flow: there is nothing to hide, and
+    /// the digest equality is the only admission check both sides share.
+    fn local_network_has_secret(&self) -> bool {
+        self.context
+            .network_identity()
+            .network_secret
+            .as_deref()
+            .is_some_and(|secret| !secret.is_empty())
+    }
+
+    /// Whether the initiator's handshake request selects the
+    /// `secret-challenge-v1` flow: it declared the feature, targets our
+    /// network, and we hold the secret it must prove.
+    fn should_challenge_initiator(&self) -> bool {
+        self.info.as_ref().is_some_and(|info| {
+            info.features.iter().any(|f| f == SECRET_CHALLENGE_FEATURE)
+                && info.network_name == self.context.network_name()
+        }) && self.local_network_has_secret()
+    }
+
+    /// Challenge-response rounds of the responder side (crypto-review S1.2).
+    ///
+    /// msg2 carries our fresh nonce plus a proof over both nonces; msg3 must
+    /// answer with the initiator's proof over the same transcript. On
+    /// success the initiator's digest is adopted as ours — it proved
+    /// knowledge of the secret, which is what the digest comparison encodes.
+    async fn respond_with_challenge(&mut self) -> Result<(), Error> {
+        let info = self.info.as_ref().expect("handshake request is decoded");
+        let initiator_peer_id = info.my_peer_id;
+        let network_name = info.network_name.clone();
+        let initiator_nonce: [u8; CHALLENGE_FIELD_LEN] =
+            info.challenge_nonce.clone().try_into().map_err(|_| {
+                Error::WaitRespError("challenge nonce missing or malformed".to_owned())
+            })?;
+        let responder_nonce: [u8; CHALLENGE_FIELD_LEN] = rand::random();
+
+        let responder_transcript = challenge_transcript(
+            ChallengeRole::Responder,
+            &network_name,
+            initiator_peer_id,
+            self.my_peer_id,
+            &initiator_nonce,
+            &responder_nonce,
+        );
+        let initiator_transcript = challenge_transcript(
+            ChallengeRole::Initiator,
+            &network_name,
+            initiator_peer_id,
+            self.my_peer_id,
+            &initiator_nonce,
+            &responder_nonce,
+        );
+        let proof = self.network_secret_proof(&responder_transcript)?;
+
+        self.send_handshake(
+            HandshakeSecret::Challenge {
+                nonce: responder_nonce,
+                proof: Some(proof),
+            },
+            &network_name,
+        )
+        .await?;
+
+        let msg3 = timeout(
+            Duration::from_secs(5),
+            self.recv_next_peer_manager_packet(Some(PacketType::HandShake)),
+        )
+        .await
+        .map_err(|e| {
+            Error::WaitRespError(format!("wait initiator challenge proof timeout: {:?}", e))
+        })??;
+        self.record_control_rx(&network_name, msg3.buf_len() as u64);
+        let msg3 = Self::decode_handshake_packet(&msg3)?;
+        let initiator_proof: [u8; CHALLENGE_FIELD_LEN] = msg3
+            .secret_proof
+            .try_into()
+            .map_err(|_| Error::WaitRespError("initiator proof missing or malformed".to_owned()))?;
+        self.verify_challenge_proof(&initiator_proof, &initiator_transcript)?;
+
+        let local_digest = self.context.secret_digest(&self.context.network_identity());
+        self.info.as_mut().unwrap().network_secret_digest = local_digest;
+        Ok(())
+    }
+
+    fn network_secret_proof(&self, transcript: &[u8]) -> Result<[u8; CHALLENGE_FIELD_LEN], Error> {
+        self.context
+            .secret_proof(transcript)
+            .map(|mac| {
+                let mut proof = [0u8; CHALLENGE_FIELD_LEN];
+                proof.copy_from_slice(&mac.finalize().into_bytes());
+                proof
+            })
+            .ok_or_else(|| {
+                Error::WaitRespError("no network secret for challenge response".to_owned())
+            })
+    }
+
+    fn verify_challenge_proof(&self, proof: &[u8], transcript: &[u8]) -> Result<(), Error> {
+        self.context
+            .secret_proof(transcript)
+            .ok_or_else(|| {
+                Error::WaitRespError("no network secret for challenge verification".to_owned())
+            })?
+            .verify_slice(proof)
+            .map_err(|_| Error::SecretKeyError("handshake challenge proof mismatch".to_owned()))
+    }
+
+    /// Challenge-response rounds of the initiator side (crypto-review S1.2).
+    ///
+    /// msg1 (sent by the caller) carried only a fresh nonce. Here we verify
+    /// the responder's proof over both nonces, answer with our own proof, and
+    /// adopt the local digest for the remote identity: the peer proved
+    /// knowledge of the secret, which is what the digest comparison encodes.
+    async fn finish_challenge_as_client(
+        &mut self,
+        rsp: HandshakeRequest,
+        initiator_nonce: [u8; CHALLENGE_FIELD_LEN],
+    ) -> Result<(), Error> {
+        let network = self.context.network_identity();
+        if rsp.network_name != network.network_name {
+            // Foreign network (e.g. a shared public server): the secret never
+            // applied and identity is name-based downstream; no challenge is
+            // expected even from a feature-declaring responder.
+            self.info = Some(rsp);
+            return Ok(());
+        }
+
+        if !rsp.features.iter().any(|f| f == SECRET_CHALLENGE_FEATURE) {
+            // The initiator cannot authenticate a featureless responder
+            // without revealing the digest, and old responders cannot echo a
+            // digest they never received. Refuse rather than downgrade.
+            return Err(Error::SecretKeyError(
+                "peer does not support secret-challenge-v1; refusing unauthenticated handshake, upgrade the peer".to_owned(),
+            ));
+        }
+
+        let invalid = || Error::WaitRespError("malformed challenge response".to_owned());
+        let responder_nonce: [u8; CHALLENGE_FIELD_LEN] = rsp
+            .challenge_nonce
+            .clone()
+            .try_into()
+            .map_err(|_| invalid())?;
+        let responder_proof: [u8; CHALLENGE_FIELD_LEN] =
+            rsp.secret_proof.clone().try_into().map_err(|_| invalid())?;
+
+        let transcript = |role| {
+            challenge_transcript(
+                role,
+                &rsp.network_name,
+                self.my_peer_id,
+                rsp.my_peer_id,
+                &initiator_nonce,
+                &responder_nonce,
+            )
+        };
+        // Authenticate the responder; its proof covers our fresh nonce, so a
+        // replayed captured response cannot pass.
+        self.verify_challenge_proof(&responder_proof, &transcript(ChallengeRole::Responder))?;
+
+        // Prove ourselves over the same transcript.
+        let proof = self.network_secret_proof(&transcript(ChallengeRole::Initiator))?;
+        self.send_handshake(
+            HandshakeSecret::Challenge {
+                nonce: initiator_nonce,
+                proof: Some(proof),
+            },
+            &network.network_name,
+        )
+        .await?;
+
+        let mut rsp = rsp;
+        rsp.network_secret_digest = self.context.secret_digest(&network);
+        self.info = Some(rsp);
         Ok(())
     }
 
@@ -1201,6 +1468,7 @@ impl PeerConn {
 
             features: noise.remote_features.clone(),
             network_secret_digest: noise.secret_digest.clone(),
+            ..Default::default()
         }
     }
 
@@ -1244,9 +1512,16 @@ impl PeerConn {
             self.info = Some(rsp);
             self.is_client = Some(false);
 
-            let send_digest = self.get_network_identity() == self.context.network_identity();
-            self.send_handshake(send_digest, &self.get_network_identity().network_name)
+            if self.should_challenge_initiator() {
+                self.respond_with_challenge().await?;
+            } else {
+                let send_digest = self.get_network_identity() == self.context.network_identity();
+                self.send_handshake(
+                    HandshakeSecret::Static { send: send_digest },
+                    &self.get_network_identity().network_name,
+                )
                 .await?;
+            }
         } else {
             return Err(Error::WaitRespError(format!(
                 "unexpected packet type during handshake: {}",
@@ -1277,11 +1552,28 @@ impl PeerConn {
             self.is_client = Some(true);
         } else {
             let network = self.context.network_identity();
-            self.send_handshake(true, &network.network_name).await?;
+            // Challenge the responder when the network is secret-gated; open
+            // networks keep the static-digest flow for interop.
+            let use_challenge = self.local_network_has_secret();
+            let initiator_nonce: [u8; CHALLENGE_FIELD_LEN] = rand::random();
+            let secret = if use_challenge {
+                HandshakeSecret::Challenge {
+                    nonce: initiator_nonce,
+                    proof: None,
+                }
+            } else {
+                HandshakeSecret::Static { send: true }
+            };
+            self.send_handshake(secret, &network.network_name).await?;
             tracing::info!("waiting for handshake request from server");
             let rsp = self.wait_handshake_loop().await?;
             tracing::info!("handshake response: {:?}", rsp);
-            self.info = Some(rsp);
+            if use_challenge {
+                self.finish_challenge_as_client(rsp, initiator_nonce)
+                    .await?;
+            } else {
+                self.info = Some(rsp);
+            }
             self.is_client = Some(true);
         }
 
