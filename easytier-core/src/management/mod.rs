@@ -45,6 +45,8 @@ pub use full::{
     call_management_json_rpc, log_level_name, parse_log_level, register_instance_management_rpc,
     register_management_rpc,
 };
+#[cfg(all(feature = "web-client", test))]
+pub(crate) use full::{patch_stats_for_test, reset_patch_stats_for_test};
 pub use instance_rpc::InstanceManagementRpc;
 pub use rpc_server_hook::ManagementRpcServerHook;
 pub use selector::{

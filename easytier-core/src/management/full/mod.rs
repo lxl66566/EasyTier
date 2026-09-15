@@ -38,6 +38,8 @@ use super::{
 #[cfg(feature = "management")]
 pub use compiled::register_instance_management_rpc;
 pub use config_patch::{ConfigPatchPersistence, apply_config_patch};
+#[cfg(test)]
+pub(crate) use config_patch::{patch_stats_for_test, reset_patch_stats_for_test};
 pub use instance_info::network_instance_running_info;
 #[cfg(feature = "management")]
 pub use logger_rpc::{
