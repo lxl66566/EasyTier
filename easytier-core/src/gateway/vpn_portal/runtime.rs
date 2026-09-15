@@ -161,6 +161,7 @@ struct PortalClientTrafficMetrics {
     upload_packets: CounterHandle,
     download_bytes: CounterHandle,
     download_packets: CounterHandle,
+    source_mismatch_packets: CounterHandle,
 }
 
 impl PortalClientTrafficMetrics {
@@ -172,7 +173,10 @@ impl PortalClientTrafficMetrics {
             upload_bytes: stats.get_counter(MetricName::VpnPortalClientBytesTx, labels.clone()),
             upload_packets: stats.get_counter(MetricName::VpnPortalClientPacketsTx, labels.clone()),
             download_bytes: stats.get_counter(MetricName::VpnPortalClientBytesRx, labels.clone()),
-            download_packets: stats.get_counter(MetricName::VpnPortalClientPacketsRx, labels),
+            download_packets: stats
+                .get_counter(MetricName::VpnPortalClientPacketsRx, labels.clone()),
+            source_mismatch_packets: stats
+                .get_counter(MetricName::VpnPortalClientPacketsSourceMismatch, labels),
         }
     }
 
@@ -184,6 +188,10 @@ impl PortalClientTrafficMetrics {
     fn record_download(&self, bytes: usize) {
         self.download_bytes.add(bytes as u64);
         self.download_packets.inc();
+    }
+
+    fn record_source_mismatch(&self) {
+        self.source_mismatch_packets.inc();
     }
 }
 
@@ -647,9 +655,22 @@ impl PortalModule {
             let virtual_ip = client.virtual_ip.address();
             let traffic = traffic.clone();
             tokio::spawn(async move {
+                // A misbehaving client can send mismatched packets
+                // indefinitely, so the warning is rate-limited and every drop
+                // is counted in the source-mismatch metric.
+                let mut source_mismatches = 0u64;
                 while let Some(payload) = client_stream.recv().await {
                     if !has_ipv4_source(&payload, virtual_ip) {
-                        tracing::warn!(client = %name, expected = ?virtual_ip, "VPN client source does not match its assigned address");
+                        source_mismatches += 1;
+                        traffic.record_source_mismatch();
+                        if should_log_source_mismatch(source_mismatches) {
+                            tracing::warn!(
+                                client = %name,
+                                expected = ?virtual_ip,
+                                total = source_mismatches,
+                                "VPN client source does not match its assigned address"
+                            );
+                        }
                         continue;
                     }
                     if let Err(error) = attached.send_packet(&payload).await {
@@ -1027,6 +1048,14 @@ fn has_ipv4_source(payload: &[u8], expected: Ipv4Addr) -> bool {
     ipv4_source(payload) == Some(expected)
 }
 
+/// Warning interval for source-mismatch packets: the first drop and then
+/// every Nth, so a hostile client cannot flood the host log.
+const SOURCE_MISMATCH_LOG_INTERVAL: u64 = 100;
+
+fn should_log_source_mismatch(total: u64) -> bool {
+    total == 1 || total % SOURCE_MISMATCH_LOG_INTERVAL == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1293,6 +1322,20 @@ mod tests {
             assigned
         ));
         assert!(!has_ipv4_source(&[0u8; 8], assigned));
+    }
+
+    #[test]
+    fn source_mismatch_warning_is_rate_limited() {
+        assert!(should_log_source_mismatch(1));
+        assert!(!should_log_source_mismatch(2));
+        assert!(!should_log_source_mismatch(
+            SOURCE_MISMATCH_LOG_INTERVAL - 1
+        ));
+        assert!(should_log_source_mismatch(SOURCE_MISMATCH_LOG_INTERVAL));
+        assert!(!should_log_source_mismatch(
+            SOURCE_MISMATCH_LOG_INTERVAL + 1
+        ));
+        assert!(should_log_source_mismatch(2 * SOURCE_MISMATCH_LOG_INTERVAL));
     }
 
     #[tokio::test]
@@ -1672,6 +1715,102 @@ mod tests {
 
         drop(to_runtime);
         task.await.unwrap();
+        peer_manager.clear_resources().await;
+    }
+
+    #[tokio::test]
+    async fn portal_client_source_mismatch_packets_are_counted_and_dropped() {
+        let (peer_manager, runtime_config) = network_runtime();
+        peer_manager.run().await.unwrap();
+        let virtual_ip = Ipv4Addr::new(10, 82, 0, 2);
+        let config = PortalRuntimeConfig {
+            clients: vec![client("alice", virtual_ip, &["ops"])],
+        };
+        let statuses = Arc::new(RwLock::new(BTreeMap::from([(
+            "alice".to_owned(),
+            ClientStatus::default(),
+        )])));
+        let session_locks = Arc::new(RwLock::new(BTreeMap::from([(
+            "alice".to_owned(),
+            Arc::new(Mutex::new(())),
+        )])));
+        let (to_runtime, from_client) = mpsc::channel(1);
+        let (to_client, _from_runtime) = mpsc::channel(1);
+        let (_endpoint_sender, endpoint) = tokio::sync::watch::channel("portal://alice".to_owned());
+        let session = PortalSession {
+            client_name: "alice".to_owned(),
+            endpoint,
+            identity_private_key: [177u8; 32],
+            from_client,
+            to_client,
+        };
+        let task = tokio::spawn(PortalModule::run_session(
+            session,
+            "portal://listener".parse().unwrap(),
+            peer_manager.clone(),
+            runtime_config,
+            Arc::new(StdRwLock::new(config)),
+            statuses.clone(),
+            session_locks,
+            traffic_metrics(&peer_manager, &["alice"]),
+            Arc::new(()),
+            CancellationToken::new(),
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let status = statuses.read().await.get("alice").cloned().unwrap();
+                if status.state == PortalClientState::Online {
+                    return;
+                }
+                assert_ne!(
+                    status.state,
+                    PortalClientState::Error,
+                    "portal session failed before becoming online: {:?}",
+                    status.error
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("portal session did not become online");
+
+        let spoofed = raw_ipv4(Ipv4Addr::new(10, 82, 0, 99), Ipv4Addr::new(10, 82, 0, 1));
+        for _ in 0..3 {
+            to_runtime.send(spoofed.clone()).await.unwrap();
+        }
+        let valid = raw_ipv4(virtual_ip, Ipv4Addr::new(10, 82, 0, 1));
+        to_runtime.send(valid.clone()).await.unwrap();
+        drop(to_runtime);
+        task.await.unwrap();
+
+        let labels = LabelSet::new()
+            .with_label_type(LabelType::NetworkName("portal-test".to_owned()))
+            .with_label_type(LabelType::VpnPortalClient("alice".to_owned()));
+        let stats = peer_manager.stats_manager();
+        assert_eq!(
+            stats
+                .get_metric(MetricName::VpnPortalClientPacketsSourceMismatch, &labels)
+                .unwrap()
+                .value,
+            3,
+            "spoofed-source packets must be counted as source mismatches"
+        );
+        assert_eq!(
+            stats
+                .get_metric(MetricName::VpnPortalClientPacketsTx, &labels)
+                .unwrap()
+                .value,
+            1,
+            "spoofed-source packets must not be forwarded"
+        );
+        assert_eq!(
+            stats
+                .get_metric(MetricName::VpnPortalClientBytesTx, &labels)
+                .unwrap()
+                .value,
+            valid.len() as u64
+        );
         peer_manager.clear_resources().await;
     }
 
