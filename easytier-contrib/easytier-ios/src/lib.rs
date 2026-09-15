@@ -369,6 +369,16 @@ pub extern "C" fn easytier_ios_collect_network_infos(max_length: c_int) -> *mut 
         // `easytier_ffi::free_string`.
         let count = unsafe { easytier_ffi::collect_network_infos(infos.as_mut_ptr(), max_length) };
         if count < 0 {
+            // The FFI contract frees nothing on failure; release any entries
+            // it may already have written so they cannot leak.
+            for info in &infos {
+                // SAFETY: entries are either null or strings allocated by
+                // easytier-ffi; free_string accepts null.
+                unsafe {
+                    easytier_ffi::free_string(info.key);
+                    easytier_ffi::free_string(info.value);
+                }
+            }
             return ptr::null_mut();
         }
         let mut map = serde_json::Map::new();
