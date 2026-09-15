@@ -169,7 +169,6 @@ pub struct AttachedPeerRuntime {
     packet_receiver: Mutex<HostPacketReceiver>,
     cleanup_resources: StdMutex<Option<AttachedCleanupResources>>,
     cleanup_done: CancellationToken,
-    runtime_handle: Handle,
     closed: CancellationToken,
     #[cfg(test)]
     cleanup_pause: StdMutex<Option<Arc<CleanupPause>>>,
@@ -182,7 +181,6 @@ impl AttachedPeerRuntime {
         network_runtime_config: CoreRuntimeConfigStore,
         config: AttachedPeerConfig,
     ) -> anyhow::Result<Arc<Self>> {
-        let runtime_handle = Handle::current();
         let network = network_runtime_config.snapshot();
         let (peer_snapshot, credential_public_key) = build_peer_snapshot(&network, &config)?;
         let credential_registration = match credential_public_key {
@@ -283,7 +281,6 @@ impl AttachedPeerRuntime {
                 credential_registration,
             })),
             cleanup_done: CancellationToken::new(),
-            runtime_handle,
             closed: CancellationToken::new(),
             #[cfg(test)]
             cleanup_pause: StdMutex::new(None),
@@ -335,14 +332,36 @@ impl AttachedPeerRuntime {
         };
         let AttachedCleanupResources {
             connections,
-            credential_registration,
+            mut credential_registration,
         } = resources;
         let network_peer_manager = self.network_peer_manager.clone();
         let peer_manager = self.peer_manager.clone();
         let cleanup_done = self.cleanup_done.clone().drop_guard();
         #[cfg(test)]
         let cleanup_pause = self.cleanup_pause.lock().clone();
-        self.runtime_handle.spawn(async move {
+        // Spawning through a stored handle whose runtime has already shut
+        // down silently drops the future (tokio 1.52 behavior), so Drop must
+        // never depend on the creating runtime being alive. Prefer the
+        // ambient runtime, which in every regular flow is the creating one;
+        // without one (e.g. Drop after runtime shutdown during mobile
+        // teardown) only the synchronous part of the cleanup can run.
+        let Ok(handle) = Handle::try_current() else {
+            network_peer_manager.unregister_attached_peer_prefix(peer_manager.my_peer_id());
+            if let Some(credential_registration) = credential_registration.as_mut() {
+                credential_registration.revoke();
+            }
+            // Dropping the drop guard cancels `cleanup_done`, releasing any
+            // `close()` waiter; the connections are left to the peer
+            // managers' own teardown, whose runtime is gone anyway.
+            drop(connections);
+            drop(cleanup_done);
+            tracing::warn!(
+                "attached peer dropped without an ambient Tokio runtime; \
+                 only synchronous cleanup ran"
+            );
+            return;
+        };
+        handle.spawn(async move {
             let _cleanup_done = cleanup_done;
             let connection_cleanup = async move {
                 #[cfg(test)]
@@ -1339,6 +1358,60 @@ mod tests {
 
         pause.resume.notify_one();
         pause.finished.notified().await;
+        network_peer_manager.clear_resources().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_attached_peer_without_ambient_runtime_cleans_up_synchronously() {
+        let (network_peer_manager, store) = peer_manager_with_acl_and_secure(Vec::new(), true);
+        network_peer_manager.run().await.unwrap();
+        let identity_private_key = [10; 32];
+        let credential_public_key =
+            *PublicKey::from(&StaticSecret::from(identity_private_key)).as_bytes();
+        let attached = AttachedPeerRuntime::connect(
+            network_peer_manager.clone(),
+            store.clone(),
+            AttachedPeerConfig {
+                name: "dropped-off-runtime".to_owned(),
+                virtual_ip: attached_ipv4(Ipv4Addr::new(10, 82, 0, 6)),
+                groups: vec!["ops".to_owned()],
+                identity_private_key,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            network_peer_manager
+                .credential_manager()
+                .is_pubkey_trusted(&credential_public_key)
+        );
+
+        // Drop outside any runtime context, as mobile teardown can do once
+        // the Tokio runtime has already shut down. The Drop path must not
+        // depend on a usable runtime.
+        std::thread::spawn(move || drop(attached)).join().unwrap();
+
+        assert!(
+            !network_peer_manager
+                .credential_manager()
+                .is_pubkey_trusted(&credential_public_key),
+            "synchronous fallback did not revoke the credential"
+        );
+
+        // The fallback also releases the prefix reservation.
+        let reconnected = AttachedPeerRuntime::connect(
+            network_peer_manager.clone(),
+            store,
+            AttachedPeerConfig {
+                name: "reconnected".to_owned(),
+                virtual_ip: attached_ipv4(Ipv4Addr::new(10, 82, 0, 6)),
+                groups: Vec::new(),
+                identity_private_key: [11; 32],
+            },
+        )
+        .await
+        .unwrap();
+        reconnected.close().await;
         network_peer_manager.clear_resources().await;
     }
 }
