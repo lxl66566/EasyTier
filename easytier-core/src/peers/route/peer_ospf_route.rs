@@ -2547,8 +2547,11 @@ impl PeerRouteServiceImpl {
     }
 
     pub fn mark_interface_peers_dirty(&self) {
+        // Release: pair with the Acquire loads in interface_peer_snapshot /
+        // update_my_conn_info, so a reader observing the new generation also
+        // observes the interface changes that preceded this call.
         self.interface_peers_generation
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(1, Ordering::Release);
     }
 
     async fn interface_peer_snapshot_uncached(&self) -> InterfacePeerSnapshot {
