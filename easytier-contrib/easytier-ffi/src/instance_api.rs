@@ -210,35 +210,45 @@ pub(crate) unsafe fn collect_network_infos(
         }
     };
 
-    let mut index = 0;
-    for (instance_id, value) in collected_infos.iter() {
-        if index >= max_length {
-            break;
+    // Encode all entries before handing any string to the caller: an
+    // unencodable name must fail atomically, otherwise already-written
+    // entries leak because the caller only frees them on success.
+    let encoded_infos = match collected_infos
+        .iter()
+        .filter_map(|(instance_id, value)| {
+            ffi_context()
+                .manager
+                .instance(*instance_id)
+                .map(|instance| (instance.instance_name().to_owned(), value))
+        })
+        .take(max_length)
+        .map(|(name, value)| {
+            let key = CString::new(name)
+                .map_err(|err| format!("failed to encode instance name: {}", err))?;
+            let value = serde_json::to_string(value)
+                .map_err(|err| format!("failed to serialize instance info: {}", err))?;
+            let value = CString::new(value)
+                .map_err(|err| format!("failed to encode instance info: {}", err))?;
+            Ok((key, value))
+        })
+        .collect::<Result<Vec<_>, String>>()
+    {
+        Ok(value) => value,
+        Err(err) => {
+            set_error_msg(&err);
+            return -1;
         }
-        let Some(key) = ffi_context()
-            .manager
-            .instance(*instance_id)
-            .map(|instance| instance.instance_name().to_owned())
-        else {
-            continue;
-        };
-        // convert value to json string
-        let value = match serde_json::to_string(&value) {
-            Ok(value) => value,
-            Err(e) => {
-                set_error_msg(&format!("failed to serialize instance info: {}", e));
-                return -1;
-            }
-        };
+    };
 
+    let count = encoded_infos.len();
+    for (index, (key, value)) in encoded_infos.into_iter().enumerate() {
         infos[index] = KeyValuePair {
-            key: std::ffi::CString::new(key).unwrap().into_raw(),
-            value: std::ffi::CString::new(value).unwrap().into_raw(),
+            key: key.into_raw(),
+            value: value.into_raw(),
         };
-        index += 1;
     }
 
-    index as std::ffi::c_int
+    count as std::ffi::c_int
 }
 
 /// # Safety

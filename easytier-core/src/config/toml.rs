@@ -758,14 +758,31 @@ impl TomlConfig {
 #[cfg(feature = "web-client")]
 mod snapshot;
 
+/// Remove control characters: they are invalid in hostnames and unusable in
+/// instance names (C-string FFI boundary, NUL above all).
+fn strip_control_chars(value: &str) -> String {
+    value.chars().filter(|c| !c.is_control()).collect()
+}
+
 impl ConfigLoader for TomlConfig {
     fn get_inst_name(&self) -> String {
-        self.config
-            .lock()
-            .unwrap()
-            .instance_name
-            .clone()
-            .unwrap_or_else(default_instance_name)
+        let mut config = self.config.lock().unwrap();
+
+        // Instance names cross FFI boundaries as C strings and key RPC name
+        // selectors, so control characters (NUL above all) are unusable.
+        // Strip them on read and cache back, mirroring get_hostname.
+        match config.instance_name.as_mut().map(|name| {
+            *name = strip_control_chars(name);
+            name.clone()
+        }) {
+            Some(name) if !name.is_empty() => name,
+            // A name stripping to nothing is treated as unset.
+            Some(_) => {
+                config.instance_name = None;
+                default_instance_name()
+            }
+            None => default_instance_name(),
+        }
     }
 
     fn set_inst_name(&self, name: String) {
@@ -777,9 +794,8 @@ impl ConfigLoader for TomlConfig {
 
         match hostname {
             Some(hostname) => {
-                let hostname = hostname
+                let hostname = strip_control_chars(&hostname)
                     .chars()
-                    .filter(|c| !c.is_control())
                     .take(32)
                     .collect::<String>();
 
@@ -1355,6 +1371,21 @@ expiry_unix = 2000000000
 
         let configured = TomlConfig::new_from_str("hostname = \"node\\u0007-name\"").unwrap();
         assert_eq!(configured.get_hostname(), "node-name");
+    }
+
+    #[test]
+    fn instance_name_control_characters_are_stripped_on_read() {
+        let absent = TomlConfig::default();
+        assert_eq!(absent.get_inst_name(), "default");
+
+        // NUL passes TOML parsing but must never reach callers (C-string FFI
+        // boundary, CString::new would fail or panic).
+        let configured = TomlConfig::new_from_str(r#"instance_name = "a\u0000b\u0007""#).unwrap();
+        assert_eq!(configured.get_inst_name(), "ab");
+
+        // A name stripping to nothing falls back to the default name.
+        let stripped_empty = TomlConfig::new_from_str(r#"instance_name = "\u0000""#).unwrap();
+        assert_eq!(stripped_empty.get_inst_name(), "default");
     }
 
     #[test]
