@@ -985,6 +985,95 @@ source = "web"
         instance.stop().await;
     }
 
+    #[cfg(feature = "management")]
+    #[tokio::test]
+    async fn config_patch_serializes_once_for_a_single_section_patch() {
+        use easytier_proto::api::config::{AclPatch, InstanceConfigPatch};
+
+        let (packet_sink, _packet_receiver) = tokio::sync::mpsc::channel(16);
+        let config = TomlConfig::new_from_str(
+            r#"
+instance_name = "single-serialization-patch"
+hostname = "stays"
+
+[network_identity]
+network_name = "single-serialization-network"
+network_secret = "network-secret"
+"#,
+        )
+        .unwrap();
+        let instance =
+            CoreInstance::from_toml(config, adapters(None, Arc::new(packet_sink))).unwrap();
+        instance.start().await.unwrap();
+
+        crate::management::reset_patch_stats_for_test();
+        crate::management::apply_config_patch(
+            &instance,
+            InstanceConfigPatch {
+                acl: Some(AclPatch {
+                    acl: Some(crate::proto::acl::Acl::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // One commit for the touched section: a single full normalization
+        // plus one dump comparison (two serializations). Untouched sections
+        // must not validate or serialize at all, and the exit-node sync
+        // reuses the commit's normalized form.
+        let (serializations, normalizations) = crate::management::patch_stats_for_test();
+        assert_eq!(
+            (serializations, normalizations),
+            (2, 1),
+            "untouched sections must skip validation and serialization"
+        );
+        assert!(instance.toml_config().unwrap().get_acl().is_some());
+        assert_eq!(instance.toml_config().unwrap().get_hostname(), "stays");
+        instance.stop().await;
+    }
+
+    #[cfg(feature = "management")]
+    #[tokio::test]
+    async fn config_patch_without_effect_skips_serialization() {
+        use easytier_proto::api::config::InstanceConfigPatch;
+
+        let (packet_sink, _packet_receiver) = tokio::sync::mpsc::channel(16);
+        let config = TomlConfig::new_from_str(
+            r#"
+instance_name = "no-op-patch"
+hostname = "unchanged"
+
+[network_identity]
+network_name = "no-op-network"
+network_secret = "network-secret"
+"#,
+        )
+        .unwrap();
+        let instance =
+            CoreInstance::from_toml(config, adapters(None, Arc::new(packet_sink))).unwrap();
+        instance.start().await.unwrap();
+
+        crate::management::reset_patch_stats_for_test();
+        crate::management::apply_config_patch(&instance, InstanceConfigPatch::default(), None)
+            .await
+            .unwrap();
+
+        // No section is touched, so nothing is serialized; the one lazy
+        // normalization feeds the exit-node sync and is then reused.
+        let (serializations, normalizations) = crate::management::patch_stats_for_test();
+        assert_eq!(
+            (serializations, normalizations),
+            (0, 1),
+            "no-op patch must not serialize the config"
+        );
+        assert_eq!(instance.toml_config().unwrap().get_hostname(), "unchanged");
+        instance.stop().await;
+    }
+
     #[cfg(all(feature = "management", feature = "vpn-portal"))]
     #[tokio::test]
     async fn portal_client_patch_restores_durable_state_after_failures() {

@@ -22,6 +22,160 @@ pub trait ConfigPatchPersistence: Send + Sync {
     async fn persist(&self, instance_id: uuid::Uuid, config: &TomlConfig) -> anyhow::Result<()>;
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only observation hook: (full TOML serializations, full
+    /// normalizations) performed by config patches on this thread. Guards
+    /// the skip-untouched-sections behavior of [`PatchTransaction`].
+    static PATCH_STATS_FOR_TEST: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_patch_stats_for_test() {
+    PATCH_STATS_FOR_TEST.with(|stats| stats.set((0, 0)));
+}
+
+#[cfg(test)]
+pub(crate) fn patch_stats_for_test() -> (usize, usize) {
+    PATCH_STATS_FOR_TEST.with(|stats| stats.get())
+}
+
+#[cfg(test)]
+fn record_patch_stats(serializations: usize, normalizations: usize) {
+    PATCH_STATS_FOR_TEST.with(|stats| {
+        let (serial, norm) = stats.get();
+        stats.set((serial + serializations, norm + normalizations));
+    });
+}
+
+#[cfg(not(test))]
+fn record_patch_stats(_serializations: usize, _normalizations: usize) {}
+
+/// Coalesces the per-section candidate mutations of one patch request.
+///
+/// The candidate starts as an exact copy of the shared config and is only
+/// mutated by the section helpers below, each reporting whether it touched
+/// the candidate so [`Self::mark_dirty`] can be set. While the candidate is
+/// clean (nothing touched it since the last commit), validation, persistence,
+/// and TOML serialization are skipped entirely, and the normalized form of
+/// the last commit is reused instead of re-normalizing.
+///
+/// This relies on the shared config being immutable while an instance
+/// operation lock is held: every live-config writer mutates it through this
+/// module under that lock.
+struct PatchTransaction<'a, H: CoreInstanceHost> {
+    instance: &'a CoreInstance<H>,
+    shared: &'a TomlConfig,
+    candidate: TomlConfig,
+    /// The candidate may differ from `shared` since the last commit.
+    dirty: bool,
+    /// Normalized form of the current `shared` content from the last
+    /// successful commit validation; reused while both stay in sync.
+    normalized: Option<CoreInstanceConfig>,
+}
+
+impl<'a, H: CoreInstanceHost> PatchTransaction<'a, H> {
+    fn new(instance: &'a CoreInstance<H>, shared: &'a TomlConfig) -> Self {
+        Self {
+            instance,
+            shared,
+            candidate: shared.detached_snapshot(),
+            dirty: false,
+            normalized: None,
+        }
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// True when the candidate serializes differently from the shared config.
+    fn content_changed(&self) -> bool {
+        let changed = self.shared.dump() != self.candidate.dump();
+        record_patch_stats(2, 0);
+        changed
+    }
+
+    /// Validates the candidate, durably persists it when its serialized form
+    /// changed, and mirrors it into the shared config. Skipped entirely while
+    /// the candidate is clean.
+    async fn commit(
+        &mut self,
+        persistence: Option<&dyn ConfigPatchPersistence>,
+    ) -> anyhow::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let normalized = validate_candidate(self.instance, &self.candidate)?;
+        if self.content_changed() {
+            if let Some(persistence) = persistence {
+                persistence
+                    .persist(self.instance.instance_id(), &self.candidate)
+                    .await?;
+            }
+            self.shared.replace_from_snapshot(&self.candidate);
+        }
+        self.dirty = false;
+        self.normalized = Some(normalized);
+        Ok(())
+    }
+
+    /// Validates and durably persists the candidate WITHOUT mirroring it into
+    /// the shared config. Used by the VPN portal section, which may only
+    /// replace the shared state after the live portal accepted the update;
+    /// the caller then records that replace via [`Self::note_replaced`].
+    async fn validate_and_persist(
+        &mut self,
+        persistence: Option<&dyn ConfigPatchPersistence>,
+    ) -> anyhow::Result<CoreInstanceConfig> {
+        let normalized = validate_candidate(self.instance, &self.candidate)?;
+        if self.dirty
+            && self.content_changed()
+            && let Some(persistence) = persistence
+        {
+            persistence
+                .persist(self.instance.instance_id(), &self.candidate)
+                .await?;
+        }
+        Ok(normalized)
+    }
+
+    /// Records that the caller mirrored the candidate into the shared config
+    /// after a successful hot apply.
+    fn note_replaced(&mut self, normalized: CoreInstanceConfig) {
+        self.dirty = false;
+        self.normalized = Some(normalized);
+    }
+
+    /// Normalized form of the committed config. Reuses the last commit's
+    /// result while the candidate is clean; validates lazily (and then caches)
+    /// when no commit happened in this request.
+    fn normalized_config(&mut self) -> anyhow::Result<CoreInstanceConfig> {
+        if !self.dirty
+            && let Some(normalized) = &self.normalized
+        {
+            return Ok(normalized.clone());
+        }
+        let normalized = validate_candidate(self.instance, &self.candidate)?;
+        if !self.dirty {
+            // Clean means the candidate still equals the shared config, so
+            // the result doubles as the shared normalized form.
+            self.normalized = Some(normalized.clone());
+        }
+        Ok(normalized)
+    }
+
+    /// Runtime config for the trailing runtime re-sync, reusing the last
+    /// commit's normalized form when available.
+    fn shared_runtime_config(&self) -> anyhow::Result<CoreInstanceRuntimeConfig> {
+        match &self.normalized {
+            Some(normalized) => Ok(runtime_config_from_normalized(normalized)),
+            None => runtime_config_from_toml(self.instance, self.shared),
+        }
+    }
+}
+
 pub async fn apply_config_patch<H>(
     instance: &Arc<CoreInstance<H>>,
     patch: InstanceConfigPatch,
@@ -38,7 +192,6 @@ where
     let config = instance
         .toml_config()
         .ok_or_else(|| anyhow::anyhow!("shared TOML configuration is not available"))?;
-    let candidate = config.detached_snapshot();
     let parsed_prefix =
         parse_ipv6_public_addr_prefix_patch(patch.ipv6_public_addr_prefix.as_deref())?;
     // Take the credential set out first so the host-facing copy below never
@@ -47,71 +200,85 @@ where
     let managed_credentials = patch.managed_credentials.take();
     let patch_for_host = patch_without_managed_credentials(&patch);
 
+    let mut tx = PatchTransaction::new(instance, &config);
+
     // Preserve the existing ordered partial-commit contract: earlier valid
     // sub-patches remain applied if a later sub-patch fails.
     let patch_result: anyhow::Result<(bool, bool)> = async {
-        let result = patch_port_forwards(&candidate, patch.port_forwards);
-        validate_persist_and_commit_candidate(instance, &config, &candidate, persistence).await?;
-        result?;
+        if patch_port_forwards(&tx.candidate, patch.port_forwards) {
+            tx.mark_dirty();
+        }
+        tx.commit(persistence).await?;
 
-        let result = patch_acl(&candidate, patch.acl);
-        validate_persist_and_commit_candidate(instance, &config, &candidate, persistence).await?;
-        result?;
+        if patch_acl(&tx.candidate, patch.acl)? {
+            tx.mark_dirty();
+        }
+        tx.commit(persistence).await?;
 
-        let result = patch_proxy_networks(&candidate, patch.proxy_networks);
-        validate_persist_and_commit_candidate(instance, &config, &candidate, persistence).await?;
-        result?;
+        if patch_proxy_networks(&tx.candidate, patch.proxy_networks)? {
+            tx.mark_dirty();
+        }
+        tx.commit(persistence).await?;
 
-        let result = patch_routes(&candidate, patch.routes);
-        validate_persist_and_commit_candidate(instance, &config, &candidate, persistence).await?;
-        result?;
+        if patch_routes(&tx.candidate, patch.routes) {
+            tx.mark_dirty();
+        }
+        tx.commit(persistence).await?;
 
-        let result = patch_exit_nodes_config(&candidate, patch.exit_nodes);
-        let normalized =
-            validate_persist_and_commit_candidate(instance, &config, &candidate, persistence)
-                .await?;
-        result?;
+        if patch_exit_nodes_config(&tx.candidate, patch.exit_nodes) {
+            tx.mark_dirty();
+        }
+        tx.commit(persistence).await?;
         instance
-            .update_exit_nodes(normalized.peer.exit_nodes.clone())
+            .update_exit_nodes(tx.normalized_config()?.peer.exit_nodes.clone())
             .await;
 
-        let result = patch_mapped_listeners(&candidate, patch.mapped_listeners);
-        validate_persist_and_commit_candidate(instance, &config, &candidate, persistence).await?;
-        result?;
+        if patch_mapped_listeners(&tx.candidate, patch.mapped_listeners) {
+            tx.mark_dirty();
+        }
+        tx.commit(persistence).await?;
 
         patch_connectors(instance, patch.connectors)?;
 
         let mut provider_config_changed = false;
         if let Some(hostname) = patch.hostname {
-            candidate.set_hostname(Some(hostname));
+            tx.candidate.set_hostname(Some(hostname));
+            tx.mark_dirty();
         }
         if let Some(ipv4) = patch.ipv4
-            && !candidate.get_dhcp()
+            && !tx.candidate.get_dhcp()
         {
-            candidate.set_ipv4(Some(ipv4.into()));
+            tx.candidate.set_ipv4(Some(ipv4.into()));
+            tx.mark_dirty();
         }
         if let Some(ipv6) = patch.ipv6 {
-            candidate.set_ipv6(Some(ipv6.into()));
+            tx.candidate.set_ipv6(Some(ipv6.into()));
+            tx.mark_dirty();
         }
         if let Some(disable_relay_data) = patch.disable_relay_data {
-            let mut flags = candidate.get_flags();
+            let mut flags = tx.candidate.get_flags();
             flags.disable_relay_data = disable_relay_data;
-            candidate.set_flags(flags);
+            tx.candidate.set_flags(flags);
+            tx.mark_dirty();
         }
         if let Some(prefer_peer_relay) = patch.prefer_peer_relay {
-            let mut flags = candidate.get_flags();
+            let mut flags = tx.candidate.get_flags();
             flags.prefer_peer_relay = prefer_peer_relay;
-            candidate.set_flags(flags);
+            tx.candidate.set_flags(flags);
+            tx.mark_dirty();
         }
         if let Some(enabled) = patch.ipv6_public_addr_provider {
-            candidate.set_ipv6_public_addr_provider(enabled);
+            tx.candidate.set_ipv6_public_addr_provider(enabled);
+            tx.mark_dirty();
             provider_config_changed = true;
         }
         if let Some(enabled) = patch.ipv6_public_addr_auto {
-            candidate.set_ipv6_public_addr_auto(enabled);
+            tx.candidate.set_ipv6_public_addr_auto(enabled);
+            tx.mark_dirty();
         }
         if let Some(prefix) = parsed_prefix {
-            candidate.set_ipv6_public_addr_prefix(prefix);
+            tx.candidate.set_ipv6_public_addr_prefix(prefix);
+            tx.mark_dirty();
             provider_config_changed = true;
         }
         let mut managed_credentials_changed = false;
@@ -120,14 +287,14 @@ where
         // including routes and the node IPv4 set earlier in this request.
         if !patch.vpn_portal_clients.is_empty() {
             let previous = config.detached_snapshot();
-            apply_vpn_portal_client_patches(&candidate, patch.vpn_portal_clients)?;
+            apply_vpn_portal_client_patches(&tx.candidate, patch.vpn_portal_clients)?;
+            tx.mark_dirty();
             // Deep-validate and durably persist before hot-applying. A failed
             // write leaves the live Portal untouched. If the host rejects the
             // hot update, restore the previous durable snapshot before
             // returning so a later patch cannot overwrite from stale shared
             // state and a restart cannot apply a rejected client set.
-            let normalized = validate_candidate(instance, &candidate)?;
-            persist_candidate_if_changed(instance, &config, &candidate, persistence).await?;
+            let normalized = tx.validate_and_persist(persistence).await?;
             #[cfg(feature = "vpn-portal")]
             {
                 let portal = normalized
@@ -155,9 +322,10 @@ where
             }
             #[cfg(not(feature = "vpn-portal"))]
             {
-                let _ = normalized;
+                let _ = &normalized;
             }
-            config.replace_from_snapshot(&candidate);
+            config.replace_from_snapshot(&tx.candidate);
+            tx.note_replaced(normalized);
         }
 
         if let Some(managed) = &managed_credentials {
@@ -193,24 +361,17 @@ where
             let replacement = credential_manager
                 .validate_managed_credentials(&entries)
                 .map_err(anyhow::Error::msg)?;
-            candidate.set_managed_credentials(entries);
-            validate_candidate(instance, &candidate)?;
-            // When durable storage is configured, persist before installing
-            // secret authority so a successful replacement survives restart.
-            if let Some(persistence) = persistence {
-                persistence
-                    .persist(instance.instance_id(), &candidate)
-                    .await?;
-            }
-            config.replace_from_snapshot(&candidate);
+            tx.candidate.set_managed_credentials(entries);
+            tx.mark_dirty();
+            // Commit persists before installing secret authority so a
+            // successful replacement survives restart.
+            tx.commit(persistence).await?;
             managed_credentials_changed =
                 CredentialManager::install_managed_credentials(replacement);
         } else {
-            validate_persist_and_commit_candidate(instance, &config, &candidate, persistence)
-                .await?;
+            tx.commit(persistence).await?;
         }
-        let normalized = validate_candidate(instance, &candidate)?;
-        let runtime = runtime_config_from_normalized(&normalized);
+        let runtime = runtime_config_from_normalized(&tx.normalized_config()?);
         if patch_for_host != InstanceConfigPatch::default() {
             instance
                 .instance_runtime
@@ -221,7 +382,7 @@ where
     .await;
 
     instance
-        .update_runtime_config_under_operation(runtime_config_from_toml(instance, &config)?)
+        .update_runtime_config_under_operation(tx.shared_runtime_config()?)
         .await?;
     let (provider_config_changed, managed_credentials_changed) = patch_result?;
     if patch_for_host != InstanceConfigPatch::default() {
@@ -254,47 +415,12 @@ fn validate_candidate<H>(
 where
     H: CoreInstanceHost,
 {
+    record_patch_stats(0, 1);
     let normalized = CoreInstanceConfig::from_toml_with_host(candidate, instance.host_config())?;
     let runtime = runtime_config_from_normalized(&normalized);
     runtime.services.public_ipv6_provider.validate()?;
     instance.validate_runtime_config_capabilities(&runtime)?;
     Ok(normalized)
-}
-
-async fn validate_persist_and_commit_candidate<H>(
-    instance: &CoreInstance<H>,
-    shared: &TomlConfig,
-    candidate: &TomlConfig,
-    persistence: Option<&dyn ConfigPatchPersistence>,
-) -> anyhow::Result<CoreInstanceConfig>
-where
-    H: CoreInstanceHost,
-{
-    let normalized = validate_candidate(instance, candidate)?;
-    if persist_candidate_if_changed(instance, shared, candidate, persistence).await? {
-        shared.replace_from_snapshot(candidate);
-    }
-    Ok(normalized)
-}
-
-async fn persist_candidate_if_changed<H>(
-    instance: &CoreInstance<H>,
-    shared: &TomlConfig,
-    candidate: &TomlConfig,
-    persistence: Option<&dyn ConfigPatchPersistence>,
-) -> anyhow::Result<bool>
-where
-    H: CoreInstanceHost,
-{
-    if shared.dump() == candidate.dump() {
-        return Ok(false);
-    }
-    if let Some(persistence) = persistence {
-        persistence
-            .persist(instance.instance_id(), candidate)
-            .await?;
-    }
-    Ok(true)
 }
 
 fn runtime_config_from_toml<H>(
@@ -304,6 +430,7 @@ fn runtime_config_from_toml<H>(
 where
     H: CoreInstanceHost,
 {
+    record_patch_stats(0, 1);
     let normalized = CoreInstanceConfig::from_toml_with_host(config, instance.host_config())?;
     Ok(runtime_config_from_normalized(&normalized))
 }
@@ -369,9 +496,10 @@ mod managed_credential_tests {
     }
 }
 
-fn patch_port_forwards(config: &TomlConfig, patches: Vec<PortForwardPatch>) -> anyhow::Result<()> {
+/// Reports whether the call may have modified `config`.
+fn patch_port_forwards(config: &TomlConfig, patches: Vec<PortForwardPatch>) -> bool {
     if patches.is_empty() {
-        return Ok(());
+        return false;
     }
     let mut current = config.get_port_forwards();
     let patches = patches
@@ -384,12 +512,13 @@ fn patch_port_forwards(config: &TomlConfig, patches: Vec<PortForwardPatch>) -> a
     trace_patchables(&patches);
     config::patch_vec(&mut current, patches);
     config.set_port_forwards(current);
-    Ok(())
+    true
 }
 
-fn patch_acl(config: &TomlConfig, patch: Option<AclPatch>) -> anyhow::Result<()> {
+/// Reports whether the call may have modified `config`.
+fn patch_acl(config: &TomlConfig, patch: Option<AclPatch>) -> anyhow::Result<bool> {
     let Some(patch) = patch else {
-        return Ok(());
+        return Ok(false);
     };
     let mut acl = AclRuleConfig {
         acl: config.get_acl(),
@@ -422,13 +551,15 @@ fn patch_acl(config: &TomlConfig, patch: Option<AclPatch>) -> anyhow::Result<()>
     config.set_acl(acl.acl);
     config.set_tcp_whitelist(acl.tcp_whitelist);
     config.set_udp_whitelist(acl.udp_whitelist);
-    Ok(())
+    Ok(true)
 }
 
+/// Reports whether the call may have modified `config`.
 fn patch_proxy_networks(
     config: &TomlConfig,
     patches: Vec<ProxyNetworkPatch>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
+    let changed = !patches.is_empty();
     for patch in patches {
         match ConfigPatchAction::try_from(patch.action) {
             Ok(ConfigPatchAction::Add) => {
@@ -452,46 +583,46 @@ fn patch_proxy_networks(
             ),
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
-fn patch_routes(config: &TomlConfig, patches: Vec<RoutePatch>) -> anyhow::Result<()> {
+/// Reports whether the call may have modified `config`.
+fn patch_routes(config: &TomlConfig, patches: Vec<RoutePatch>) -> bool {
     if patches.is_empty() {
-        return Ok(());
+        return false;
     }
     let mut current = config.get_routes().unwrap_or_default();
     let patches = patches.into_iter().map(Into::into).collect::<Vec<_>>();
     trace_patchables(&patches);
     config::patch_vec(&mut current, patches);
     config.set_routes((!current.is_empty()).then_some(current));
-    Ok(())
+    true
 }
 
-fn patch_exit_nodes_config(
-    config: &TomlConfig,
-    patches: Vec<ExitNodePatch>,
-) -> anyhow::Result<Vec<std::net::IpAddr>> {
+/// Reports whether the call may have modified `config`.
+fn patch_exit_nodes_config(config: &TomlConfig, patches: Vec<ExitNodePatch>) -> bool {
     if patches.is_empty() {
-        return Ok(config.get_exit_nodes());
+        return false;
     }
     let mut current = config.get_exit_nodes();
     let patches = patches.into_iter().map(Into::into).collect::<Vec<_>>();
     trace_patchables(&patches);
     config::patch_vec(&mut current, patches);
-    config.set_exit_nodes(current.clone());
-    Ok(current)
+    config.set_exit_nodes(current);
+    true
 }
 
-fn patch_mapped_listeners(config: &TomlConfig, patches: Vec<UrlPatch>) -> anyhow::Result<()> {
+/// Reports whether the call may have modified `config`.
+fn patch_mapped_listeners(config: &TomlConfig, patches: Vec<UrlPatch>) -> bool {
     if patches.is_empty() {
-        return Ok(());
+        return false;
     }
     let mut current = config.get_mapped_listeners();
     let patches = patches.into_iter().map(Into::into).collect::<Vec<_>>();
     trace_patchables(&patches);
     config::patch_vec(&mut current, patches);
     config.set_mapped_listeners((!current.is_empty()).then_some(current));
-    Ok(())
+    true
 }
 
 /// Applies VPN portal client patches to the candidate TOML model. The live
