@@ -106,6 +106,78 @@ pub enum PacketType {
     DataWithQuicSrcModified = 19,
 }
 
+/// Cryptographic enforcement class of a packet type, used by receive paths
+/// that must decide whether a plaintext packet may enter the pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketCryptoClass {
+    /// Connection bootstrap and liveness traffic that predates any crypto
+    /// session by design (legacy handshake, Noise messages, relay handshakes,
+    /// ping/pong). Never carries data-plane or control state.
+    Bootstrap,
+    /// Data-plane and control traffic that must be encrypted and
+    /// authenticated whenever the network has encryption enabled.
+    Protected,
+}
+
+impl PacketType {
+    /// Parses the wire value. Unknown values yield `None` and must be treated
+    /// as [`PacketCryptoClass::Protected`] by callers to fail closed.
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Invalid),
+            1 => Some(Self::Data),
+            2 => Some(Self::HandShake),
+            3 => Some(Self::RoutePacket),
+            4 => Some(Self::Ping),
+            5 => Some(Self::Pong),
+            6 => Some(Self::TaRpc),
+            7 => Some(Self::Route),
+            8 => Some(Self::RpcReq),
+            9 => Some(Self::RpcResp),
+            10 => Some(Self::ForeignNetworkPacket),
+            11 => Some(Self::KcpSrc),
+            12 => Some(Self::KcpDst),
+            13 => Some(Self::NoiseHandshakeMsg1),
+            14 => Some(Self::NoiseHandshakeMsg2),
+            15 => Some(Self::NoiseHandshakeMsg3),
+            16 => Some(Self::QuicSrc),
+            17 => Some(Self::QuicDst),
+            18 => Some(Self::DataWithKcpSrcModified),
+            19 => Some(Self::DataWithQuicSrcModified),
+            20 => Some(Self::RelayHandshake),
+            21 => Some(Self::RelayHandshakeAck),
+            _ => None,
+        }
+    }
+
+    pub const fn crypto_class(self) -> PacketCryptoClass {
+        match self {
+            Self::HandShake
+            | Self::NoiseHandshakeMsg1
+            | Self::NoiseHandshakeMsg2
+            | Self::NoiseHandshakeMsg3
+            | Self::RelayHandshake
+            | Self::RelayHandshakeAck
+            | Self::Ping
+            | Self::Pong => PacketCryptoClass::Bootstrap,
+            Self::Invalid
+            | Self::Data
+            | Self::RoutePacket
+            | Self::Route
+            | Self::TaRpc
+            | Self::RpcReq
+            | Self::RpcResp
+            | Self::ForeignNetworkPacket
+            | Self::KcpSrc
+            | Self::KcpDst
+            | Self::QuicSrc
+            | Self::QuicDst
+            | Self::DataWithKcpSrcModified
+            | Self::DataWithQuicSrcModified => PacketCryptoClass::Protected,
+        }
+    }
+}
+
 bitflags::bitflags! {
     struct PeerManagerHeaderFlags: u8 {
         const ENCRYPTED = 0b0000_0001;

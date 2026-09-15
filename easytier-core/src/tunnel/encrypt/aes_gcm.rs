@@ -161,6 +161,19 @@ mod tests {
     }
 
     #[test]
+    fn decrypt_is_noop_for_plaintext_packets() {
+        // The ENCRYPTED flag lives in the plaintext header and is controlled
+        // by the sender, so the AEAD layer cannot reject plaintext on its
+        // own; the packet router enforces the network's encryption policy.
+        let key = [0u8; 16];
+        let cipher = AesGcmCipher::new_128(key);
+        let mut packet = ZCPacket::new_with_payload(b"plain");
+        packet.fill_peer_manager_hdr(1, 2, 1);
+        cipher.decrypt(&mut packet).unwrap();
+        assert_eq!(packet.payload(), b"plain");
+    }
+
+    #[test]
     fn test_aes_gcm_cipher_with_nonce() {
         let key = [7u8; 16];
         let cipher = AesGcmCipher::new_128(key);

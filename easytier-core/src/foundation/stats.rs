@@ -196,6 +196,10 @@ pub enum MetricName {
     /// Compression bytes after compression
     CompressionBytesTxAfter,
 
+    /// Protected packets dropped because they arrived unencrypted while the
+    /// network enforces encryption (secure mode or enable_encryption)
+    SecurityPacketsPlaintextDropped,
+
     TcpProxyConnect,
 }
 
@@ -295,6 +299,9 @@ impl fmt::Display for MetricName {
             MetricName::CompressionBytesRxAfter => write!(f, "compression_bytes_rx_after"),
             MetricName::CompressionBytesTxBefore => write!(f, "compression_bytes_tx_before"),
             MetricName::CompressionBytesTxAfter => write!(f, "compression_bytes_tx_after"),
+            MetricName::SecurityPacketsPlaintextDropped => {
+                write!(f, "security_packets_plaintext_dropped")
+            }
 
             MetricName::TcpProxyConnect => write!(f, "tcp_proxy_connect"),
         }

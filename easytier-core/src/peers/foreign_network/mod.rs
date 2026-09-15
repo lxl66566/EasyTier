@@ -30,7 +30,9 @@ use crate::{
     },
     packet::{PacketType, ZCPacket},
     peers::peer_center::instance::{PeerCenterInstance, PeerCenterPeerManagerTrait},
-    peers::{PacketRecvChan, PacketRecvChanReceiver, recv_packet_from_chan},
+    peers::{
+        PacketRecvChan, PacketRecvChanReceiver, PeerPacketIngress, recv_packet_envelope_from_chan,
+    },
     proto::core_peer::peer::{PeerConnInfo, Route as CoreRoute},
     socket::SocketContext,
 };
@@ -46,6 +48,9 @@ use super::{
         PeerContextEvent, PeerStunInfoSource, TrustedKeySource,
     },
     error::Error,
+    peer_manager::{
+        CryptoRegime, PLAINTEXT_DROP_LOG_INTERVAL, PlaintextDelivery, network_plaintext_policy,
+    },
     peer_rpc::{PeerRpcManager, PeerRpcManagerTransport},
     public_ipv6::{DisabledPublicIpv6Runtime, PublicIpv6Runtime},
     relay_peer_map::RelayPeerMap,
@@ -1355,6 +1360,7 @@ struct ForeignNetworkForwardCounters {
     forward_control_packets: CounterHandle,
     rx_bytes: CounterHandle,
     rx_packets: CounterHandle,
+    plaintext_dropped: CounterHandle,
 }
 
 pub(crate) struct ForeignNetworkPacketRouter {
@@ -1402,7 +1408,9 @@ impl ForeignNetworkPacketRouter {
                 label_set.clone(),
             ),
             rx_bytes: stats_mgr.get_counter(MetricName::TrafficBytesSelfRx, label_set.clone()),
-            rx_packets: stats_mgr.get_counter(MetricName::TrafficPacketsRx, label_set),
+            rx_packets: stats_mgr.get_counter(MetricName::TrafficPacketsRx, label_set.clone()),
+            plaintext_dropped: stats_mgr
+                .get_counter(MetricName::SecurityPacketsPlaintextDropped, label_set),
         };
 
         Self {
@@ -1437,7 +1445,10 @@ impl ForeignNetworkPacketRouter {
             counters,
         } = self;
 
-        while let Ok(mut zc_packet) = recv_packet_from_chan(&mut packet_recv).await {
+        let mut plaintext_drop_log_count: u64 = 0;
+
+        while let Ok(envelope) = recv_packet_envelope_from_chan(&mut packet_recv).await {
+            let (mut zc_packet, ingress) = envelope.into_parts();
             let buf_len = zc_packet.buf_len();
             let Some(hdr) = zc_packet.peer_manager_header() else {
                 tracing::warn!("invalid packet, skip");
@@ -1463,17 +1474,50 @@ impl ForeignNetworkPacketRouter {
                     continue;
                 }
 
-                if relay_peer_map.is_secure_mode_enabled() && hdr.is_encrypted() {
-                    match relay_peer_map.decrypt_if_needed(&mut zc_packet).await {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            tracing::error!("secure session not found");
-                            continue;
+                if relay_peer_map.is_secure_mode_enabled() {
+                    if hdr.is_encrypted() {
+                        match relay_peer_map.decrypt_if_needed(&mut zc_packet).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                tracing::error!("secure session not found");
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::error!(?e, "secure decrypt failed");
+                                continue;
+                            }
                         }
-                        Err(e) => {
-                            tracing::error!(?e, "secure decrypt failed");
-                            continue;
+                    } else if let PeerPacketIngress::Peer {
+                        peer_id: conn_peer_id,
+                        ..
+                    } = ingress
+                        && network_plaintext_policy(
+                            packet_type,
+                            from_peer_id,
+                            conn_peer_id,
+                            CryptoRegime::SecureMode,
+                        ) == PlaintextDelivery::Reject
+                    {
+                        // Same injected-plaintext rule as the main router:
+                        // packets from the connection's peer were decrypted (and
+                        // authenticated) by its session filter; anything else
+                        // must have stayed encrypted. Locally injected packets
+                        // never crossed the network and stay trusted.
+                        counters.plaintext_dropped.inc();
+                        plaintext_drop_log_count += 1;
+                        if plaintext_drop_log_count == 1
+                            || plaintext_drop_log_count % PLAINTEXT_DROP_LOG_INTERVAL == 0
+                        {
+                            tracing::warn!(
+                                drops = plaintext_drop_log_count,
+                                ?from_peer_id,
+                                ?to_peer_id,
+                                packet_type,
+                                network_name = %network_name,
+                                "dropping unencrypted packet of protected type in foreign network"
+                            );
                         }
+                        continue;
                     }
                 }
 
