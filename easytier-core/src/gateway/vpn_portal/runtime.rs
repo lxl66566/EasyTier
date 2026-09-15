@@ -210,6 +210,11 @@ pub struct PortalModule {
     events: Arc<dyn CoreEventSink>,
     statuses: Arc<RwLock<BTreeMap<String, ClientStatus>>>,
     session_locks: Arc<RwLock<BTreeMap<String, Arc<Mutex<()>>>>>,
+    /// Keyed by client name for the lifetime of the module. Entries outlive
+    /// removal from the configured set, so re-adding the same identity
+    /// resumes its counters and removed series keep exporting their last
+    /// cumulative values instead of lingering for an unpredictable number
+    /// of cleanup epochs.
     traffic_metrics: Arc<StdRwLock<BTreeMap<String, PortalClientTrafficMetrics>>>,
     runtime: Mutex<Option<PortalRuntime>>,
 }
@@ -326,7 +331,11 @@ impl PortalModule {
                 .clone();
             let stats = self.peer_manager.stats_manager();
             let mut traffic_metrics = self.traffic_metrics.write().unwrap();
-            traffic_metrics.retain(|name, _| applied.contains(name));
+            // Entries are intentionally not pruned to the applied set:
+            // counters are bound to the client identity, which outlives
+            // remove/re-add cycles (WireGuard keys derive from the name).
+            // A re-added client resumes its series instead of restarting
+            // from zero, matching the reconnect behavior.
             for name in &applied {
                 traffic_metrics.entry(name.clone()).or_insert_with(|| {
                     PortalClientTrafficMetrics::new(&stats, &network_name, name)
@@ -2450,5 +2459,58 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("not configured"));
+    }
+
+    #[tokio::test]
+    async fn portal_traffic_metrics_survive_remove_and_readd() {
+        let (module, _host, runtime_config) =
+            portal_module_with_recording_host(PortalRuntimeConfig {
+                clients: vec![client("alice", Ipv4Addr::new(10, 82, 0, 2), &["ops"])],
+            });
+        {
+            let metrics = module.traffic_metrics.read().unwrap();
+            metrics.get("alice").unwrap().record_upload(100);
+            metrics.get("alice").unwrap().record_download(50);
+        }
+
+        // Removing every client must not reset or drop the identity's series.
+        module
+            .update_clients(Vec::new(), runtime_config.snapshot().as_ref())
+            .await
+            .unwrap();
+
+        let labels = LabelSet::new()
+            .with_label_type(LabelType::NetworkName("portal-test".to_owned()))
+            .with_label_type(LabelType::VpnPortalClient("alice".to_owned()));
+        let stats = module.peer_manager.stats_manager();
+        assert_eq!(
+            stats
+                .get_metric(MetricName::VpnPortalClientBytesTx, &labels)
+                .unwrap()
+                .value,
+            100,
+            "removed client's cumulative traffic must stay exported"
+        );
+
+        // Re-adding the same name resumes the series instead of restarting.
+        module
+            .update_clients(
+                vec![client("alice", Ipv4Addr::new(10, 82, 0, 2), &["ops"])],
+                runtime_config.snapshot().as_ref(),
+            )
+            .await
+            .unwrap();
+        {
+            let metrics = module.traffic_metrics.read().unwrap();
+            metrics.get("alice").unwrap().record_upload(25);
+        }
+        assert_eq!(
+            stats
+                .get_metric(MetricName::VpnPortalClientBytesTx, &labels)
+                .unwrap()
+                .value,
+            125,
+            "re-added client must accumulate on top of its previous traffic"
+        );
     }
 }
