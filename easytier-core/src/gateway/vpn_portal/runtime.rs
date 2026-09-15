@@ -7,14 +7,18 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::{IpAddr, Ipv4Addr},
-    sync::{Arc, RwLock as StdRwLock},
+    sync::{
+        Arc, RwLock as StdRwLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use cidr::Ipv4Inet;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::{Mutex, RwLock, mpsc, watch},
+    sync::{Mutex, Notify, RwLock, mpsc, watch},
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
@@ -32,6 +36,17 @@ use crate::{
 };
 
 pub const MAX_VPN_PORTAL_CLIENTS: usize = 64;
+
+/// Initial delay before the restart supervisor revives a portal whose
+/// listeners failed at runtime (UDP receive or accept errors).
+const PORTAL_RESTART_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+/// Upper bound of the exponential restart backoff. Retries stay unbounded in
+/// count but are rate-limited to this interval, so a permanently occupied
+/// port cannot cause a restart storm while a freed port still self-heals.
+const PORTAL_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// A runtime that stayed up this long counts as stable and resets the
+/// backoff after its eventual failure.
+const PORTAL_RESTART_STABLE_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortalClientConfig {
@@ -217,6 +232,12 @@ pub struct PortalModule {
     /// of cleanup epochs.
     traffic_metrics: Arc<StdRwLock<BTreeMap<String, PortalClientTrafficMetrics>>>,
     runtime: Mutex<Option<PortalRuntime>>,
+    /// Signalled by `run_listener` when a listener fails at runtime; wakes
+    /// the detached restart supervisor.
+    restart_signal: Arc<Notify>,
+    supervisor_started: AtomicBool,
+    /// Cancelled when the module is dropped so the supervisor task exits.
+    supervisor_shutdown: CancellationToken,
 }
 
 impl PortalModule {
@@ -260,6 +281,9 @@ impl PortalModule {
             session_locks: Arc::new(RwLock::new(BTreeMap::new())),
             traffic_metrics: Arc::new(StdRwLock::new(traffic_metrics)),
             runtime: Mutex::new(None),
+            restart_signal: Arc::new(Notify::new()),
+            supervisor_started: AtomicBool::new(false),
+            supervisor_shutdown: CancellationToken::new(),
         }))
     }
     #[cfg(feature = "vpn-portal")]
@@ -282,7 +306,7 @@ impl PortalModule {
     /// against, so a combined configuration patch is judged by its final
     /// state rather than the currently running one.
     pub async fn update_clients(
-        &self,
+        self: &Arc<Self>,
         clients: Vec<PortalClientConfig>,
         runtime: &CoreInstanceRuntimeConfig,
     ) -> anyhow::Result<Vec<PortalClientConfig>> {
@@ -295,6 +319,19 @@ impl PortalModule {
         }
         let candidate = PortalRuntimeConfig { clients };
         validate_clients(&candidate, runtime)?;
+
+        // A portal whose listeners died at runtime would reject the host-side
+        // update below ("not running"). Restart it first so patches heal the
+        // portal instead of hard-failing until the whole instance restarts.
+        let runtime_failed = self
+            .runtime
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|runtime| runtime.cancel.is_cancelled());
+        if runtime_failed {
+            self.start_locked().await?;
+        }
 
         self.host
             .as_ref()
@@ -358,8 +395,15 @@ impl PortalModule {
         Ok(applied_clients)
     }
 
-    pub async fn start(&self) -> anyhow::Result<()> {
+    pub async fn start(self: &Arc<Self>) -> anyhow::Result<()> {
         let _operation = self.operation.lock().await;
+        self.start_locked().await
+    }
+
+    /// Starts the portal runtime. The caller must serialize invocations
+    /// through the `operation` lock (see [`Self::start`] and
+    /// [`Self::update_clients`]).
+    async fn start_locked(self: &Arc<Self>) -> anyhow::Result<()> {
         if self.config.is_none() {
             return Ok(());
         }
@@ -428,6 +472,7 @@ impl PortalModule {
                 self.events.clone(),
                 cancel.clone(),
                 start_signal.clone(),
+                self.restart_signal.clone(),
             ));
         }
         *self.runtime.lock().await = Some(PortalRuntime {
@@ -435,6 +480,7 @@ impl PortalModule {
             tasks,
             listener_urls: listener_urls.clone(),
         });
+        self.ensure_restart_supervisor();
         for local_url in &listener_urls {
             self.events
                 .emit(CoreEvent::VpnPortalStarted(local_url.to_string()));
@@ -456,6 +502,7 @@ impl PortalModule {
         events: Arc<dyn CoreEventSink>,
         cancel: CancellationToken,
         start_signal: CancellationToken,
+        restart_signal: Arc<Notify>,
     ) {
         tokio::select! {
             _ = cancel.cancelled() => return,
@@ -484,6 +531,10 @@ impl PortalModule {
                     }
                     Err(error) => {
                         tracing::warn!(?error, "VPN portal listener stopped accepting");
+                        // The token cancellation tears down the sibling
+                        // listeners and sessions; the signal asks the restart
+                        // supervisor to bring the portal back afterwards.
+                        restart_signal.notify_one();
                         cancel.cancel();
                         break;
                     }
@@ -827,6 +878,77 @@ impl PortalModule {
         self.shutdown_runtime(runtime).await;
     }
 
+    /// Spawns the restart supervisor once, after the first runtime install.
+    /// The supervisor only holds a weak module reference and exits on module
+    /// drop, so it never outlives the portal.
+    fn ensure_restart_supervisor(self: &Arc<Self>) {
+        if self.supervisor_started.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        tokio::spawn(Self::supervise_restarts(
+            Arc::downgrade(self),
+            self.restart_signal.clone(),
+            self.supervisor_shutdown.clone(),
+        ));
+    }
+
+    /// Revives the portal after runtime listener failures. Restart attempts
+    /// back off exponentially up to [`PORTAL_RESTART_BACKOFF_MAX`]; a runtime
+    /// that ran stably for [`PORTAL_RESTART_STABLE_AFTER`] resets the backoff.
+    /// An operator stop (runtime removed) or a concurrent revival (patch path
+    /// or manual start) is detected under the operation lock and leaves the
+    /// healthy state alone.
+    async fn supervise_restarts(
+        weak: std::sync::Weak<Self>,
+        restart_signal: Arc<Notify>,
+        shutdown: CancellationToken,
+    ) {
+        let mut backoff = PORTAL_RESTART_BACKOFF_INITIAL;
+        let mut last_started: Option<std::time::Instant> = None;
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = restart_signal.notified() => {}
+            }
+            if last_started.is_some_and(|started| started.elapsed() >= PORTAL_RESTART_STABLE_AFTER)
+            {
+                backoff = PORTAL_RESTART_BACKOFF_INITIAL;
+            }
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                let Some(module) = weak.upgrade() else {
+                    return;
+                };
+                let _operation = module.operation.lock().await;
+                match module.runtime.lock().await.as_ref() {
+                    // The portal was stopped by an operator; wait for the
+                    // next failure signal instead of reviving it.
+                    None => break,
+                    // Someone else already revived the portal.
+                    Some(runtime) if !runtime.cancel.is_cancelled() => break,
+                    Some(_) => {}
+                }
+                match module.start_locked().await {
+                    Ok(()) => {
+                        last_started = Some(std::time::Instant::now());
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            backoff_secs = backoff.as_secs(),
+                            "failed to restart VPN portal after listener failure"
+                        );
+                        backoff = std::cmp::min(backoff * 2, PORTAL_RESTART_BACKOFF_MAX);
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn info_snapshot(&self) -> PortalInfoSnapshot {
         let Some(config) = self
             .config
@@ -910,6 +1032,14 @@ impl PortalModule {
             allowed.insert(format!("{}/{}", mapped.address, mapped.prefix_len));
         }
         allowed.into_iter().collect()
+    }
+}
+
+impl Drop for PortalModule {
+    fn drop(&mut self) {
+        // The restart supervisor waits on this token; without the cancel it
+        // would stay parked on its Notify forever after the module is gone.
+        self.supervisor_shutdown.cancel();
     }
 }
 
@@ -1232,6 +1362,10 @@ mod tests {
 
         fn render_client_config(&self, plan: &PortalClientConfigPlan) -> anyhow::Result<String> {
             Ok(format!("config:{}", plan.name))
+        }
+
+        async fn update_clients(&self, _clients: &[PortalClientConfig]) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 
@@ -2263,6 +2397,153 @@ mod tests {
         .expect("failed listener remained reported as active");
 
         module.start().await.unwrap();
+
+        assert_eq!(host.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            module.info_snapshot().await.listener.as_deref(),
+            Some("test://127.0.0.1:10001")
+        );
+        module.stop().await;
+        peer_manager.clear_resources().await;
+    }
+
+    #[tokio::test]
+    async fn portal_auto_restarts_after_listener_accept_failure() {
+        let (peer_manager, runtime_config) = network_runtime();
+        let events = Arc::new(RecordingEvents::default());
+        let host = Arc::new(RestartingPortalHost {
+            starts: AtomicUsize::new(0),
+            accept_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let module = PortalModule::new(
+            peer_manager.clone(),
+            runtime_config,
+            Some(PortalRuntimeConfig {
+                clients: vec![client("alice", Ipv4Addr::new(10, 82, 0, 2), &["ops"])],
+            }),
+            Some(host.clone()),
+            events.clone(),
+        )
+        .unwrap();
+        module.start().await.unwrap();
+
+        // The first listener fails on accept; the supervisor must revive the
+        // portal on its own after the initial backoff, without any manual
+        // start call.
+        tokio::time::timeout(PORTAL_RESTART_BACKOFF_INITIAL * 10, async {
+            loop {
+                if module.info_snapshot().await.listener.as_deref()
+                    == Some("test://127.0.0.1:10001")
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("portal did not restart automatically after listener failure");
+
+        assert_eq!(host.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            events
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event, CoreEvent::VpnPortalStarted(_)))
+                .count(),
+            2,
+            "the restarted portal must announce its listener again"
+        );
+        module.stop().await;
+        peer_manager.clear_resources().await;
+    }
+
+    #[tokio::test]
+    async fn portal_restart_supervisor_does_not_revive_stopped_portal() {
+        let (peer_manager, runtime_config) = network_runtime();
+        let host = Arc::new(RestartingPortalHost {
+            starts: AtomicUsize::new(0),
+            accept_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let module = PortalModule::new(
+            peer_manager.clone(),
+            runtime_config,
+            Some(PortalRuntimeConfig {
+                clients: vec![client("alice", Ipv4Addr::new(10, 82, 0, 2), &["ops"])],
+            }),
+            Some(host.clone()),
+            Arc::new(()),
+        )
+        .unwrap();
+        module.start().await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if module.info_snapshot().await.listener.is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed listener remained reported as active");
+
+        // Stop before the supervisor's backoff elapses: an operator stop must
+        // win over the automatic restart.
+        module.stop().await;
+
+        tokio::time::sleep(PORTAL_RESTART_BACKOFF_INITIAL * 2).await;
+        assert_eq!(
+            host.starts.load(Ordering::SeqCst),
+            1,
+            "supervisor must not revive a portal stopped by the operator"
+        );
+        assert!(module.info_snapshot().await.listener.is_none());
+        peer_manager.clear_resources().await;
+    }
+
+    #[tokio::test]
+    async fn portal_update_clients_restarts_failed_portal() {
+        let (peer_manager, runtime_config) = network_runtime();
+        let host = Arc::new(RestartingPortalHost {
+            starts: AtomicUsize::new(0),
+            accept_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let module = PortalModule::new(
+            peer_manager.clone(),
+            runtime_config.clone(),
+            Some(PortalRuntimeConfig {
+                clients: vec![client("alice", Ipv4Addr::new(10, 82, 0, 2), &["ops"])],
+            }),
+            Some(host.clone()),
+            Arc::new(()),
+        )
+        .unwrap();
+        module.start().await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if module.info_snapshot().await.listener.is_none()
+                    || host.starts.load(Ordering::SeqCst) >= 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed listener remained reported as active");
+
+        // A client patch against a dead portal must heal it instead of
+        // failing until the whole instance restarts.
+        module
+            .update_clients(
+                vec![client("bob", Ipv4Addr::new(10, 82, 0, 3), &["ops"])],
+                runtime_config.snapshot().as_ref(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(host.starts.load(Ordering::SeqCst), 2);
         assert_eq!(
