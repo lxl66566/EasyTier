@@ -39,6 +39,8 @@ pub enum Error {
     InvalidAlgorithm(String),
     #[error("encryption algorithm is unavailable in this build: {0}")]
     AlgorithmUnavailable(String),
+    #[error("replayed packet rejected")]
+    ReplayDetected,
 }
 
 pub trait Encryptor: Send + Sync + 'static {
@@ -314,13 +316,14 @@ pub fn create_encryptor(
     }
 }
 
-/// Creates the legacy data-plane encryptor (crypto-review S1.3).
+/// Creates the legacy data-plane encryptor (crypto-review S1.3 / S1.4).
 ///
-/// AEAD backends are wrapped with counter-nonce generation; the wire format
-/// is unchanged so upgraded and old peers interoperate freely. XOR keeps its
-/// historical behavior: it has no authentication tag and no nonce on the
-/// wire, so nonce management does not apply. Invalid algorithms return the
-/// plain error cipher unchanged.
+/// AEAD backends are wrapped with counter-nonce generation and replay
+/// filtering; the wire format is unchanged so upgraded and old peers
+/// interoperate freely. XOR keeps its historical behavior: it has no
+/// authentication tag and no nonce on the wire, so neither nonce management
+/// nor replay filtering applies. Invalid algorithms return the plain error
+/// cipher unchanged.
 pub fn create_legacy_encryptor(
     algorithm: &str,
     key_128: [u8; 16],
