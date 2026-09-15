@@ -282,6 +282,10 @@ sudo easytier-core --network-name mysharednode --network-secret mysharednode
 
 网络设置成功后，您可以轻松配置它以在系统启动时自动启动。请参阅 [一键注册服务指南](https://easytier.cn/en/guide/network/oneclick-install-as-service.html) 了解如何将 EasyTier 注册为系统服务。
 
+#### 传输层安全
+
+与名称给人的印象不同，EasyTier 的 `quic://` 隧道**在传输层并不加密**：QUIC 层使用仅带校验和的自定义会话，没有 TLS 握手，网络路径上的任何人都可以读取和注入报文。`wss://` 隧道在未固定服务器证书指纹时同样如此（见下文）。机密性与完整性应由 EasyTier 自身的数据面加密提供——保持 `enable_encryption` 开启（默认）或更优的 secure mode。
+
 ## 相关项目
 
 - [ZeroTier](https://www.zerotier.com/)：用于连接设备的全球虚拟网络。
