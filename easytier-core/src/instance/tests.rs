@@ -770,25 +770,35 @@ network_secret = "network-secret"
         );
 
         let secret = BASE64_STANDARD.encode([9u8; 32]);
-        rpc.patch_config(
-            BaseController::default(),
-            PatchConfigRequest {
-                patch: Some(InstanceConfigPatch {
-                    managed_credentials: Some(ManagedCredentialSet {
-                        entries: vec![ManagedCredentialConfig {
-                            credential_id: "pathless".to_owned(),
-                            credential_secret: secret.clone(),
-                            expiry_unix: i64::MAX,
-                            ..Default::default()
-                        }],
+        // This RPC surface has no config storage, so a managed credential
+        // patch must fail perceivably instead of installing memory-only
+        // credentials that silently revert on restart.
+        let error = rpc
+            .patch_config(
+                BaseController::default(),
+                PatchConfigRequest {
+                    patch: Some(InstanceConfigPatch {
+                        managed_credentials: Some(ManagedCredentialSet {
+                            entries: vec![ManagedCredentialConfig {
+                                credential_id: "pathless".to_owned(),
+                                credential_secret: secret,
+                                expiry_unix: i64::MAX,
+                                ..Default::default()
+                            }],
+                        }),
+                        ..Default::default()
                     }),
-                    ..Default::default()
-                }),
-                instance: Some(selector()),
-            },
-        )
-        .await
-        .unwrap();
+                    instance: Some(selector()),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no durable configuration persistence"),
+            "unexpected patch error: {error:#}"
+        );
         let response = rpc
             .get_config(
                 BaseController::default(),
@@ -798,15 +808,9 @@ network_secret = "network-secret"
             )
             .await
             .unwrap();
-        assert_eq!(
-            response.config.unwrap().managed_credentials,
-            vec![ManagedCredentialConfig {
-                credential_id: "pathless".to_owned(),
-                credential_secret: secret,
-                expiry_unix: i64::MAX,
-                reusable: Some(true),
-                ..Default::default()
-            }]
+        assert!(
+            response.config.unwrap().managed_credentials.is_empty(),
+            "rejected credential patch must not install anything"
         );
         let runtime = instance.runtime_config.snapshot();
         assert!(runtime.services.proxy.enable_exit_node);
@@ -926,6 +930,64 @@ source = "web"
         let persisted = persistence.writes.lock().unwrap();
         assert_eq!(persisted.len(), 1);
         assert!(persisted[0].contains(&secret));
+    }
+
+    #[cfg(feature = "management")]
+    #[tokio::test]
+    async fn managed_credential_patch_without_persistence_is_rejected() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+        use easytier_proto::api::{
+            config::InstanceConfigPatch,
+            manage::{ManagedCredentialConfig, ManagedCredentialSet},
+        };
+
+        let (packet_sink, _packet_receiver) = tokio::sync::mpsc::channel(16);
+        let config = TomlConfig::new_from_str(
+            r#"
+[network_identity]
+network_name = "memory-only-credential-network"
+network_secret = "network-secret"
+"#,
+        )
+        .unwrap();
+        let instance =
+            CoreInstance::from_toml(config, adapters(None, Arc::new(packet_sink))).unwrap();
+        instance.start().await.unwrap();
+        let secret = BASE64_STANDARD.encode([11u8; 32]);
+
+        let error = crate::management::apply_config_patch(
+            &instance,
+            InstanceConfigPatch {
+                managed_credentials: Some(ManagedCredentialSet {
+                    entries: vec![ManagedCredentialConfig {
+                        credential_id: "memory-only".to_owned(),
+                        credential_secret: secret,
+                        expiry_unix: i64::MAX,
+                        ..Default::default()
+                    }],
+                }),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no durable configuration persistence"),
+            "the missing durability must be perceivable, got: {error:#}"
+        );
+        assert!(
+            instance
+                .toml_config()
+                .unwrap()
+                .get_managed_credentials()
+                .is_empty()
+        );
+        assert_eq!(instance.state(), CoreInstanceState::Running);
+        instance.stop().await;
     }
 
     #[cfg(feature = "management")]
