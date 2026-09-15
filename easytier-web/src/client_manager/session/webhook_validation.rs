@@ -126,6 +126,36 @@ async fn persisted_config_revision_for_token(
         .map_err(|e| anyhow::anyhow!("DB error: {:?}", e))
 }
 
+/// Builds the validation input from the locked session state. Returns `None`
+/// when the dirty flag was set without complete identity input (missing
+/// heartbeat request, machine ID, or storage); callers must treat that as a
+/// malformed intermediate state and keep waiting, not as worker termination.
+fn validation_input_locked(data: &SessionData) -> Option<(WebhookValidationInput, u64)> {
+    let req = data.req.clone()?;
+    let machine_id = req.machine_id.map(Into::into)?;
+    let storage = Storage::try_from(data.storage.clone()).ok()?;
+    let (applied_config_revision, applied_config_revision_known) = {
+        let runtime = data.managed_runtime();
+        (
+            runtime.applied_config_revision.clone(),
+            runtime.applied_config_revision_known,
+        )
+    };
+    Some((
+        WebhookValidationInput {
+            storage,
+            webhook_config: data.webhook_config.clone(),
+            client_url: data.client_url.clone(),
+            applied_config_revision,
+            applied_config_revision_known,
+            failed_instance_ids: SessionRpcService::sorted_failed_instance_ids_locked(data),
+            req,
+            machine_id,
+        },
+        data.webhook_validation_change_epoch,
+    ))
+}
+
 async fn wait_for_input(
     session_data: std::sync::Weak<RwLock<SessionData>>,
 ) -> Option<(WebhookValidationInput, u64)> {
@@ -143,31 +173,15 @@ async fn wait_for_input(
             }
             if data.webhook_validation_dirty {
                 data.webhook_validation_dirty = false;
-                let req = data.req.clone()?;
-                let machine_id = req.machine_id.map(Into::into)?;
-                let storage = Storage::try_from(data.storage.clone()).ok()?;
-                let (applied_config_revision, applied_config_revision_known) = {
-                    let runtime = data.managed_runtime();
-                    (
-                        runtime.applied_config_revision.clone(),
-                        runtime.applied_config_revision_known,
-                    )
-                };
-                return Some((
-                    WebhookValidationInput {
-                        storage,
-                        webhook_config: data.webhook_config.clone(),
-                        client_url: data.client_url.clone(),
-                        applied_config_revision,
-                        applied_config_revision_known,
-                        failed_instance_ids: SessionRpcService::sorted_failed_instance_ids_locked(
-                            &data,
-                        ),
-                        req,
-                        machine_id,
-                    },
-                    data.webhook_validation_change_epoch,
-                ));
+                if let Some(input) = validation_input_locked(&data) {
+                    return Some(input);
+                }
+                // Returning None here would permanently kill the worker, so
+                // wait for the next heartbeat to re-mark dirty instead.
+                tracing::warn!(
+                    client_url = %data.client_url,
+                    "webhook validation marked dirty without complete identity input; waiting for next heartbeat"
+                );
             }
             data.webhook_validation_notify.clone()
         };
@@ -643,6 +657,47 @@ mod tests {
         assert!(Arc::ptr_eq(&data.managed_runtime, &shared));
         assert!(data.webhook_validation_dirty);
         assert_eq!(data.webhook_validation_change_epoch, 1);
+    }
+
+    #[tokio::test]
+    async fn dirty_without_identity_keeps_worker_alive_for_next_heartbeat() {
+        let machine_id = uuid::Uuid::new_v4();
+        let session_data = validation_session(machine_id).await;
+        // Keep the storage alive so the recovered input can resolve it.
+        let storage = Storage::new(crate::db::Db::memory_db().await);
+        {
+            let mut data = session_data.write().await;
+            data.storage = storage.weak_ref();
+            data.req = None;
+            data.webhook_validation_dirty = true;
+        }
+        let weak_session = Arc::downgrade(&session_data);
+        let wait = tokio::spawn(wait_for_input(weak_session.clone()));
+
+        // The malformed dirty state is consumed without terminating the
+        // worker loop.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!wait.is_finished());
+        assert!(!session_data.read().await.webhook_validation_dirty);
+
+        // A later heartbeat completes the identity and re-marks dirty.
+        let notify = {
+            let mut data = session_data.write().await;
+            data.req = Some(HeartbeatRequest {
+                user_token: "token".to_string(),
+                machine_id: Some(machine_id.into()),
+                ..Default::default()
+            });
+            SessionRpcService::mark_webhook_validation_state_changed_locked(&mut data)
+        };
+        notify.notify_one();
+
+        let (input, _) = tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("worker should recover after identity arrives")
+            .unwrap()
+            .expect("validation input");
+        assert_eq!(input.machine_id, machine_id);
     }
 
     #[tokio::test]
