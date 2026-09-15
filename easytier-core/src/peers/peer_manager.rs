@@ -3045,7 +3045,8 @@ impl PeerPacketRouter {
 
             self.handle_packet(ret, disable_relay_data, ingress).await;
         }
-        panic!("done_peer_recv");
+        // The packet channel closing is the only normal exit of this task.
+        tracing::debug!("done_peer_recv");
     }
 
     async fn handle_packet(
