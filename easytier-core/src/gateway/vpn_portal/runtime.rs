@@ -26,6 +26,7 @@ use crate::{
     peers::{
         attached::{AttachedPeerConfig, AttachedPeerRuntime},
         peer_manager::PeerManagerCore,
+        virtual_ip::{ipv4_assignments_overlap, special_ipv4_range_conflict},
     },
     socket::SocketListener,
 };
@@ -799,6 +800,9 @@ impl PortalModule {
 /// a portal with zero clients keeps listening and accepts nothing, so
 /// clearing all clients never produces a configuration that fails a later
 /// instance recreation.
+///
+/// Client networks must stay pairwise disjoint: overlapping prefixes would
+/// make mesh-side prefix routing ambiguous between two attached peers.
 fn validate_clients(
     config: &PortalRuntimeConfig,
     runtime_config: &CoreInstanceRuntimeConfig,
@@ -816,6 +820,7 @@ fn validate_clients(
         .collect::<BTreeSet<_>>();
     let mut names = BTreeSet::new();
     let mut addresses = BTreeSet::new();
+    let mut assigned: Vec<(&str, Ipv4Inet)> = Vec::with_capacity(config.clients.len());
     for client in &config.clients {
         validate_client_name(&client.name)?;
         if !names.insert(client.name.as_str()) {
@@ -824,6 +829,26 @@ fn validate_clients(
         if !addresses.insert(client.virtual_ip.address()) {
             anyhow::bail!("duplicate VPN portal virtual IP: {}", client.virtual_ip);
         }
+        if let Some(range) = special_ipv4_range_conflict(client.virtual_ip) {
+            anyhow::bail!(
+                "VPN portal client {} uses a {} virtual IP: {}",
+                client.name,
+                range.label(),
+                client.virtual_ip
+            );
+        }
+        if let Some((other_name, other)) = assigned
+            .iter()
+            .find(|(_, other)| ipv4_assignments_overlap(*other, client.virtual_ip))
+        {
+            anyhow::bail!(
+                "VPN portal client {} virtual IP {} overlaps {} of client {other_name}",
+                client.name,
+                client.virtual_ip,
+                other
+            );
+        }
+        assigned.push((client.name.as_str(), client.virtual_ip));
         for group in &client.groups {
             if !declared_groups.contains(group.as_str()) {
                 anyhow::bail!(
@@ -1306,6 +1331,75 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("duplicate VPN portal virtual IP"));
+    }
+
+    #[test]
+    fn portal_runtime_rejects_overlapping_client_cidrs() {
+        let runtime_config = runtime_config();
+        let snapshot = runtime_config.snapshot();
+
+        let same_network = PortalRuntimeConfig {
+            clients: vec![
+                client("alice", Ipv4Addr::new(10, 83, 0, 2), &["ops"]),
+                client("bob", Ipv4Addr::new(10, 83, 0, 3), &["ops"]),
+            ],
+        };
+        let error = validate_clients(&same_network, snapshot.as_ref())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("overlaps"), "unexpected error: {error}");
+
+        let nested = PortalRuntimeConfig {
+            clients: vec![
+                PortalClientConfig {
+                    name: "alice".to_owned(),
+                    virtual_ip: "10.83.0.2/16".parse().unwrap(),
+                    groups: vec!["ops".to_owned()],
+                },
+                client("bob", Ipv4Addr::new(10, 83, 1, 3), &["ops"]),
+            ],
+        };
+        let error = validate_clients(&nested, snapshot.as_ref())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("overlaps"), "unexpected error: {error}");
+
+        let disjoint = PortalRuntimeConfig {
+            clients: vec![
+                client("alice", Ipv4Addr::new(10, 83, 0, 2), &["ops"]),
+                client("bob", Ipv4Addr::new(10, 83, 1, 3), &["ops"]),
+            ],
+        };
+        validate_clients(&disjoint, snapshot.as_ref()).unwrap();
+    }
+
+    #[test]
+    fn portal_runtime_rejects_special_purpose_virtual_ips() {
+        let runtime_config = runtime_config();
+        let snapshot = runtime_config.snapshot();
+        for (virtual_ip, label) in [
+            ("127.0.0.5/8", "loopback"),
+            ("169.254.0.9/16", "link-local"),
+            ("224.0.0.5/24", "multicast"),
+            ("255.0.0.9/8", "reserved"),
+            // A /7 spanning 126.0.0.0-127.255.255.255 swallows loopback.
+            ("126.0.0.1/7", "loopback"),
+        ] {
+            let config = PortalRuntimeConfig {
+                clients: vec![PortalClientConfig {
+                    name: "alice".to_owned(),
+                    virtual_ip: virtual_ip.parse().unwrap(),
+                    groups: vec!["ops".to_owned()],
+                }],
+            };
+            let error = validate_clients(&config, snapshot.as_ref())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(label),
+                "{virtual_ip}: unexpected error: {error}"
+            );
+        }
     }
 
     #[test]
