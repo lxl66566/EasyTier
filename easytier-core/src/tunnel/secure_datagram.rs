@@ -204,6 +204,40 @@ impl SyncRxGrace {
     }
 }
 
+#[derive(Debug, Default)]
+struct DecryptFailTracker {
+    consecutive: AtomicU32,
+    first_failure_ms: AtomicU64,
+}
+
+/// Consecutive decrypt failures that mark a suspected unrecoverable key
+/// desync and make the session eligible for invalidation.
+const DECRYPT_FAIL_THRESHOLD: u32 = 10;
+/// The threshold must be exceeded for at least this long before the session
+/// is actually invalidated. A short burst of injected garbage no longer
+/// immediately tears down the connection (which would force a fresh Noise
+/// handshake the attacker can repeat cheaply); genuine key desync fails on
+/// every packet, so real recovery still happens after roughly this delay.
+const DECRYPT_FAIL_SUSTAIN_MS: u64 = 1_000;
+
+impl DecryptFailTracker {
+    /// Records one decrypt failure; returns `true` when the session should be
+    /// invalidated (failures sustained past the threshold and time window).
+    fn record_failure(&self, now_ms: u64) -> bool {
+        let count = self.consecutive.fetch_add(1, Ordering::Relaxed) + 1;
+        if count == 1 {
+            self.first_failure_ms.store(now_ms, Ordering::Relaxed);
+        }
+        let elapsed = now_ms.saturating_sub(self.first_failure_ms.load(Ordering::Relaxed));
+        count > DECRYPT_FAIL_THRESHOLD && elapsed >= DECRYPT_FAIL_SUSTAIN_MS
+    }
+
+    fn reset(&self) {
+        self.consecutive.store(0, Ordering::Relaxed);
+        self.first_failure_ms.store(0, Ordering::Relaxed);
+    }
+}
+
 pub struct SecureDatagramSession {
     root_key: RwLock<[u8; 32]>,
     session_generation: AtomicU32,
@@ -222,7 +256,7 @@ pub struct SecureDatagramSession {
     recv_cipher_algorithm: String,
 
     invalidated: AtomicBool,
-    decrypt_fail_count: AtomicU32,
+    decrypt_fail: DecryptFailTracker,
 }
 
 impl std::fmt::Debug for SecureDatagramSession {
@@ -253,7 +287,6 @@ impl SecureDatagramSession {
     const ROTATE_AFTER_PACKETS: u64 = 1_000_000;
     const ROTATE_AFTER_MS: u64 = 10 * 60 * 1000;
     const MAX_ACCEPTED_RX_EPOCH_AHEAD: u32 = 3;
-    const DECRYPT_FAIL_THRESHOLD: u32 = 10;
 
     pub fn new(
         root_key: [u8; 32],
@@ -285,7 +318,7 @@ impl SecureDatagramSession {
             send_cipher_algorithm,
             recv_cipher_algorithm,
             invalidated: AtomicBool::new(false),
-            decrypt_fail_count: AtomicU32::new(0),
+            decrypt_fail: DecryptFailTracker::default(),
         }
     }
 
@@ -725,17 +758,16 @@ impl SecureDatagramSession {
 
         let encryptor = self.get_or_create_encryptor(epoch, dir, self.session_generation(), false);
         if let Err(e) = encryptor.decrypt(ciphertext_with_tail) {
-            let count = self.decrypt_fail_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if count >= Self::DECRYPT_FAIL_THRESHOLD {
+            if self.decrypt_fail.record_failure(now_ms) {
                 self.invalidate();
                 tracing::warn!(
-                    count,
-                    "secure datagram session auto-invalidated after consecutive decrypt failures"
+                    consecutive = self.decrypt_fail.consecutive.load(Ordering::Relaxed),
+                    "secure datagram session auto-invalidated after sustained decrypt failures"
                 );
             }
             return Err(e.into());
         }
-        self.decrypt_fail_count.store(0, Ordering::Relaxed);
+        self.decrypt_fail.reset();
 
         if !self.commit_replay(epoch, seq, dir, now_ms) {
             return Err(anyhow!("replay rejected"));
@@ -922,6 +954,97 @@ mod tests {
             .decrypt_payload(SecureDatagramDirection::AToB, &mut pkt2)
             .unwrap();
         assert_eq!(pkt2.payload(), plaintext);
+    }
+
+    #[test]
+    fn decrypt_fail_tracker_requires_sustained_failures() {
+        let tracker = DecryptFailTracker::default();
+
+        // A fast burst crossing the threshold does not invalidate on its own.
+        for i in 0..50 {
+            assert!(!tracker.record_failure(i));
+        }
+
+        // Failures spanning the sustain window do invalidate.
+        assert!(!tracker.record_failure(500));
+        assert!(tracker.record_failure(DECRYPT_FAIL_SUSTAIN_MS + 500));
+
+        // Reset restores the initial state.
+        tracker.reset();
+        assert!(!tracker.record_failure(DECRYPT_FAIL_SUSTAIN_MS + 1000));
+        assert!(!tracker.record_failure(DECRYPT_FAIL_SUSTAIN_MS + 2000));
+    }
+
+    #[test]
+    fn decrypt_fail_tracker_recovers_after_success() {
+        let tracker = DecryptFailTracker::default();
+
+        for i in 0..50 {
+            assert!(!tracker.record_failure(i));
+        }
+
+        // A successful decrypt resets the streak; the next failure burst
+        // starts a fresh window instead of accumulating across recoveries.
+        tracker.reset();
+        for _ in 0..DECRYPT_FAIL_THRESHOLD {
+            assert!(!tracker.record_failure(10_000));
+        }
+        assert!(tracker.record_failure(10_000 + DECRYPT_FAIL_SUSTAIN_MS));
+    }
+
+    #[test]
+    #[cfg(any(
+        feature = "aes-gcm",
+        feature = "openssl-crypto",
+        feature = "ring-crypto"
+    ))]
+    fn decrypt_failure_burst_keeps_session_valid() {
+        use crate::packet::PacketType;
+
+        let root_key = SecureDatagramSession::new_root_key();
+        let sender = SecureDatagramSession::new(
+            root_key,
+            1,
+            0,
+            "aes-256-gcm".to_string(),
+            "aes-256-gcm".to_string(),
+        );
+        let receiver = SecureDatagramSession::new(
+            root_key,
+            1,
+            0,
+            "aes-256-gcm".to_string(),
+            "aes-256-gcm".to_string(),
+        );
+
+        // Well above the old threshold of 10 consecutive failures; the burst
+        // arrives within the sustain window, so the session must survive.
+        for i in 0..50u64 {
+            let mut forged = ZCPacket::new_with_payload(b"forged");
+            forged.fill_peer_manager_hdr(10, 20, PacketType::Data as u8);
+            sender
+                .encrypt_payload(SecureDatagramDirection::AToB, &mut forged)
+                .unwrap();
+
+            let mut forged_nonce = [0u8; StandardAeadTail::NONCE_SIZE];
+            forged_nonce[..4].copy_from_slice(&0u32.to_be_bytes());
+            forged_nonce[4..].copy_from_slice(&(500 + i).to_be_bytes());
+
+            let payload = forged.mut_payload();
+            let nonce_offset = payload.len() - StandardAeadTail::NONCE_SIZE;
+            payload[nonce_offset..].copy_from_slice(&forged_nonce);
+
+            assert!(
+                receiver
+                    .decrypt_payload(SecureDatagramDirection::AToB, &mut forged)
+                    .is_err()
+            );
+        }
+
+        assert!(
+            receiver.is_valid(),
+            "a fast failure burst must not invalidate the session"
+        );
     }
 
     #[test]

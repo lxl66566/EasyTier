@@ -218,11 +218,11 @@ impl TunnelFilter for PeerSessionTunnelFilter {
 
         if let Err(e) = session.decrypt_payload(from_peer_id, my_peer_id, &mut data) {
             if !session.is_valid() {
-                // Session auto-invalidated after too many consecutive failures.
+                // Session auto-invalidated after sustained decrypt failures.
                 // Close the connection to trigger reconnection with a fresh handshake.
                 tracing::error!(?e, "session invalidated, closing connection");
                 return Some(Err(TunnelError::InternalError(
-                    "session invalidated due to consecutive decrypt failures".to_string(),
+                    "session invalidated due to sustained decrypt failures".to_string(),
                 )));
             }
             // Transient failure, drop this packet but keep the connection alive.
