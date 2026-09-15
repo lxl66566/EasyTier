@@ -117,7 +117,10 @@ pub trait PortalHost: Send + Sync + 'static {
 
     fn name(&self) -> String;
 
-    fn render_client_config(&self, plan: &PortalClientConfigPlan) -> String;
+    /// Renders the connect configuration for one client. Failing hosts (for
+    /// example a WireGuard adapter whose key setup failed) report the error
+    /// instead of panicking.
+    fn render_client_config(&self, plan: &PortalClientConfigPlan) -> anyhow::Result<String>;
 
     /// Replaces the configured client set at runtime without restarting the
     /// listeners. Established sessions of untouched clients must stay intact;
@@ -756,6 +759,14 @@ impl PortalModule {
                             allowed_ips: client_allowed_ips,
                             listener_url: listener_url.clone(),
                         })
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(
+                                ?error,
+                                client = %client.name,
+                                "failed to render VPN portal client config"
+                            );
+                            String::new()
+                        })
                     }
                     _ => String::new(),
                 };
@@ -997,13 +1008,13 @@ mod tests {
             "test".to_owned()
         }
 
-        fn render_client_config(&self, plan: &PortalClientConfigPlan) -> String {
-            format!(
+        fn render_client_config(&self, plan: &PortalClientConfigPlan) -> anyhow::Result<String> {
+            Ok(format!(
                 "config:{}:{}:{}",
                 plan.name,
                 plan.address,
                 plan.allowed_ips.join(",")
-            )
+            ))
         }
     }
 
@@ -1105,8 +1116,8 @@ mod tests {
             "test".to_owned()
         }
 
-        fn render_client_config(&self, plan: &PortalClientConfigPlan) -> String {
-            format!("config:{}", plan.name)
+        fn render_client_config(&self, plan: &PortalClientConfigPlan) -> anyhow::Result<String> {
+            Ok(format!("config:{}", plan.name))
         }
     }
 
@@ -2059,8 +2070,8 @@ mod tests {
             "recording".to_owned()
         }
 
-        fn render_client_config(&self, plan: &PortalClientConfigPlan) -> String {
-            format!("config:{}", plan.name)
+        fn render_client_config(&self, plan: &PortalClientConfigPlan) -> anyhow::Result<String> {
+            Ok(format!("config:{}", plan.name))
         }
 
         async fn update_clients(&self, clients: &[PortalClientConfig]) -> anyhow::Result<()> {

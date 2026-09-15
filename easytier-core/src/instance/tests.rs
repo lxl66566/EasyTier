@@ -500,8 +500,8 @@ mod portable_runtime {
         fn render_client_config(
             &self,
             _plan: &crate::gateway::vpn_portal::PortalClientConfigPlan,
-        ) -> String {
-            String::new()
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
         }
 
         async fn update_clients(

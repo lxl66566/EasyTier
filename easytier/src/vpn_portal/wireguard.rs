@@ -324,24 +324,24 @@ impl PortalHost for WireGuardPortalHost {
         self.apply_client_updates(clients).await
     }
 
-    fn render_client_config(&self, plan: &PortalClientConfigPlan) -> String {
+    fn render_client_config(&self, plan: &PortalClientConfigPlan) -> anyhow::Result<String> {
         let setup = self
             .setup
             .as_ref()
-            .expect("client config is rendered only after successful startup");
+            .map_err(|error| anyhow::anyhow!(error.clone()))?;
         let clients = setup.clients.read().unwrap();
         let Some(client) = clients.get(&plan.name) else {
-            return String::new();
+            return Ok(String::new());
         };
         let endpoint = &plan.listener_url[url::Position::BeforeHost..url::Position::AfterPort];
-        format!(
+        Ok(format!(
             "[Interface]\nPrivateKey = {}\nAddress = {}/32\n\n[Peer]\nPublicKey = {}\nAllowedIPs = {}\nEndpoint = {} # replace wildcard with the public address\nPersistentKeepalive = 25\n",
             BASE64_STANDARD.encode(client.wireguard_private),
             plan.address,
             BASE64_STANDARD.encode(setup.server_public.as_bytes()),
             plan.allowed_ips.join(", "),
             endpoint,
-        )
+        ))
     }
 }
 
