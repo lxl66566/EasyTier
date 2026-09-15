@@ -148,6 +148,13 @@ mod crypto {
             header: &[u8],
             payload: &mut BytesMut,
         ) -> Result<(), CryptoError> {
+            // quinn does not guarantee a minimum payload length before
+            // decryption: a large Initial token field can shrink the packet
+            // payload below the tag, and 1-RTT packets carry no floor at all.
+            // Reject short packets instead of underflowing the split offset.
+            if payload.len() < self.tag_len() {
+                return Err(CryptoError);
+            }
             let tag = payload.split_off(payload.len() - self.tag_len()).get_u64();
             trace!(tag, ?payload);
             let checksum = self.checksum_for(packet, &[header, payload]);
@@ -341,6 +348,24 @@ mod crypto {
             // as happens when reordering exceeds the RFC 9000 Appendix A
             // decode window, must fail authentication.
             assert!(roundtrip(true, 100, 356).is_err());
+        }
+
+        #[test]
+        fn short_packet_fails_closed_instead_of_panicking() {
+            // A payload shorter than the 8-byte checksum tag must be rejected,
+            // not underflow the split offset. Reachable pre-handshake: Initial
+            // datagrams only need the 1200-byte floor for the whole datagram,
+            // so a large token field can leave a tiny payload.
+            let key = CryptoKey { pn_bound: true };
+            let header = [0u8; 8];
+            for len in 0..key.tag_len() {
+                let mut payload = BytesMut::from(&vec![0u8; len][..]);
+                assert!(
+                    quinn_proto::crypto::PacketKey::decrypt(&key, 1, &header, &mut payload)
+                        .is_err(),
+                    "payload of {len} bytes must fail closed"
+                );
+            }
         }
     }
 }
