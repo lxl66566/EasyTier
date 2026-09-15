@@ -14,6 +14,7 @@ pub(crate) mod relay_peer_map;
 pub(crate) mod route;
 pub(crate) mod traffic_metrics;
 mod util;
+pub(crate) mod virtual_ip;
 pub(crate) mod whitelist;
 
 #[cfg(test)]
