@@ -4,7 +4,7 @@ use zerocopy::{AsBytes, FromBytes};
 
 use crate::packet::{StandardAeadTail, ZCPacket};
 
-use super::{Encryptor, Error};
+use super::{AeadBinding, Encryptor, Error, open_aad, seal_aad};
 
 #[derive(Clone)]
 pub struct AesGcmCipher {
@@ -38,6 +38,7 @@ impl Encryptor for AesGcmCipher {
         if !pm_header.is_encrypted() {
             return Ok(());
         }
+        let aad = open_aad(zc_packet);
 
         let payload_len = zc_packet.payload().len();
         if payload_len < StandardAeadTail::SIZE {
@@ -52,17 +53,18 @@ impl Encryptor for AesGcmCipher {
 
         let nonce = aes_tail.nonce.into();
         let tag = aes_tail.tag.into();
+        let aad = aad.as_ref().map(|b| &b[..]).unwrap_or(&[]);
 
         let rs = match &self.cipher {
             AesGcmEnum::AES128GCM(aes_gcm) => aes_gcm.decrypt_in_place_detached(
                 &nonce,
-                &[],
+                aad,
                 &mut zc_packet.mut_payload()[..text_len],
                 &tag,
             ),
             AesGcmEnum::AES256GCM(aes_gcm) => aes_gcm.decrypt_in_place_detached(
                 &nonce,
-                &[],
+                aad,
                 &mut zc_packet.mut_payload()[..text_len],
                 &tag,
             ),
@@ -77,6 +79,7 @@ impl Encryptor for AesGcmCipher {
 
         let pm_header = zc_packet.mut_peer_manager_header().unwrap();
         pm_header.set_encrypted(false);
+        pm_header.set_header_aad(false);
         let old_len = zc_packet.buf_len();
         zc_packet
             .mut_inner()
@@ -84,20 +87,23 @@ impl Encryptor for AesGcmCipher {
         Ok(())
     }
 
-    fn encrypt(&self, zc_packet: &mut ZCPacket) -> Result<(), Error> {
-        self.encrypt_with_nonce(zc_packet, None)
+    fn encrypt(&self, zc_packet: &mut ZCPacket, binding: AeadBinding) -> Result<(), Error> {
+        self.encrypt_with_nonce(zc_packet, None, binding)
     }
 
     fn encrypt_with_nonce(
         &self,
         zc_packet: &mut ZCPacket,
         nonce: Option<&[u8]>,
+        binding: AeadBinding,
     ) -> Result<(), Error> {
         let pm_header = zc_packet.peer_manager_header().unwrap();
         if pm_header.is_encrypted() {
             tracing::warn!(?zc_packet, "packet is already encrypted");
             return Ok(());
         }
+        let aad = seal_aad(zc_packet, binding)?;
+        let aad = aad.as_ref().map(|b| &b[..]).unwrap_or(&[]);
 
         let nonce = nonce
             .map(|n| {
@@ -111,14 +117,14 @@ impl Encryptor for AesGcmCipher {
             AesGcmEnum::AES128GCM(aes_gcm) => {
                 let nonce = nonce.unwrap_or_else(|| Aes128Gcm::generate_nonce(&mut OsRng));
                 (
-                    aes_gcm.encrypt_in_place_detached(&nonce, &[], zc_packet.mut_payload()),
+                    aes_gcm.encrypt_in_place_detached(&nonce, aad, zc_packet.mut_payload()),
                     nonce,
                 )
             }
             AesGcmEnum::AES256GCM(aes_gcm) => {
                 let nonce = nonce.unwrap_or_else(|| Aes256Gcm::generate_nonce(&mut OsRng));
                 (
-                    aes_gcm.encrypt_in_place_detached(&nonce, &[], zc_packet.mut_payload()),
+                    aes_gcm.encrypt_in_place_detached(&nonce, aad, zc_packet.mut_payload()),
                     nonce,
                 )
             }
@@ -140,7 +146,7 @@ impl Encryptor for AesGcmCipher {
 mod tests {
     use crate::{
         packet::{StandardAeadTail, ZCPacket},
-        tunnel::encrypt::{Encryptor, aes_gcm::AesGcmCipher},
+        tunnel::encrypt::{AeadBinding, Encryptor, aes_gcm::AesGcmCipher},
     };
     use zerocopy::FromBytes;
 
@@ -151,7 +157,7 @@ mod tests {
         let text = b"1234567";
         let mut packet = ZCPacket::new_with_payload(text);
         packet.fill_peer_manager_hdr(0, 0, 0);
-        cipher.encrypt(&mut packet).unwrap();
+        cipher.encrypt(&mut packet, AeadBinding::None).unwrap();
         assert_eq!(packet.payload().len(), text.len() + StandardAeadTail::SIZE);
         assert!(packet.peer_manager_header().unwrap().is_encrypted());
 
@@ -183,13 +189,13 @@ mod tests {
         let mut packet1 = ZCPacket::new_with_payload(text);
         packet1.fill_peer_manager_hdr(0, 0, 0);
         cipher
-            .encrypt_with_nonce(&mut packet1, Some(&nonce))
+            .encrypt_with_nonce(&mut packet1, Some(&nonce), AeadBinding::None)
             .unwrap();
 
         let mut packet2 = ZCPacket::new_with_payload(text);
         packet2.fill_peer_manager_hdr(0, 0, 0);
         cipher
-            .encrypt_with_nonce(&mut packet2, Some(&nonce))
+            .encrypt_with_nonce(&mut packet2, Some(&nonce), AeadBinding::None)
             .unwrap();
 
         assert_eq!(packet1.payload(), packet2.payload());

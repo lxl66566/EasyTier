@@ -43,8 +43,8 @@ use crate::{
     tunnel::{
         Tunnel,
         encrypt::{
-            Encryptor, NullCipher, create_legacy_encryptor, derive_key_128, derive_key_256,
-            validate_algorithm,
+            AeadBinding, Encryptor, NullCipher, create_legacy_encryptor, derive_key_128,
+            derive_key_256, validate_algorithm,
         },
     },
 };
@@ -166,7 +166,7 @@ impl PeerRpcManagerTransport for RpcTransport {
             .unwrap_or(!peers.has_peer(dst_peer_id));
         if !is_dst_peer_public_server && !self.is_secure_mode_enabled {
             self.encryptor
-                .encrypt(&mut msg)
+                .encrypt(&mut msg, legacy_aad_binding(peers.as_ref(), dst_peer_id))
                 .with_context(|| "encrypt failed")?;
         }
         // send to self and this packet will be forwarded in peer_recv loop
@@ -188,6 +188,21 @@ pub(crate) fn get_next_hop_policy(is_latency_first: bool) -> NextHopPolicy {
         NextHopPolicy::LeastCost
     } else {
         NextHopPolicy::LeastHop
+    }
+}
+
+/// AAD binding for a legacy-encrypted packet sent to `dst_peer_id`.
+///
+/// Bind the header only when the destination negotiated the header-AAD
+/// handshake feature, so peers predating header authentication always receive
+/// the legacy empty-AAD format they can decrypt. Destinations without a
+/// direct connection (pure relay targets) cannot be negotiated with and stay
+/// legacy as well.
+fn legacy_aad_binding(peers: &PeerMap, dst_peer_id: PeerId) -> AeadBinding {
+    if peers.peer_supports_header_aad(dst_peer_id) {
+        AeadBinding::Header
+    } else {
+        AeadBinding::None
     }
 }
 
@@ -2472,6 +2487,7 @@ pub(crate) async fn try_compress_and_encrypt(
     encryptor: &Arc<dyn Encryptor + 'static>,
     msg: &mut ZCPacket,
     secure_mode_enabled: bool,
+    binding: AeadBinding,
 ) -> Result<(), Error> {
     let compressor = DefaultCompressor {};
     compressor
@@ -2479,7 +2495,9 @@ pub(crate) async fn try_compress_and_encrypt(
         .await
         .with_context(|| "compress failed")?;
     if !secure_mode_enabled {
-        encryptor.encrypt(msg).with_context(|| "encrypt failed")?;
+        encryptor
+            .encrypt(msg, binding)
+            .with_context(|| "encrypt failed")?;
     }
     Ok(())
 }
@@ -2692,6 +2710,7 @@ impl PeerOutboundPacketRouter {
             &self.encryptor,
             &mut msg,
             self.is_secure_mode_enabled,
+            legacy_aad_binding(self.peers.as_ref(), dst_peer_id),
         )
         .await?;
 
@@ -2871,18 +2890,16 @@ impl PeerOutboundPacketRouter {
             .compress_tx_bytes_before
             .add(msg.buf_len() as u64);
 
-        try_compress_and_encrypt(
-            self.data_compress_algo,
-            &self.encryptor,
-            &mut msg,
-            self.is_secure_mode_enabled,
-        )
-        .await?;
+        let compressor = DefaultCompressor {};
+        compressor
+            .compress(&mut msg, self.data_compress_algo)
+            .await
+            .with_context(|| "compress failed")?;
 
-        self.counters
-            .compress_tx_bytes_after
-            .add(msg.buf_len() as u64);
-
+        // The AEAD authenticates to_peer_id and the remaining header flags,
+        // so every header field must be final before sealing. Fanout copies
+        // get per-destination headers and therefore per-destination
+        // encryptions instead of sharing one ciphertext.
         msg.mut_peer_manager_header()
             .unwrap()
             .set_latency_first(packet_policy.latency_first)
@@ -2921,6 +2938,19 @@ impl PeerOutboundPacketRouter {
                 hdr.set_no_proxy(true);
             }
 
+            if !self.is_secure_mode_enabled
+                && let Err(e) = self
+                    .encryptor
+                    .encrypt(&mut msg, legacy_aad_binding(self.peers.as_ref(), *peer_id))
+                    .with_context(|| "encrypt failed")
+            {
+                errs.push(e.into());
+                continue;
+            }
+
+            self.counters
+                .compress_tx_bytes_after
+                .add(msg.buf_len() as u64);
             self.counters.self_tx_bytes.add(msg.buf_len() as u64);
             self.counters.self_tx_packets.inc();
 
@@ -3194,6 +3224,7 @@ impl PeerPacketRouter {
                         &self.encryptor,
                         &mut ret,
                         self.secure_mode_enabled,
+                        legacy_aad_binding(self.peers.as_ref(), to_peer_id),
                     )
                     .await;
                 }

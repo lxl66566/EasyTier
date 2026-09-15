@@ -14,7 +14,7 @@ use crate::{
     },
 };
 
-use super::{Encryptor, Error};
+use super::{AeadBinding, Encryptor, Error};
 
 pub(super) struct WasiHostAead {
     algorithm: u32,
@@ -78,6 +78,11 @@ impl Encryptor for WasiHostAead {
         if !header.is_encrypted() {
             return Ok(());
         }
+        // The host AEAD ABI takes no AAD input, so header-authenticated
+        // packets always go through the software fallback.
+        if header.is_header_aad() {
+            return self.fallback.decrypt(packet);
+        }
 
         let payload_len = packet.payload().len();
         if payload_len < StandardAeadTail::SIZE {
@@ -112,15 +117,25 @@ impl Encryptor for WasiHostAead {
         Ok(())
     }
 
-    fn encrypt(&self, packet: &mut ZCPacket) -> Result<(), Error> {
-        self.encrypt_with_nonce(packet, None)
+    fn encrypt(&self, packet: &mut ZCPacket, binding: AeadBinding) -> Result<(), Error> {
+        self.encrypt_with_nonce(packet, None, binding)
     }
 
-    fn encrypt_with_nonce(&self, packet: &mut ZCPacket, nonce: Option<&[u8]>) -> Result<(), Error> {
+    fn encrypt_with_nonce(
+        &self,
+        packet: &mut ZCPacket,
+        nonce: Option<&[u8]>,
+        binding: AeadBinding,
+    ) -> Result<(), Error> {
         let header = packet.peer_manager_header().unwrap();
         if header.is_encrypted() {
             tracing::warn!(?packet, "packet is already encrypted");
             return Ok(());
+        }
+        // The host AEAD ABI takes no AAD input; header-bound packets must be
+        // sealed by the software fallback.
+        if binding == AeadBinding::Header {
+            return self.fallback.encrypt_with_nonce(packet, nonce, binding);
         }
 
         let mut nonce_bytes = [0; StandardAeadTail::NONCE_SIZE];
@@ -139,7 +154,9 @@ impl Encryptor for WasiHostAead {
         let status = self.call(false, &nonce_bytes, packet.mut_payload(), text_len);
         if status != 0 {
             packet.mut_inner().truncate(old_len);
-            return self.fallback.encrypt_with_nonce(packet, Some(&nonce_bytes));
+            return self
+                .fallback
+                .encrypt_with_nonce(packet, Some(&nonce_bytes), binding);
         }
 
         packet.mut_inner().extend_from_slice(&nonce_bytes);

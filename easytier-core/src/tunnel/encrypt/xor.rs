@@ -1,6 +1,6 @@
 use crate::packet::ZCPacket;
 
-use super::{Encryptor, Error};
+use super::{AeadBinding, Encryptor, Error};
 
 #[derive(Clone)]
 pub struct XorCipher {
@@ -38,7 +38,10 @@ impl Encryptor for XorCipher {
         Ok(())
     }
 
-    fn encrypt(&self, zc_packet: &mut ZCPacket) -> Result<(), Error> {
+    // Xor is obfuscation, not authentication: the binding is ignored and no
+    // header-AAD marker is set, so peers never mistake xor for an
+    // authenticated packet.
+    fn encrypt(&self, zc_packet: &mut ZCPacket, _binding: AeadBinding) -> Result<(), Error> {
         let pm_header = zc_packet.peer_manager_header().unwrap();
         if pm_header.is_encrypted() {
             tracing::warn!(?zc_packet, "packet is already encrypted");
@@ -59,7 +62,7 @@ impl Encryptor for XorCipher {
 mod tests {
     use crate::{
         packet::ZCPacket,
-        tunnel::encrypt::{Encryptor, xor::XorCipher},
+        tunnel::encrypt::{AeadBinding, Encryptor, xor::XorCipher},
     };
 
     #[test]
@@ -71,7 +74,7 @@ mod tests {
         packet.fill_peer_manager_hdr(0, 0, 0);
 
         // 加密
-        cipher.encrypt(&mut packet).unwrap();
+        cipher.encrypt(&mut packet, AeadBinding::None).unwrap();
         assert!(packet.peer_manager_header().unwrap().is_encrypted());
         assert_ne!(packet.payload(), text); // 加密后数据应该不同
 

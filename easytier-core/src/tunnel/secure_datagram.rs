@@ -13,7 +13,8 @@ use zerocopy::FromBytes;
 use crate::{
     packet::{StandardAeadTail, ZCPacket},
     tunnel::encrypt::{
-        Encryptor, create_encryptor, replay_window::ReplayWindow256, replay_window::now_ms,
+        AeadBinding, Encryptor, create_encryptor, replay_window::ReplayWindow256,
+        replay_window::now_ms,
     },
 };
 
@@ -633,7 +634,14 @@ impl SecureDatagramSession {
         }
         let (epoch, _seq, nonce_bytes) = self.next_nonce(dir);
         let encryptor = self.get_or_create_encryptor(epoch, dir, self.session_generation(), true);
-        if let Err(e) = encryptor.encrypt_with_nonce(pkt, Some(nonce_bytes.as_slice())) {
+        // Sessions only exist between nodes that completed the fork-specific
+        // Noise/web handshake, so the header can always be bound into the AAD
+        // without a capability negotiation round. The header is final here:
+        // sessions encrypt at the last egress stage, and relay-legal transit
+        // mutations are excluded from the canonical AAD bytes.
+        if let Err(e) =
+            encryptor.encrypt_with_nonce(pkt, Some(nonce_bytes.as_slice()), AeadBinding::Header)
+        {
             tracing::warn!(?e, "secure datagram session encrypt failed, invalidating");
             self.invalidate();
             return Err(e.into());
@@ -763,6 +771,63 @@ mod tests {
         ab.decrypt_payload(SecureDatagramDirection::BToA, &mut pkt2)
             .unwrap();
         assert_eq!(pkt2.payload(), plaintext2);
+    }
+
+    #[test]
+    #[cfg(any(
+        feature = "aes-gcm",
+        feature = "openssl-crypto",
+        feature = "ring-crypto"
+    ))]
+    fn session_binds_header_into_aad() {
+        use crate::packet::PacketType;
+
+        let root_key = SecureDatagramSession::new_root_key();
+        let sender = SecureDatagramSession::new(
+            root_key,
+            1,
+            0,
+            "aes-256-gcm".to_string(),
+            "aes-256-gcm".to_string(),
+        );
+        let receiver = SecureDatagramSession::new(
+            root_key,
+            1,
+            0,
+            "aes-256-gcm".to_string(),
+            "aes-256-gcm".to_string(),
+        );
+
+        // Round trip.
+        let plaintext = b"session payload";
+        let mut pkt = ZCPacket::new_with_payload(plaintext);
+        pkt.fill_peer_manager_hdr(10, 20, PacketType::Data as u8);
+        sender
+            .encrypt_payload(SecureDatagramDirection::AToB, &mut pkt)
+            .unwrap();
+        assert!(pkt.peer_manager_header().unwrap().is_header_aad());
+        receiver
+            .decrypt_payload(SecureDatagramDirection::AToB, &mut pkt)
+            .unwrap();
+        assert_eq!(pkt.payload(), plaintext);
+
+        // Spoofing from_peer_id (keeping the id order, so the direction key
+        // would still match) must fail now that the header is authenticated.
+        let mut spoofed = ZCPacket::new_with_payload(plaintext);
+        spoofed.fill_peer_manager_hdr(10, 20, PacketType::Data as u8);
+        sender
+            .encrypt_payload(SecureDatagramDirection::AToB, &mut spoofed)
+            .unwrap();
+        spoofed
+            .mut_peer_manager_header()
+            .unwrap()
+            .from_peer_id
+            .set(11);
+        assert!(
+            receiver
+                .decrypt_payload(SecureDatagramDirection::AToB, &mut spoofed)
+                .is_err()
+        );
     }
 
     #[test]
