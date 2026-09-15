@@ -334,16 +334,8 @@ impl PortalModule {
             }
         }
         {
-            let mut locks = self.session_locks.write().await;
             for name in removed {
-                // Entries still held by a live session are left alone; the
-                // session drops its reference during its regular cleanup.
-                if locks
-                    .get(&name)
-                    .is_none_or(|lock| Arc::strong_count(lock) == 1)
-                {
-                    locks.remove(&name);
-                }
+                Self::release_session_slot(&self.session_locks, &name).await;
             }
         }
         Ok(applied_clients)
@@ -366,6 +358,24 @@ impl PortalModule {
         };
         if let Some(stale_runtime) = stale_runtime {
             self.shutdown_runtime(stale_runtime).await;
+        }
+
+        // `statuses` mirrors the configured client set so sessions never
+        // resurrect status entries of removed clients.
+        {
+            let config = self.config.as_ref().expect("checked above");
+            let configured: BTreeSet<String> = config
+                .read()
+                .unwrap()
+                .clients
+                .iter()
+                .map(|client| client.name.clone())
+                .collect();
+            let mut statuses = self.statuses.write().await;
+            statuses.retain(|name, _| configured.contains(name));
+            for name in &configured {
+                statuses.entry(name.clone()).or_default();
+            }
         }
 
         let host = self.host.as_ref().ok_or_else(|| {
@@ -470,7 +480,7 @@ impl PortalModule {
 
     #[allow(clippy::too_many_arguments)]
     async fn run_session(
-        mut session: PortalSession,
+        session: PortalSession,
         listener_url: url::Url,
         peer_manager: Arc<PeerManagerCore>,
         runtime_config: CoreRuntimeConfigStore,
@@ -481,21 +491,81 @@ impl PortalModule {
         events: Arc<dyn CoreEventSink>,
         cancel: CancellationToken,
     ) {
-        let Some(client) = config
-            .read()
-            .unwrap()
-            .clients
-            .iter()
-            .find(|client| client.name == session.client_name)
-            .cloned()
+        // The membership check and the lock-slot claim share one critical
+        // section so a concurrent client removal cannot slip between them.
+        let Some((client, session_lock)) =
+            Self::reserve_session_slot(&config, &session_locks, &session.client_name).await
         else {
             tracing::warn!(client = %session.client_name, "unknown VPN portal client session");
             return;
         };
-        let session_lock = {
-            let mut locks = session_locks.write().await;
-            locks.entry(client.name.clone()).or_default().clone()
-        };
+        Self::run_authenticated_session(
+            session,
+            listener_url,
+            peer_manager,
+            runtime_config,
+            client.clone(),
+            statuses,
+            traffic_metrics,
+            events,
+            cancel,
+            session_lock,
+        )
+        .await;
+        Self::release_session_slot(&session_locks, &client.name).await;
+    }
+
+    /// Looks up the configured client and inserts its session-lock entry in
+    /// one `session_locks` write section. No guard spans an await, keeping
+    /// the combined check-and-claim atomic against removals in
+    /// `update_clients`, which run under the same write lock.
+    async fn reserve_session_slot(
+        config: &Arc<StdRwLock<PortalRuntimeConfig>>,
+        session_locks: &Arc<RwLock<BTreeMap<String, Arc<Mutex<()>>>>>,
+        client_name: &str,
+    ) -> Option<(PortalClientConfig, Arc<Mutex<()>>)> {
+        let mut locks = session_locks.write().await;
+        let client = config
+            .read()
+            .unwrap()
+            .clients
+            .iter()
+            .find(|client| client.name == client_name)?
+            .clone();
+        let session_lock = locks.entry(client.name.clone()).or_default().clone();
+        Some((client, session_lock))
+    }
+
+    /// Removes the session-lock entry of a finished session when no other
+    /// session still holds a clone. Entries held by a live session are left
+    /// alone so a queued session stays serialized against it; without this
+    /// cleanup a session racing a removal would leave a ghost entry forever.
+    async fn release_session_slot(
+        session_locks: &Arc<RwLock<BTreeMap<String, Arc<Mutex<()>>>>>,
+        name: &str,
+    ) {
+        let mut locks = session_locks.write().await;
+        if locks
+            .get(name)
+            .is_none_or(|lock| Arc::strong_count(lock) == 1)
+        {
+            locks.remove(name);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_authenticated_session(
+        mut session: PortalSession,
+        listener_url: url::Url,
+        peer_manager: Arc<PeerManagerCore>,
+        runtime_config: CoreRuntimeConfigStore,
+        client: PortalClientConfig,
+        statuses: Arc<RwLock<BTreeMap<String, ClientStatus>>>,
+        traffic_metrics: Arc<StdRwLock<BTreeMap<String, PortalClientTrafficMetrics>>>,
+        events: Arc<dyn CoreEventSink>,
+        cancel: CancellationToken,
+        session_lock: Arc<Mutex<()>>,
+    ) {
         let _session_guard = tokio::select! {
             _ = cancel.cancelled() => return,
             guard = session_lock.lock() => guard,
@@ -508,7 +578,13 @@ impl PortalModule {
         };
         let generation = {
             let mut statuses = statuses.write().await;
-            let status = statuses.entry(client.name.clone()).or_default();
+            // `statuses` mirrors the configured client set; a missing entry
+            // means the client was removed concurrently, so the session must
+            // not resurrect it.
+            let Some(status) = statuses.get_mut(&client.name) else {
+                tracing::warn!(client = %client.name, "VPN portal client removed before session started");
+                return;
+            };
             status.generation = status.generation.wrapping_add(1);
             status.state = PortalClientState::Connecting;
             status.endpoint = Some(session.endpoint.borrow_and_update().clone());
@@ -1706,6 +1782,54 @@ mod tests {
                 1
             );
         }
+        peer_manager.clear_resources().await;
+    }
+
+    #[tokio::test]
+    async fn portal_session_for_removed_client_leaves_no_session_slot() {
+        let (peer_manager, runtime_config) = network_runtime();
+        peer_manager.run().await.unwrap();
+        // The config still lists alice, but every other mirror of the applied
+        // set no longer contains her, as if a concurrent removal raced this
+        // session after its membership check.
+        let config = PortalRuntimeConfig {
+            clients: vec![client("alice", Ipv4Addr::new(10, 82, 0, 2), &["ops"])],
+        };
+        let statuses = Arc::new(RwLock::new(BTreeMap::new()));
+        let session_locks: Arc<RwLock<BTreeMap<String, Arc<Mutex<()>>>>> =
+            Arc::new(RwLock::new(BTreeMap::new()));
+        let (_to_runtime, from_client) = mpsc::channel(1);
+        let (to_client, _from_runtime) = mpsc::channel(1);
+        let (_endpoint_sender, endpoint) = watch::channel("portal://alice".to_owned());
+        let session = PortalSession {
+            client_name: "alice".to_owned(),
+            endpoint,
+            identity_private_key: [176u8; 32],
+            from_client,
+            to_client,
+        };
+        let task = tokio::spawn(PortalModule::run_session(
+            session,
+            "portal://listener".parse().unwrap(),
+            peer_manager.clone(),
+            runtime_config,
+            Arc::new(StdRwLock::new(config)),
+            statuses.clone(),
+            session_locks.clone(),
+            traffic_metrics(&peer_manager, &[]),
+            Arc::new(()),
+            CancellationToken::new(),
+        ));
+        task.await.unwrap();
+
+        assert!(
+            session_locks.read().await.is_empty(),
+            "session for a removed client must release its session-lock entry"
+        );
+        assert!(
+            statuses.read().await.is_empty(),
+            "session for a removed client must not resurrect its status entry"
+        );
         peer_manager.clear_resources().await;
     }
 
