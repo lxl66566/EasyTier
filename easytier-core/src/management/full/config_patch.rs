@@ -234,10 +234,27 @@ where
     }
     .await;
 
-    instance
+    // Re-sync the running instance with everything durably committed above,
+    // even when the patch failed part-way (partial-commit contract). When the
+    // patch already failed, the re-sync is best-effort: its own failure (e.g.
+    // the instance moved to Stopping mid-request) must not mask the patch
+    // error the caller needs.
+    let runtime_sync = instance
         .update_runtime_config_under_operation(runtime_config_from_toml(instance, &config)?)
-        .await?;
-    let (provider_config_changed, managed_credentials_changed) = patch_result?;
+        .await;
+    let (provider_config_changed, managed_credentials_changed) = match (patch_result, runtime_sync)
+    {
+        (Ok(flags), Ok(())) => flags,
+        (Ok(_), Err(error)) => return Err(error),
+        (Err(patch_error), Ok(())) => return Err(patch_error),
+        (Err(patch_error), Err(runtime_error)) => {
+            tracing::warn!(
+                %runtime_error,
+                "runtime config re-sync failed after a failed config patch; reporting the patch error"
+            );
+            return Err(patch_error);
+        }
+    };
     if patch_for_host != InstanceConfigPatch::default() {
         instance
             .instance_runtime
