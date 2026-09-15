@@ -322,17 +322,23 @@ pub unsafe extern "C" fn easytier_ios_delete_instance(instance_name: *const c_ch
     }
 }
 
+/// Upper bound for the caller-supplied collection buffer size. The instance
+/// count stays far below this; a corrupt argument (e.g. `Int32::MAX`) must
+/// not turn into a multi-gigabyte allocation that aborts the process.
+const MAX_COLLECT_INSTANCES: c_int = 1024;
+
 /// Collect running instance information as a JSON object mapping each
 /// instance name to its running info JSON.
 ///
-/// Returns a newly allocated string the caller must release with
+/// `max_length` is clamped to \[`0`, `MAX_COLLECT_INSTANCES`\]. Returns a
+/// newly allocated string the caller must release with
 /// `easytier_ios_free_string`, or null on failure (see
 /// `easytier_ios_last_error`).
 #[unsafe(no_mangle)]
 pub extern "C" fn easytier_ios_collect_network_infos(max_length: c_int) -> *mut c_char {
     guarded(ptr::null_mut(), || {
         error::clear_error();
-        let max_length = max_length.max(0) as usize;
+        let max_length = max_length.clamp(0, MAX_COLLECT_INSTANCES) as usize;
         let mut infos = vec![
             easytier_ffi::KeyValuePair {
                 key: ptr::null(),

@@ -93,7 +93,8 @@ int easytier_ios_delete_instance(const char *instance_name);
  *
  * The result maps each instance name to its running info JSON object.
  *
- * @param max_length Maximum number of instances to report.
+ * @param max_length Maximum number of instances to report. Negative values
+ *                   are treated as 0; values above 1024 are clamped to 1024.
  * @return A newly allocated NUL-terminated JSON string on success, NULL on
  *         failure.
  *
