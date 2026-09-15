@@ -21,7 +21,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     ptr,
-    sync::OnceLock,
+    sync::Mutex,
 };
 
 use diagnostic_logging::DiagnosticMakeWriter;
@@ -76,13 +76,26 @@ impl DiagnosticLogger {
     }
 }
 
-static DIAGNOSTIC_LOGGER: OnceLock<Result<DiagnosticLogger, String>> = OnceLock::new();
+// `None` until the first successful install; install failures are reported
+// through the last-error buffer only, so a later enable can retry (the
+// failure may have been transient, e.g. a filesystem error).
+static DIAGNOSTIC_LOGGER: Mutex<Option<DiagnosticLogger>> = Mutex::new(None);
+
+fn lock_diagnostic_logger() -> std::sync::MutexGuard<'static, Option<DiagnosticLogger>> {
+    DIAGNOSTIC_LOGGER
+        .lock()
+        // Nothing in the critical sections can panic; recover from stray
+        // poisoning instead of propagating it across the FFI boundary.
+        .unwrap_or_else(|error| error.into_inner())
+}
 
 /// Configure persistent EasyTier diagnostic logging for the embedding app.
 ///
-/// Enabling installs a process-wide subscriber on first use, writes into
-/// `directory`, and turns on trace/debug events for connection lifecycle
-/// modules. Disabling reloads the filter to `off`, avoiding event construction
+/// Enabling installs a process-wide subscriber on first successful use,
+/// writes into `directory`, and turns on trace/debug events for connection
+/// lifecycle modules. A failed install is not cached: the next enable
+/// retries it, and the error stays available through `easytier_ios_last_error`.
+/// Disabling reloads the filter to `off`, avoiding event construction
 /// while keeping the subscriber ready for a later enable.
 ///
 /// # Safety
@@ -97,12 +110,11 @@ pub unsafe extern "C" fn easytier_ios_configure_diagnostic_logging(
         guarded(-1, || {
             error::clear_error();
             if enabled == 0 {
-                let Some(logger) = DIAGNOSTIC_LOGGER.get() else {
-                    return 0;
-                };
-                return match logger {
-                    Ok(logger) => diagnostic_result(logger.disable()),
-                    Err(message) => diagnostic_failure(message),
+                let logger = lock_diagnostic_logger();
+                // Disabling without an installed logger is a no-op success.
+                return match logger.as_ref() {
+                    Some(logger) => diagnostic_result(logger.disable()),
+                    None => 0,
                 };
             }
 
@@ -117,11 +129,15 @@ pub unsafe extern "C" fn easytier_ios_configure_diagnostic_logging(
                     return -1;
                 }
             };
-            let logger = DIAGNOSTIC_LOGGER.get_or_init(|| DiagnosticLogger::install(directory));
-            match logger {
-                Ok(logger) => diagnostic_result(logger.enable(directory)),
-                Err(message) => diagnostic_failure(message),
-            }
+            let mut logger = lock_diagnostic_logger();
+            let logger = match logger.as_ref() {
+                Some(logger) => logger,
+                None => match DiagnosticLogger::install(directory) {
+                    Ok(installed) => logger.insert(installed),
+                    Err(message) => return diagnostic_failure(&message),
+                },
+            };
+            diagnostic_result(logger.enable(directory))
         })
     }
 }
@@ -167,7 +183,8 @@ pub unsafe extern "C" fn easytier_ios_append_diagnostic_event(message: *const c_
 pub extern "C" fn easytier_ios_flush_diagnostic_logging() -> c_int {
     guarded(-1, || {
         error::clear_error();
-        let Some(Ok(logger)) = DIAGNOSTIC_LOGGER.get() else {
+        let logger = lock_diagnostic_logger();
+        let Some(logger) = logger.as_ref() else {
             return 0;
         };
         match logger.writer.flush() {
@@ -185,7 +202,8 @@ pub extern "C" fn easytier_ios_flush_diagnostic_logging() -> c_int {
 pub extern "C" fn easytier_ios_clear_diagnostic_logs() -> c_int {
     guarded(-1, || {
         error::clear_error();
-        let Some(Ok(logger)) = DIAGNOSTIC_LOGGER.get() else {
+        let logger = lock_diagnostic_logger();
+        let Some(logger) = logger.as_ref() else {
             return 0;
         };
         match logger.writer.clear() {
