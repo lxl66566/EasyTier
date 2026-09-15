@@ -177,6 +177,9 @@ pub enum MetricName {
     VpnPortalClientPacketsTx,
     /// Packets delivered from the mesh to one VPN portal client
     VpnPortalClientPacketsRx,
+    /// Packets from one VPN portal client dropped because their IP source
+    /// did not match the client's assigned address
+    VpnPortalClientPacketsSourceMismatch,
 
     /// UDP broadcast relay packets captured from the raw socket
     UdpBroadcastRelayPacketsCaptured,
@@ -280,6 +283,9 @@ impl fmt::Display for MetricName {
             }
             MetricName::VpnPortalClientPacketsRx => {
                 write!(f, "vpn_portal_client_packets_rx")
+            }
+            MetricName::VpnPortalClientPacketsSourceMismatch => {
+                write!(f, "vpn_portal_client_packets_source_mismatch")
             }
 
             MetricName::UdpBroadcastRelayPacketsCaptured => {
