@@ -43,7 +43,7 @@ use crate::{
     tunnel::{
         Tunnel,
         encrypt::{
-            Encryptor, NullCipher, create_encryptor, derive_key_128, derive_key_256,
+            Encryptor, NullCipher, create_legacy_encryptor, derive_key_128, derive_key_256,
             validate_algorithm,
         },
     },
@@ -908,7 +908,7 @@ impl PeerManagerCore {
             .unwrap_or_default();
         let encryptor: Arc<dyn Encryptor> = if flags.enable_encryption {
             validate_algorithm(&flags.encryption_algorithm)?;
-            create_encryptor(
+            create_legacy_encryptor(
                 &flags.encryption_algorithm,
                 derive_key_128(secret),
                 derive_key_256(secret),
