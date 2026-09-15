@@ -69,7 +69,9 @@ impl Encryptor for AesGcmCipher {
         };
 
         if let Err(e) = rs {
-            println!("error: {:?}", e.to_string());
+            // Corrupted ciphertext is attacker-controllable; keep this at debug
+            // level so it cannot be used to flood the log.
+            tracing::debug!(?e, "aes-gcm decrypt failed");
             return Err(Error::DecryptionFailed);
         }
 
