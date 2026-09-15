@@ -140,6 +140,13 @@ impl TunnelFilter for PeerConnLiveness {
         let Some(header) = data.mut_peer_manager_header() else {
             return Some(data);
         };
+        // Encrypted headers are authenticated by the AEAD (the canonical
+        // header is bound into the AAD and `reserved` carries the format
+        // marker), so probes and echoes must not touch them. Ping/Pong and
+        // other plaintext packets carry the markers instead.
+        if header.is_encrypted() {
+            return Some(data);
+        }
         header.clear_liveness_marker();
         if let Some(token) = self.take_echo() {
             header.set_liveness_echo(token);
@@ -160,6 +167,14 @@ impl TunnelFilter for PeerConnLiveness {
         let Some(header) = packet.mut_peer_manager_header() else {
             return Some(Ok(packet));
         };
+        // Header-AAD packets must reach the decryptor with their marker and
+        // flag bits intact. Sealed packets of this build never carry liveness
+        // markers (see before_send); peers that still piggyback on encrypted
+        // packets never set the marker, so reading and clearing those stays
+        // safe.
+        if header.is_header_aad() {
+            return Some(Ok(packet));
+        }
         let probe = header.liveness_probe_token();
         let echo = header.liveness_echo_token();
         header.clear_liveness_marker();
@@ -227,6 +242,61 @@ mod tests {
 
         liveness.set_remote_features(&[FEATURE.to_owned()]);
         assert!(liveness.start_probe().is_some());
+    }
+
+    #[tokio::test]
+    async fn encrypted_headers_pass_through_untouched() {
+        // Encrypted headers are AEAD-authenticated; the filter must neither
+        // piggyback markers on them nor strip the header-AAD marker.
+        let local = PeerConnLiveness::new();
+        local.set_enabled(true);
+        let token = local.start_probe().unwrap();
+
+        let mut outbound = data_packet(1, 2);
+        outbound
+            .mut_peer_manager_header()
+            .unwrap()
+            .set_encrypted(true);
+        outbound
+            .mut_peer_manager_header()
+            .unwrap()
+            .set_header_aad(true);
+        let sealed = local.before_send(outbound).unwrap();
+        let header = sealed.peer_manager_header().unwrap();
+        assert!(header.is_header_aad());
+        assert_eq!(header.liveness_probe_token(), None);
+
+        // The local probe stays unacknowledged by the encrypted round trip.
+        let remote = PeerConnLiveness::new();
+        remote.set_enabled(true);
+        let reply = remote.after_received(Ok(sealed)).unwrap().unwrap();
+        assert!(reply.peer_manager_header().unwrap().is_header_aad());
+        let reply = remote.before_send(reply).unwrap();
+        let received = local.after_received(Ok(reply)).unwrap().unwrap();
+        assert!(received.peer_manager_header().unwrap().is_header_aad());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), local.wait_for_echo(token))
+                .await
+                .is_err(),
+            "encrypted round trip must not carry liveness markers"
+        );
+
+        // Encrypted packets from peers that still piggyback markers (no
+        // header-AAD marker present) keep being processed for interop. The
+        // token equals the AAD marker value here, so this also pins the
+        // discrimination: liveness tokens always pair with a LIVENESS_* flag.
+        let mut legacy = data_packet(2, 1);
+        let header = legacy.mut_peer_manager_header().unwrap();
+        header.set_encrypted(true);
+        header.set_liveness_echo(token);
+        assert!(!legacy.peer_manager_header().unwrap().is_header_aad());
+        let received = local.after_received(Ok(legacy)).unwrap().unwrap();
+        let header = received.peer_manager_header().unwrap();
+        assert_eq!(header.liveness_echo_token(), None);
+        assert!(!header.is_header_aad());
+        tokio::time::timeout(Duration::from_millis(50), local.wait_for_echo(token))
+            .await
+            .expect("legacy piggybacked echo was not observed");
     }
 
     #[tokio::test]
