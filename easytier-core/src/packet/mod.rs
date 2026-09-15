@@ -195,7 +195,7 @@ bitflags::bitflags! {
 }
 
 #[repr(C, packed)]
-#[derive(AsBytes, FromBytes, FromZeroes, Clone, Debug, Default)]
+#[derive(AsBytes, FromBytes, FromZeroes, Clone, Copy, Debug, Default)]
 pub struct PeerManagerHeader {
     pub from_peer_id: U32<DefaultEndian>,
     pub to_peer_id: U32<DefaultEndian>,
@@ -206,6 +206,16 @@ pub struct PeerManagerHeader {
     pub len: U32<DefaultEndian>,
 }
 pub const PEER_MANAGER_HEADER_SIZE: usize = std::mem::size_of::<PeerManagerHeader>();
+
+/// Value of [`PeerManagerHeader::reserved`] marking an encrypted packet whose
+/// AEAD tag covers the canonical header bytes (see
+/// [`PeerManagerHeader::aad_bytes`]).
+///
+/// The reserved byte carries disjoint meanings on disjoint packet classes:
+/// liveness tokens on unencrypted Ping/Pong, this marker on encrypted packets.
+/// Peers predating header authentication always leave it zero on encrypted
+/// packets, so the marker doubles as the receiver-side format selector.
+pub const HEADER_AAD_MARKER: u8 = 1;
 
 impl PeerManagerHeader {
     pub fn is_encrypted(&self) -> bool {
@@ -320,6 +330,52 @@ impl PeerManagerHeader {
             .remove(PeerManagerHeaderFlags::LIVENESS_PROBE | PeerManagerHeaderFlags::LIVENESS_ECHO);
         self.flags = flags.bits();
         self.reserved = 0;
+    }
+
+    /// True when the sender bound the canonical header into the AEAD AAD.
+    /// Only meaningful on encrypted packets; see [`HEADER_AAD_MARKER`].
+    ///
+    /// The liveness filter stores its probe/echo token in `reserved` together
+    /// with a `LIVENESS_*` flag, so a bare `reserved == marker` check would
+    /// misread a liveness token that happens to equal the marker. Genuine
+    /// header-AAD packets never carry liveness flags: the liveness filter
+    /// leaves encrypted headers untouched.
+    pub fn is_header_aad(&self) -> bool {
+        self.reserved == HEADER_AAD_MARKER
+            && !PeerManagerHeaderFlags::from_bits(self.flags)
+                .unwrap()
+                .intersects(
+                    PeerManagerHeaderFlags::LIVENESS_PROBE | PeerManagerHeaderFlags::LIVENESS_ECHO,
+                )
+    }
+
+    pub fn set_header_aad(&mut self, on: bool) {
+        self.reserved = if on { HEADER_AAD_MARKER } else { 0 };
+    }
+
+    /// Canonical header bytes to bind into the AEAD AAD.
+    ///
+    /// Fields that legitimately differ between seal and open are zeroed so
+    /// both sides derive identical bytes:
+    /// - `ENCRYPTED`: sealing happens before the bit is set, opening before it
+    ///   is cleared;
+    /// - `LATENCY_FIRST` and `forward_counter`: intermediate hops may clear or
+    ///   increment them while forwarding an encrypted packet;
+    /// - `reserved`: carries the [`HEADER_AAD_MARKER`] format selector, not
+    ///   content.
+    ///
+    /// Everything else (`from_peer_id`, `to_peer_id`, `packet_type`, the
+    /// remaining flags and `len`) is authenticated.
+    pub fn aad_bytes(&self) -> [u8; PEER_MANAGER_HEADER_SIZE] {
+        let mut canonical = *self;
+        let excluded =
+            (PeerManagerHeaderFlags::ENCRYPTED | PeerManagerHeaderFlags::LATENCY_FIRST).bits();
+        canonical.flags &= !excluded;
+        canonical.forward_counter = 0;
+        canonical.reserved = 0;
+        let mut bytes = [0u8; PEER_MANAGER_HEADER_SIZE];
+        bytes.copy_from_slice(canonical.as_bytes());
+        bytes
     }
 
     fn set_liveness_marker(&mut self, marker: PeerManagerHeaderFlags, token: u8) {
@@ -953,6 +1009,55 @@ mod tests {
             let bytes = self.bytes_from_offset(offset)?;
             TCPTunnelHeader::ref_from_prefix(bytes)
         }
+    }
+
+    #[test]
+    fn aad_bytes_covers_stable_fields_and_ignores_transient_ones() {
+        let mut hdr = PeerManagerHeader::default();
+        hdr.from_peer_id.set(0x11223344);
+        hdr.to_peer_id.set(0x55667788);
+        hdr.packet_type = PacketType::Data as u8;
+        hdr.flags = (PeerManagerHeaderFlags::ENCRYPTED
+            | PeerManagerHeaderFlags::LATENCY_FIRST
+            | PeerManagerHeaderFlags::NO_PROXY)
+            .bits();
+        hdr.forward_counter = 3;
+        hdr.reserved = HEADER_AAD_MARKER;
+        hdr.len.set(0x0403);
+
+        let aad = hdr.aad_bytes();
+        let expected = PeerManagerHeader {
+            from_peer_id: U32::new(0x11223344),
+            to_peer_id: U32::new(0x55667788),
+            packet_type: PacketType::Data as u8,
+            flags: PeerManagerHeaderFlags::NO_PROXY.bits(),
+            forward_counter: 0,
+            reserved: 0,
+            len: U32::new(0x0403),
+        };
+        assert_eq!(aad.as_slice(), expected.as_bytes());
+
+        // Relay-legal mutations (latency-first clear, forward counter bump)
+        // must not change the canonical bytes, so relayed packets still open.
+        hdr.set_latency_first(false);
+        hdr.forward_counter = 4;
+        assert_eq!(hdr.aad_bytes(), aad);
+    }
+
+    #[test]
+    fn header_aad_marker_round_trip() {
+        let mut hdr = PeerManagerHeader::default();
+        assert!(!hdr.is_header_aad());
+        hdr.set_header_aad(true);
+        assert!(hdr.is_header_aad());
+        hdr.set_header_aad(false);
+        assert!(!hdr.is_header_aad());
+
+        // A liveness token equal to the marker must not read as header-AAD:
+        // liveness always pairs the token with a LIVENESS_* flag.
+        hdr.set_header_aad(true);
+        hdr.set_liveness_probe(HEADER_AAD_MARKER);
+        assert!(!hdr.is_header_aad());
     }
 
     #[test]
