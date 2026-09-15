@@ -210,6 +210,12 @@ where
             }
 
             if let Some(external_signal) = external_signal.as_ref() {
+                // The `notified()` future must be created before the version is
+                // re-read: a `Notified` future is guaranteed to observe every
+                // `notify_waiters()` call made after its creation, so a notify
+                // landing between the version read and the first poll below
+                // cannot be lost. Reordering these two statements would degrade
+                // wakeups back to `loop_interval_ms` polling.
                 let notified = external_signal.notified();
                 tokio::pin!(notified);
                 let cur_version = external_signal.version();
@@ -319,5 +325,89 @@ mod tests {
 
         manager.stop().await;
         assert_eq!(active_tasks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn external_signal_notify_before_first_poll_wakes_immediately() {
+        // Pins the ordering invariant of `PeerTaskManager::main_loop`: the
+        // `notified()` future is created before the version is re-read, and a
+        // `notify()` landing between that read and the future's first poll
+        // (the classic lost-wakeup window) must still wake the waiter without
+        // waiting for a polling timeout.
+        let signal = ExternalTaskSignal::new();
+        let observed_version = signal.version();
+
+        let notified = signal.notified();
+        tokio::pin!(notified);
+
+        let cur_version = signal.version();
+        assert_eq!(observed_version, cur_version);
+
+        signal.notify();
+
+        tokio::time::timeout(Duration::from_secs(1), &mut notified)
+            .await
+            .expect("notify() before the first poll must not be lost");
+        assert_eq!(signal.version(), observed_version + 1);
+    }
+
+    #[derive(Clone)]
+    struct ImmediateWakeLauncher {
+        collect_count: Arc<AtomicUsize>,
+        interval_ms: u64,
+    }
+
+    #[async_trait]
+    impl PeerTaskLauncher for ImmediateWakeLauncher {
+        type CollectPeerItem = u8;
+        type TaskRet = ();
+
+        async fn collect_peers_need_task(&self) -> Vec<u8> {
+            self.collect_count.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
+        }
+
+        async fn launch_task(&self, _item: u8) -> JoinHandle<Result<(), Error>> {
+            tokio::spawn(async { Ok(()) })
+        }
+
+        fn loop_interval_ms(&self) -> u64 {
+            self.interval_ms
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn external_signal_wakes_manager_without_waiting_for_interval() {
+        // With the clock paused, only the lost-wakeup path (falling back to the
+        // interval timer) would advance time; a working demand-driven wakeup
+        // re-collects at ~zero elapsed time.
+        let collect_count = Arc::new(AtomicUsize::new(0));
+        let signal = Arc::new(ExternalTaskSignal::new());
+        let manager = PeerTaskManager::new_with_external_signal(
+            ImmediateWakeLauncher {
+                collect_count: collect_count.clone(),
+                interval_ms: 60_000,
+            },
+            Some(signal.clone()),
+        );
+
+        manager.start();
+        while collect_count.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+
+        let started = tokio::time::Instant::now();
+        signal.notify();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while collect_count.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("external signal must wake the manager immediately");
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        manager.stop().await;
     }
 }
