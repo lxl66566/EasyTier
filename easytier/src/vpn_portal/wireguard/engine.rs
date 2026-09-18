@@ -18,6 +18,7 @@ use boringtun::{
     },
     x25519::{PublicKey, StaticSecret},
 };
+use bytes::Bytes;
 use easytier_core::{
     gateway::vpn_portal::{PortalClientConfig, PortalSession},
     socket::udp::VirtualUdpSocket,
@@ -46,8 +47,8 @@ pub(super) struct DerivedClient {
 
 struct PortalChannels {
     endpoint: watch::Receiver<String>,
-    from_client: mpsc::Receiver<Vec<u8>>,
-    to_client: mpsc::Sender<Vec<u8>>,
+    from_client: mpsc::Receiver<Bytes>,
+    to_client: mpsc::Sender<Bytes>,
 }
 
 struct ClientSession {
@@ -56,7 +57,7 @@ struct ClientSession {
     endpoint: Option<Endpoint>,
     endpoint_updates: watch::Sender<String>,
     tunnel: Tunn,
-    from_client: mpsc::Sender<Vec<u8>>,
+    from_client: mpsc::Sender<Bytes>,
     portal_channels: Option<PortalChannels>,
     drain_capacity: usize,
     tasks: JoinSet<()>,
@@ -325,7 +326,10 @@ impl PortalEngine {
                 TunnResult::WriteToTunnelV4(packet, _) => {
                     current.update_endpoint(socket.clone(), remote);
                     self.activate_client(&slot, current);
-                    match current.from_client.try_send(packet.to_vec()) {
+                    // Owned copy required while the decapsulation output is a
+                    // fresh per-datagram buffer; removed once the session owns
+                    // a reusable scratch chunk.
+                    match current.from_client.try_send(Bytes::copy_from_slice(packet)) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             tracing::debug!(
@@ -380,7 +384,7 @@ impl PortalEngine {
     ) -> ClientSession {
         let generation = slot.next_generation.fetch_add(1, Ordering::Relaxed);
         let (from_client, portal_from_client) = mpsc::channel(PORTAL_PACKET_CAPACITY);
-        let (portal_to_client, mut to_client) = mpsc::channel::<Vec<u8>>(PORTAL_PACKET_CAPACITY);
+        let (portal_to_client, mut to_client) = mpsc::channel::<Bytes>(PORTAL_PACKET_CAPACITY);
         let (endpoint_updates, portal_endpoint) = watch::channel(remote.to_string());
         let engine = Arc::downgrade(self);
         let slot_for_task = Arc::downgrade(slot);

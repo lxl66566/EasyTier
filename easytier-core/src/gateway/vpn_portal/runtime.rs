@@ -15,6 +15,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use cidr::Ipv4Inet;
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -66,13 +67,14 @@ pub struct PortalRuntimeConfig {
 /// ordinary reauthentication and endpoint roaming stay within that adapter.
 /// The endpoint watch exposes the current authenticated endpoint and any later
 /// roaming within the generation. Packet channels carry complete raw IPv4
-/// packets without protocol framing.
+/// packets without protocol framing; `Bytes` lets adapters hand off
+/// zero-copy views of their receive buffers instead of per-packet vectors.
 pub struct PortalSession {
     pub client_name: String,
     pub endpoint: watch::Receiver<String>,
     pub identity_private_key: [u8; 32],
-    pub from_client: mpsc::Receiver<Vec<u8>>,
-    pub to_client: mpsc::Sender<Vec<u8>>,
+    pub from_client: mpsc::Receiver<Bytes>,
+    pub to_client: mpsc::Sender<Bytes>,
 }
 
 impl std::fmt::Debug for PortalSession {
@@ -745,7 +747,10 @@ impl PortalModule {
             let attached = attached.clone();
             tokio::spawn(async move {
                 while let Some(packet) = attached.recv_packet().await {
-                    let payload = packet.payload().to_vec();
+                    // Zero-copy: move the ZCPacket payload out and hand the
+                    // adapter an immutable view; the channel seam no longer
+                    // forces an owned copy per packet.
+                    let payload = packet.into_core_packet().payload_bytes().freeze();
                     let bytes = payload.len();
                     if client_sink.send(payload).await.is_err() {
                         break;
@@ -1920,10 +1925,10 @@ mod tests {
 
         let spoofed = raw_ipv4(Ipv4Addr::new(10, 82, 0, 99), Ipv4Addr::new(10, 82, 0, 1));
         for _ in 0..3 {
-            to_runtime.send(spoofed.clone()).await.unwrap();
+            to_runtime.send(Bytes::from(spoofed.clone())).await.unwrap();
         }
         let valid = raw_ipv4(virtual_ip, Ipv4Addr::new(10, 82, 0, 1));
-        to_runtime.send(valid.clone()).await.unwrap();
+        to_runtime.send(Bytes::from(valid.clone())).await.unwrap();
         drop(to_runtime);
         task.await.unwrap();
 
@@ -2156,7 +2161,10 @@ mod tests {
         ));
 
         let client_packet = raw_ipv4(virtual_ip, Ipv4Addr::new(10, 82, 0, 1));
-        to_runtime.send(client_packet.clone()).await.unwrap();
+        to_runtime
+            .send(Bytes::from(client_packet.clone()))
+            .await
+            .unwrap();
         let attached_peer_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let status = statuses.read().await.get("alice").cloned().unwrap();
