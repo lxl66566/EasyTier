@@ -21,6 +21,12 @@ impl EncryptionAlgorithm {
             Self::ChaCha20 => "chacha20",
         }
     }
+
+    /// True when the algorithm is obfuscation only: no integrity, no replay
+    /// protection, and passive attackers can tamper with traffic undetected.
+    pub const fn is_insecure(self) -> bool {
+        matches!(self, Self::Xor)
+    }
 }
 
 impl fmt::Display for EncryptionAlgorithm {
@@ -69,5 +75,19 @@ mod tests {
     #[test]
     fn aes_is_the_stable_default() {
         assert_eq!(EncryptionAlgorithm::default(), EncryptionAlgorithm::AesGcm);
+    }
+
+    #[test]
+    fn xor_is_the_only_insecure_algorithm() {
+        // Drives the peer-manager warning path: only an explicitly selected
+        // xor must be flagged, never the AEAD defaults.
+        for algorithm in EncryptionAlgorithm::VARIANTS {
+            assert_eq!(
+                algorithm.is_insecure(),
+                *algorithm == EncryptionAlgorithm::Xor,
+                "{algorithm} misclassified"
+            );
+        }
+        assert!("xor".parse::<EncryptionAlgorithm>().unwrap().is_insecure());
     }
 }

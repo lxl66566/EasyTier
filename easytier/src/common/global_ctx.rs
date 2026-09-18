@@ -9,7 +9,6 @@ use async_trait::async_trait;
 use easytier_core::connectivity::composite::ConnectorRuntime as _;
 use easytier_core::peers::public_ipv6::PublicIpv6Host;
 use easytier_core::socket::{NetNamespace, SocketContext};
-use easytier_core::tunnel::effective_encryption_uses_xor;
 use easytier_core::{
     config::{PeerId, peers::PeerRuntimeSnapshot, runtime::CoreInstanceRuntimeConfig},
     instance::{CoreInstanceConfig, CoreInstanceHostConfig},
@@ -187,9 +186,6 @@ impl GlobalCtx {
         let ipv6 = runtime
             .map(|runtime| Self::runtime_ipv6(&runtime.peer))
             .unwrap_or_else(|| config_fs.get_ipv6());
-        if flags.enable_encryption && effective_encryption_uses_xor(&flags.encryption_algorithm) {
-            tracing::warn!("using insecure XOR because no AEAD encryption is configured");
-        }
 
         let (event_bus, _) = tokio::sync::broadcast::channel(16);
         GlobalCtx {

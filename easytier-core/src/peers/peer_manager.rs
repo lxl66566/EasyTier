@@ -954,6 +954,19 @@ impl PeerManagerCore {
             .unwrap_or_default();
         let encryptor: Arc<dyn Encryptor> = if flags.enable_encryption {
             validate_algorithm(&flags.encryption_algorithm)?;
+            // crypto-review M1: xor exists only for legacy interop; surface its
+            // insecurity here (once per instance construction, never per packet).
+            if flags
+                .encryption_algorithm
+                .parse::<crate::config::EncryptionAlgorithm>()
+                .is_ok_and(crate::config::EncryptionAlgorithm::is_insecure)
+            {
+                tracing::warn!(
+                    "encryption_algorithm 'xor' is obfuscation only: it provides no \
+                     integrity or replay protection, so traffic can be tampered with \
+                     undetected; prefer 'aes-gcm'"
+                );
+            }
             // Both KDF suites are built up front so per-packet selection is a
             // cheap branch: v1 SipHash keys for peers predating `kdf-v2`,
             // argon2id keys (derived once and cached) for peers that
