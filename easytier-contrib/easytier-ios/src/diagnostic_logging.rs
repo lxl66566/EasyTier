@@ -2,7 +2,12 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{Receiver, SyncSender, channel, sync_channel},
+    },
+    thread::{Builder, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -15,34 +20,161 @@ pub(crate) const MAX_LOG_FILES: usize = 4;
 /// broken sink cannot flood the log with its own failures.
 const ROTATION_WARN_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Bounded capacity of the event queue between emitting threads and the
+/// writer thread. When full, events are dropped and counted instead of
+/// blocking the emitter (which runs on data-plane worker threads).
+const CHANNEL_CAPACITY: usize = 1024;
+
+/// Why not `tracing_appender::non_blocking`: it does move writes off the
+/// emitting thread, but its rolling policy is time-based only (it cannot
+/// reproduce this sink's size-triggered rename chain with a hard file-count
+/// cap) and it offers no way to run control operations (directory switch,
+/// clear, synchronous drain) on the worker thread. A minimal dedicated
+/// writer over a bounded std mpsc channel keeps those semantics without
+/// pulling in another dependency.
+enum Message {
+    Event(Vec<u8>),
+    SetDirectory(PathBuf, Reply),
+    Clear(Reply),
+    Flush(Reply),
+    Shutdown,
+}
+
+/// Completion channel for control operations; the caller blocks on it until
+/// the writer thread has processed the command.
+type Reply = std::sync::mpsc::Sender<io::Result<()>>;
+
+struct WriterShared {
+    tx: SyncSender<Message>,
+    /// Events dropped because the channel was full; once the channel
+    /// recovers, a single summary line is emitted so the gap stays visible.
+    /// Best-effort counters (Relaxed); exact counts are not required.
+    dropped: AtomicU64,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for WriterShared {
+    fn drop(&mut self) {
+        // Last writer clone gone: enqueue Shutdown behind the remaining
+        // events (send blocks only until the worker drains space, which it
+        // always does for a live worker) and join so the handle never leaks.
+        let _ = self.tx.send(Message::Shutdown);
+        if let Some(worker) = self
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            // The worker surfaces errors as values and must not panic; a
+            // stray panic is already unreportable here, so just reap it.
+            let _ = worker.join();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct DiagnosticMakeWriter {
-    inner: Arc<Mutex<RotatingLog>>,
+    shared: Arc<WriterShared>,
 }
 
 impl DiagnosticMakeWriter {
     pub(crate) fn new(directory: &Path) -> io::Result<Self> {
+        let log = RotatingLog::open(directory)?;
+        let (tx, rx) = sync_channel(CHANNEL_CAPACITY);
+        let worker = Builder::new()
+            .name("easytier-diagnostic-log".to_owned())
+            .spawn(move || run_writer(log, rx))?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(RotatingLog::open(directory)?)),
+            shared: Arc::new(WriterShared {
+                tx,
+                dropped: AtomicU64::new(0),
+                worker: Mutex::new(Some(worker)),
+            }),
         })
     }
 
     pub(crate) fn set_directory(&self, directory: &Path) -> io::Result<()> {
-        self.lock()?.set_directory(directory)
+        self.call(|reply| Message::SetDirectory(directory.to_owned(), reply))
     }
 
     pub(crate) fn clear(&self) -> io::Result<()> {
-        self.lock()?.clear()
+        self.call(Message::Clear)
     }
 
+    /// Drain every event enqueued so far, flush the file, and only return
+    /// once both are done. `disable` relies on this so already-emitted
+    /// events are never lost. The writer thread itself is intentionally kept
+    /// alive afterwards: the tracing subscriber is process-global and cannot
+    /// be uninstalled, so a later enable reuses the parked thread instead of
+    /// respawn machinery.
     pub(crate) fn flush(&self) -> io::Result<()> {
-        self.lock()?.flush()
+        self.call(Message::Flush)
     }
 
-    fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, RotatingLog>> {
-        self.inner
-            .lock()
-            .map_err(|_| io::Error::other("diagnostic log lock poisoned"))
+    /// Run a control operation on the writer thread and wait for it to
+    /// finish. Blocking is fine here: these are called from FFI lifecycle
+    /// paths, never from event emission.
+    fn call(&self, make: impl FnOnce(Reply) -> Message) -> io::Result<()> {
+        let (reply, done) = channel();
+        self.shared
+            .tx
+            .send(make(reply))
+            .map_err(|_| io::Error::other("diagnostic log writer stopped"))?;
+        done.recv()
+            .map_err(|_| io::Error::other("diagnostic log writer stopped"))?
+    }
+}
+
+/// Writer thread body: owns the rotating log exclusively, so the emitting
+/// path never touches files or locks.
+fn run_writer(mut log: RotatingLog, rx: Receiver<Message>) {
+    while let Ok(message) = rx.recv() {
+        match message {
+            Message::Event(event) => {
+                // Write errors have no observer here and must not be logged
+                // back (an unthrottled loop of failing warn events would
+                // spin this thread); only the rate-limited rotation warning
+                // is re-emitted, bounded by ROTATION_WARN_INTERVAL.
+                let _ = log.write_event(&event);
+                if let Some(warning) = log.take_rotation_warning() {
+                    tracing::warn!(target: "easytier_ios::diagnostics", "{warning}");
+                }
+            }
+            Message::SetDirectory(directory, reply) => {
+                let _ = reply.send(log.set_directory(&directory));
+            }
+            Message::Clear(reply) => {
+                let _ = reply.send(log.clear());
+            }
+            Message::Flush(reply) => {
+                let _ = reply.send(log.flush());
+            }
+            Message::Shutdown => break,
+        }
+    }
+}
+
+/// Enqueue one formatted event without ever blocking the caller: a full
+/// channel drops the event and counts it; once the channel recovers, a
+/// single "dropped N events" summary line is emitted first so the gap stays
+/// visible in the log.
+fn enqueue_event(tx: &SyncSender<Message>, dropped: &AtomicU64, event: Vec<u8>) {
+    let missed = dropped.load(Ordering::Relaxed);
+    if missed > 0
+        && dropped
+            .compare_exchange(missed, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        let summary =
+            format!("easytier diagnostic log: dropped {missed} events while the queue was full\n");
+        if tx.try_send(Message::Event(summary.into_bytes())).is_err() {
+            // Still saturated (or the worker is gone); restore the count so
+            // the summary is retried later.
+            dropped.fetch_add(missed, Ordering::Relaxed);
+        }
+    }
+    if tx.try_send(Message::Event(event)).is_err() {
+        dropped.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -63,23 +195,12 @@ pub(crate) struct BufferedEventWriter {
 }
 
 impl BufferedEventWriter {
-    fn commit(&mut self) -> io::Result<()> {
+    fn commit(&mut self) {
         if self.buffer.is_empty() {
-            return Ok(());
+            return;
         }
         let buffer = std::mem::take(&mut self.buffer);
-        let mut log = self.target.lock()?;
-        log.write_event(&buffer)?;
-        let warning = log.take_rotation_warning();
-        // Release the lock before emitting: the warning re-enters this
-        // writer (and this lock) when the subscriber records it, so holding
-        // the guard here would deadlock. ROTATION_WARN_INTERVAL bounds the
-        // re-entry depth.
-        drop(log);
-        if let Some(warning) = warning {
-            tracing::warn!(target: "easytier_ios::diagnostics", "{warning}");
-        }
-        Ok(())
+        enqueue_event(&self.target.shared.tx, &self.target.shared.dropped, buffer);
     }
 }
 
@@ -90,13 +211,14 @@ impl Write for BufferedEventWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.commit()
+        self.commit();
+        Ok(())
     }
 }
 
 impl Drop for BufferedEventWriter {
     fn drop(&mut self) {
-        let _ = self.commit();
+        self.commit();
     }
 }
 
@@ -104,8 +226,9 @@ struct RotatingLog {
     directory: PathBuf,
     active: Option<File>,
     active_bytes: u64,
-    /// Rate-limited rotation failure message, drained by the write path and
-    /// emitted as a `warn!` once it no longer holds the log lock.
+    /// Rate-limited rotation failure message, drained by the writer thread
+    /// after `write_event` returns and emitted as a `warn!`; the rate limit
+    /// bounds the re-entry when that warning is logged itself.
     pending_rotation_warn: Option<String>,
     last_rotation_warn: Option<Instant>,
 }
@@ -277,9 +400,8 @@ impl RotatingLog {
     }
 
     /// Record a rate-limited warning about a swallowed rotation failure; the
-    /// write path drains it via `take_rotation_warning` once the log lock has
-    /// been released, so the warning never re-enters the lock it was taken
-    /// under.
+    /// writer thread drains it via `take_rotation_warning` after
+    /// `write_event` returns.
     fn note_rotation_failure(&mut self, error: &io::Error) {
         let now = Instant::now();
         if self
@@ -430,5 +552,84 @@ mod tests {
         log.write_event(b"second\n").unwrap();
         log.flush().unwrap();
         assert_eq!(fs::read(log.active_path()).unwrap(), b"first\nsecond\n");
+    }
+
+    fn wait_for(mut probe: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !probe() {
+            assert!(
+                Instant::now() < deadline,
+                "condition not met within the timeout"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn events_reach_disk_through_the_writer_thread() {
+        let directory = TempDir::new("writer");
+        let writer = DiagnosticMakeWriter::new(&directory.0).unwrap();
+        {
+            let mut event = writer.make_writer();
+            event
+                .write_all(b"hello from the emitting thread\n")
+                .unwrap();
+            event.flush().unwrap();
+        }
+        // The Drop of the writer also commits.
+
+        // The write happens on another thread; poll for its arrival.
+        let log_path = directory.0.join("easytier.log");
+        wait_for(|| fs::read_to_string(&log_path).is_ok_and(|content| content.contains("hello")));
+        // Control flush is a barrier: everything enqueued before it is on
+        // disk once it returns.
+        writer.flush().unwrap();
+        assert!(fs::read_to_string(&log_path).unwrap().contains("hello"));
+        // Dropping the last clone shuts the worker down cleanly.
+    }
+
+    #[test]
+    fn flush_drains_pending_events() {
+        let directory = TempDir::new("drain");
+        let writer = DiagnosticMakeWriter::new(&directory.0).unwrap();
+        const EVENTS: usize = 200;
+        for index in 0..EVENTS {
+            let mut event = writer.make_writer();
+            write!(event, "drain event {index}\n").unwrap();
+        }
+        // Every writer Drop only enqueues; the flush reply proves all 200
+        // events were written and flushed before it returned.
+        writer.flush().unwrap();
+        let content = fs::read_to_string(directory.0.join("easytier.log")).unwrap();
+        for index in 0..EVENTS {
+            assert!(
+                content.contains(&format!("drain event {index}\n")),
+                "event {index} lost before the flush barrier"
+            );
+        }
+    }
+
+    #[test]
+    fn full_channel_drops_events_without_blocking() {
+        let (tx, rx) = sync_channel::<Message>(2);
+        let dropped = AtomicU64::new(0);
+
+        enqueue_event(&tx, &dropped, b"first\n".to_vec());
+        enqueue_event(&tx, &dropped, b"second\n".to_vec());
+        // The queue is full now: this must neither block nor panic, just
+        // count the drop.
+        let start = Instant::now();
+        enqueue_event(&tx, &dropped, b"third\n".to_vec());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+
+        // Free one slot; the next enqueue recovers and reports the earlier
+        // drop through a summary line ahead of it.
+        assert!(matches!(&rx.try_recv(), Ok(Message::Event(e)) if e == b"first\n"));
+        enqueue_event(&tx, &dropped, b"fourth\n".to_vec());
+        assert!(matches!(&rx.try_recv(), Ok(Message::Event(e)) if e == b"second\n"));
+        assert!(
+            matches!(&rx.try_recv(), Ok(Message::Event(e)) if String::from_utf8_lossy(e).contains("dropped 1 events"))
+        );
     }
 }
