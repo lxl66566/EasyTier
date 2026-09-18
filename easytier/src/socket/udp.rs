@@ -50,7 +50,7 @@ pub struct RuntimeUdpSocket {
 
 impl RuntimeUdpSocket {
     #[cfg(test)]
-    fn new(socket: Arc<UdpSocket>) -> Self {
+    pub(crate) fn new(socket: Arc<UdpSocket>) -> Self {
         Self::new_with_context(socket, SocketContext::default())
     }
 

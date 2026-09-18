@@ -18,7 +18,7 @@ use boringtun::{
     },
     x25519::{PublicKey, StaticSecret},
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use easytier_core::{
     gateway::vpn_portal::{PortalClientConfig, PortalSession},
     socket::udp::VirtualUdpSocket,
@@ -38,6 +38,10 @@ const MIN_WIREGUARD_PACKET_CAPACITY: usize = 148;
 const DOUBLE_VERIFY_HANDSHAKE_LIMIT: u64 = 200;
 const TIMER_INTERVAL: Duration = Duration::from_millis(250);
 const PORTAL_PACKET_CAPACITY: usize = 128;
+/// Fresh decapsulation scratch chunks reserve this much capacity so the tail
+/// survives several packets between allocations. Only the datagram-sized
+/// prefix is ever initialized or touched.
+const SCRATCH_CHUNK_CAPACITY: usize = 8 * 1024;
 #[derive(Clone)]
 pub(super) struct DerivedClient {
     pub(super) config: PortalClientConfig,
@@ -58,6 +62,10 @@ struct ClientSession {
     endpoint_updates: watch::Sender<String>,
     tunnel: Tunn,
     from_client: mpsc::Sender<Bytes>,
+    /// Reusable decapsulation output chunk. Owned by the session (guarded by
+    /// the session mutex, i.e. held only while `handle_datagram` runs) so the
+    /// receive path never allocates per datagram.
+    decapsulate_scratch: BytesMut,
     portal_channels: Option<PortalChannels>,
     drain_capacity: usize,
     tasks: JoinSet<()>,
@@ -281,10 +289,27 @@ impl PortalEngine {
 
         // The shared pre-verification establishes the correct upstream order.
         // Tunn::decapsulate performs a second MAC/cookie check because the
-        // dependency's verified-dispatch method is not public. Size the first
-        // output to the datagram: unauthenticated transport packets must not
-        // amplify a tiny allocation into a full-size IP buffer.
-        let mut output = vec![0u8; datagram.len().max(MIN_WIREGUARD_PACKET_CAPACITY)];
+        // dependency's verified-dispatch method is not public.
+        //
+        // The decapsulation output is the session's reusable scratch chunk,
+        // taken out of the session so boringtun's borrowed result slices do
+        // not alias the session struct; it is restored on every path that
+        // keeps the session alive. Decrypted packets are handed to Core as
+        // frozen `Bytes` views split off the chunk, so the steady-state
+        // uplink performs no per-packet allocation. Each split advances the
+        // chunk tail; once the tail cannot hold the next datagram the chunk
+        // is replaced instead of growing it without bound (live prefixes
+        // stay pinned by the handed-off views until Core drops them). Only
+        // the datagram-sized prefix is initialized, so a tiny
+        // unauthenticated packet still cannot amplify into touching a
+        // full-size buffer.
+        let mut output = std::mem::take(&mut current.decapsulate_scratch);
+        let output_len = datagram.len().max(MIN_WIREGUARD_PACKET_CAPACITY);
+        if output.capacity() < output_len {
+            output = BytesMut::with_capacity(output_len.max(SCRATCH_CHUNK_CAPACITY));
+        }
+        output.clear();
+        output.resize(output_len, 0);
         let mut result = current
             .tunnel
             .decapsulate(Some(remote.ip()), datagram, &mut output);
@@ -300,6 +325,10 @@ impl PortalEngine {
                     break;
                 }
                 TunnResult::Err(WireGuardError::ConnectionExpired) => {
+                    // The expired session is dropped below, taking the
+                    // (emptied) scratch field with it; the chunk held locally
+                    // is simply freed, which only costs a fresh chunk on the
+                    // next session's first datagram.
                     let expired = session.take();
                     drop(session);
                     Self::retire_session(expired);
@@ -326,10 +355,12 @@ impl PortalEngine {
                 TunnResult::WriteToTunnelV4(packet, _) => {
                     current.update_endpoint(socket.clone(), remote);
                     self.activate_client(&slot, current);
-                    // Owned copy required while the decapsulation output is a
-                    // fresh per-datagram buffer; removed once the session owns
-                    // a reusable scratch chunk.
-                    match current.from_client.try_send(Bytes::copy_from_slice(packet)) {
+                    // Zero-copy handoff: split the decrypted prefix off the
+                    // scratch chunk and freeze it. The view pins only its own
+                    // bytes while the scratch keeps reusing the chunk tail.
+                    let payload_len = packet.len();
+                    let payload = output.split_to(payload_len).freeze();
+                    match current.from_client.try_send(payload) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             tracing::debug!(
@@ -352,6 +383,7 @@ impl PortalEngine {
                 }
             }
         }
+        current.decapsulate_scratch = output;
     }
 
     fn activate_client(&self, slot: &ClientSlot, session: &mut ClientSession) {
@@ -419,6 +451,7 @@ impl PortalEngine {
                 Some(self.rate_limiter.clone()),
             ),
             from_client,
+            decapsulate_scratch: BytesMut::new(),
             portal_channels: Some(PortalChannels {
                 endpoint: portal_endpoint,
                 from_client: portal_from_client,
@@ -547,6 +580,9 @@ fn is_transport_data_packet(packet: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
+
+    const MAX_TEST_DATAGRAM: usize = 65535;
 
     fn derived(name: &str, seed: u8) -> DerivedClient {
         let secret = StaticSecret::from([seed; 32]);
@@ -602,5 +638,130 @@ mod tests {
 
         engine.add_client(derived("d", 14)).unwrap();
         assert_eq!(slot_index(&engine, "d"), Some(3));
+    }
+
+    /// Minimal raw IPv4 packet: version/IHL, total length, protocol ICMP,
+    /// source and destination addresses.
+    fn raw_ipv4_packet(source: Ipv4Addr, destination: Ipv4Addr) -> Vec<u8> {
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&28u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 1;
+        packet[12..16].copy_from_slice(&source.octets());
+        packet[16..20].copy_from_slice(&destination.octets());
+        packet[20] = 8;
+        packet
+    }
+
+    /// Loopback data-path test: a real boringtun client handshakes with the
+    /// engine over loopback UDP sockets, one packet travels client-to-mesh
+    /// and one travels mesh-to-client, exercising decapsulation (including
+    /// the scratch `Bytes` handoff) and encapsulation end to end.
+    #[tokio::test]
+    async fn wireguard_datapath_loops_packets_both_ways() {
+        let server_socket = {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            Arc::new(RuntimeUdpSocket::new(Arc::new(socket)))
+        };
+        let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_socket.local_addr().unwrap();
+
+        let server_secret = StaticSecret::from([31; 32]);
+        let client_secret = StaticSecret::from([21; 32]);
+        let (accepted, mut accepted_rx) = mpsc::unbounded_channel();
+        let engine = PortalEngine::new(
+            server_secret.to_bytes(),
+            vec![DerivedClient {
+                config: PortalClientConfig {
+                    name: "loop".to_owned(),
+                    virtual_ip: "10.82.0.2/24".parse().unwrap(),
+                    groups: Vec::new(),
+                },
+                wireguard_private: client_secret.to_bytes(),
+                wireguard_public: PublicKey::from(&client_secret),
+            }],
+            accepted,
+        );
+
+        let mut client = Tunn::new(
+            client_secret,
+            PublicKey::from(&server_secret),
+            None,
+            None,
+            0,
+            None,
+        );
+        let mut client_buf = vec![0u8; MAX_TEST_DATAGRAM];
+
+        // Handshake initiation from the client; the engine replies with a
+        // handshake response addressed to the client endpoint.
+        let TunnResult::WriteToNetwork(initiation) = client.encapsulate(&[], &mut client_buf)
+        else {
+            panic!("client did not produce a handshake initiation");
+        };
+        engine
+            .handle_datagram(server_socket.clone(), client_addr, initiation)
+            .await;
+
+        let mut server_buf = vec![0u8; MAX_TEST_DATAGRAM];
+        let (len, _) = client_socket.recv_from(&mut server_buf).await.unwrap();
+        match client.decapsulate(None, &server_buf[..len], &mut client_buf) {
+            TunnResult::Done => {}
+            TunnResult::WriteToNetwork(reply) => {
+                engine
+                    .handle_datagram(server_socket.clone(), client_addr, reply)
+                    .await;
+            }
+            other => panic!("unexpected handshake result: {other:?}"),
+        }
+
+        // Uplink: an IPv4 packet traverses the tunnel and leaves the engine
+        // as a `Bytes` view on the accepted session's channel.
+        let uplink = raw_ipv4_packet(
+            std::net::Ipv4Addr::new(10, 82, 0, 2),
+            std::net::Ipv4Addr::new(10, 126, 0, 1),
+        );
+        let TunnResult::WriteToNetwork(transport) = client.encapsulate(&uplink, &mut client_buf)
+        else {
+            panic!("client did not encrypt the uplink packet");
+        };
+        engine
+            .handle_datagram(server_socket.clone(), client_addr, transport)
+            .await;
+
+        let session = tokio::time::timeout(Duration::from_secs(5), accepted_rx.recv())
+            .await
+            .expect("first data packet must activate the portal session")
+            .expect("engine stays alive");
+        let mut from_client = session.from_client;
+        let received = tokio::time::timeout(Duration::from_secs(5), from_client.recv())
+            .await
+            .expect("decapsulated uplink packet was not delivered")
+            .expect("session channel closed before the uplink packet");
+        assert_eq!(&received[..], uplink.as_slice());
+
+        // Downlink: Core sends a reply through to_client; the engine's
+        // encapsulation task encrypts it back to the client endpoint.
+        let downlink = raw_ipv4_packet(
+            std::net::Ipv4Addr::new(10, 126, 0, 1),
+            std::net::Ipv4Addr::new(10, 82, 0, 2),
+        );
+        session
+            .to_client
+            .send(Bytes::from(downlink.clone()))
+            .await
+            .unwrap();
+        let (len, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            client_socket.recv_from(&mut server_buf),
+        )
+        .await
+        .expect("engine did not send the downlink packet")
+        .unwrap();
+        match client.decapsulate(None, &server_buf[..len], &mut client_buf) {
+            TunnResult::WriteToTunnelV4(payload, _) => assert_eq!(payload, downlink.as_slice()),
+            other => panic!("unexpected downlink result: {other:?}"),
+        }
     }
 }
