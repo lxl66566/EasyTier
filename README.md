@@ -285,7 +285,15 @@ sudo easytier-core --network-name mysharednode --network-secret mysharednode
 
 #### Transport Security
 
-Despite the name, EasyTier's `quic://` tunnels are **not encrypted by the transport**: the QUIC layer uses a checksum-only session without a TLS handshake, so anyone on the network path can read and inject packets. The same applies to `wss://` tunnels unless a server certificate fingerprint is pinned (see below). Confidentiality and integrity should come from EasyTier's data-plane encryption — keep `enable_encryption` enabled (default) or, ideally, enable secure mode.
+Despite the name, EasyTier's `quic://` tunnels are **not encrypted by the transport**: the QUIC layer uses a checksum-only session without a TLS handshake, so anyone on the network path can read and inject packets. Confidentiality and integrity should come from EasyTier's data-plane encryption — keep `enable_encryption` enabled (default) or, ideally, enable secure mode.
+
+`wss://` tunnels do run TLS, but by default the client accepts any server certificate, so an active man-in-the-middle can still impersonate the server. To prevent that, pin the server certificate fingerprint in the peer URL fragment:
+
+```bash
+sudo easytier-core -p 'wss://server.example.com:11010#fingerprint=sha256:<64-hex-chars>'
+```
+
+The fingerprint of a node's `wss://` listener certificate is logged when the listener starts. A pinned connection whose fingerprint does not match is rejected. Note that the certificate is currently regenerated on every process restart, which changes the fingerprint; pinned peers then fail closed until re-pinned.
 
 ## Related Projects
 

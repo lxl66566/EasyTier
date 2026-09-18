@@ -284,7 +284,15 @@ sudo easytier-core --network-name mysharednode --network-secret mysharednode
 
 #### 传输层安全
 
-与名称给人的印象不同，EasyTier 的 `quic://` 隧道**在传输层并不加密**：QUIC 层使用仅带校验和的自定义会话，没有 TLS 握手，网络路径上的任何人都可以读取和注入报文。`wss://` 隧道在未固定服务器证书指纹时同样如此（见下文）。机密性与完整性应由 EasyTier 自身的数据面加密提供——保持 `enable_encryption` 开启（默认）或更优的 secure mode。
+与名称给人的印象不同，EasyTier 的 `quic://` 隧道**在传输层并不加密**：QUIC 层使用仅带校验和的自定义会话，没有 TLS 握手，网络路径上的任何人都可以读取和注入报文。机密性与完整性应由 EasyTier 自身的数据面加密提供——保持 `enable_encryption` 开启（默认）或更优的 secure mode。
+
+`wss://` 隧道虽然使用 TLS，但默认情况下客户端接受任意服务器证书，主动中间人仍可冒充服务器。可在节点 URL 的 fragment 中固定服务器证书指纹来防范：
+
+```bash
+sudo easytier-core -p 'wss://server.example.com:11010#fingerprint=sha256:<64位十六进制>'
+```
+
+节点 `wss://` 监听器启动时会在日志中打印其证书指纹。固定了指纹的连接一旦不匹配即被拒绝。注意：当前证书在每次进程重启时会重新生成，指纹随之变化，已固定的对端会拒绝连接（fail-closed），需要重新固定。
 
 ## 相关项目
 
