@@ -353,7 +353,12 @@ async fn web_client_routine(
                     continue;
                 }
             };
-            let connection = match web_security::upgrade_client_tunnel(connection).await {
+            let connection = match web_security::upgrade_client_tunnel(
+                connection,
+                web_security::ClientHandshakeMode::V1,
+            )
+            .await
+            {
                 Ok(connection) => connection,
                 Err(error) => {
                     connected.store(false, Ordering::Release);

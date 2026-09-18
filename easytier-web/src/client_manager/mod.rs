@@ -188,11 +188,9 @@ impl ClientManager {
         let webhook_config = self.webhook_config.clone();
         self.tasks.spawn(async move {
             while let Ok(tunnel) = listener.accept().await {
-                let (tunnel, secure) = match web_security::accept_or_upgrade_server_tunnel(
-                    tunnel,
-                )
-                .await
-                {
+                let (tunnel, secure) =
+                    match web_security::accept_or_upgrade_server_tunnel(tunnel, None).await
+                    {
                     Ok(v) => v,
                     Err(error) => {
                         tracing::warn!(%error, "failed to accept secure tunnel, dropping connection");
