@@ -39,6 +39,9 @@ const PORTAL_PACKET_CAPACITY: usize = 128;
 /// survives several packets between allocations. Only the datagram-sized
 /// prefix is ever initialized or touched.
 const SCRATCH_CHUNK_CAPACITY: usize = 8 * 1024;
+/// Upper bound of downlink packets encrypted under one session-lock
+/// acquisition while draining an already-queued backlog.
+const ENCAPSULATE_BATCH_CAPACITY: usize = 16;
 #[derive(Clone)]
 pub(super) struct DerivedClient {
     pub(super) config: PortalClientConfig,
@@ -267,6 +270,9 @@ impl PortalEngine {
             return;
         }
 
+        // Per-datagram session lock: boringtun's Tunn is a single mutable
+        // object shared by this receive path and the encapsulation task, and
+        // the mutex also orders the retired-slot re-check below, so it stays.
         let mut session = slot.session.lock().await;
         // Re-check after acquiring the lock: remove_client retires the slot
         // and drains the session under this same lock, so a datagram that
@@ -419,6 +425,13 @@ impl PortalEngine {
         let slot_for_task = Arc::downgrade(slot);
         let mut tasks = JoinSet::new();
         let forward_packets = async move {
+            // Task-local send scratch: never shared with the receive path,
+            // which owns its own scratch behind the session mutex.
+            let mut scratch = Vec::new();
+            // Reused drain buffer: packets already queued when the task wakes
+            // are encrypted under a single session-lock acquisition instead
+            // of one acquisition per packet.
+            let mut batch = Vec::with_capacity(ENCAPSULATE_BATCH_CAPACITY);
             while let Some(payload) = to_client.recv().await {
                 let Some(engine) = engine.upgrade() else {
                     return;
@@ -426,9 +439,17 @@ impl PortalEngine {
                 let Some(slot) = slot_for_task.upgrade() else {
                     return;
                 };
+                batch.push(payload);
+                while batch.len() < ENCAPSULATE_BATCH_CAPACITY {
+                    match to_client.try_recv() {
+                        Ok(payload) => batch.push(payload),
+                        Err(_) => break,
+                    }
+                }
                 engine
-                    .encapsulate_for_client(&slot, generation, &payload)
+                    .encapsulate_for_client(&slot, generation, &batch, &mut scratch)
                     .await;
+                batch.clear();
             }
             if let (Some(engine), Some(slot)) = (engine.upgrade(), slot_for_task.upgrade()) {
                 engine.expire_if_current(slot, generation).await;
@@ -470,9 +491,11 @@ impl PortalEngine {
         self: &Arc<Self>,
         slot: &Arc<ClientSlot>,
         generation: u64,
-        payload: &[u8],
+        payloads: &[Bytes],
+        scratch: &mut Vec<u8>,
     ) {
-        let mut output = vec![0u8; payload.len().saturating_add(148).max(148)];
+        // One lock acquisition covers the whole batch; the session cannot be
+        // replaced while the guard is held, so the generation check runs once.
         let mut guard = slot.session.lock().await;
         let Some(session) = guard
             .as_mut()
@@ -480,25 +503,35 @@ impl PortalEngine {
         else {
             return;
         };
-        match session.tunnel.encapsulate(payload, &mut output) {
-            TunnResult::WriteToNetwork(packet) => {
-                if is_handshake_initiation(packet) {
+        for payload in payloads {
+            scratch.clear();
+            scratch.resize(
+                payload.len().saturating_add(MIN_WIREGUARD_PACKET_CAPACITY),
+                0,
+            );
+            match session.tunnel.encapsulate(payload, scratch) {
+                TunnResult::WriteToNetwork(packet) => {
+                    if is_handshake_initiation(packet) {
+                        session.drain_capacity =
+                            session.drain_capacity.max(payload.len().saturating_add(32));
+                    }
+                    if let Some(endpoint) = session.endpoint.clone() {
+                        let _ = endpoint.socket.send_to(packet, endpoint.remote).await;
+                    }
+                }
+                TunnResult::Done => {
                     session.drain_capacity =
                         session.drain_capacity.max(payload.len().saturating_add(32));
                 }
-                if let Some(endpoint) = session.endpoint.clone() {
-                    let _ = endpoint.socket.send_to(packet, endpoint.remote).await;
+                TunnResult::Err(WireGuardError::ConnectionExpired) => {
+                    // Remaining payloads are dropped: the expired session's
+                    // generation check would reject them anyway.
+                    drop(guard);
+                    self.expire_if_current(slot.clone(), generation).await;
+                    return;
                 }
+                _ => {}
             }
-            TunnResult::Done => {
-                session.drain_capacity =
-                    session.drain_capacity.max(payload.len().saturating_add(32));
-            }
-            TunnResult::Err(WireGuardError::ConnectionExpired) => {
-                drop(guard);
-                self.expire_if_current(slot.clone(), generation).await;
-            }
-            _ => {}
         }
     }
 
@@ -586,6 +619,9 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
+    use crate::socket::udp::RuntimeUdpSocket;
+    use crate::vpn_portal::wireguard::UdpBindOptions;
+
     const MAX_TEST_DATAGRAM: usize = 65535;
 
     fn derived(name: &str, seed: u8) -> DerivedClient {
@@ -666,7 +702,12 @@ mod tests {
     async fn wireguard_datapath_loops_packets_both_ways() {
         let server_socket = {
             let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            Arc::new(RuntimeUdpSocket::new(Arc::new(socket)))
+            Arc::new(PortalSocket {
+                socket: tokio::sync::RwLock::new(Some(Arc::new(RuntimeUdpSocket::new(Arc::new(
+                    socket,
+                ))))),
+                options: UdpBindOptions::port_bound_listener("127.0.0.1:0".parse().unwrap()),
+            })
         };
         let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_addr = client_socket.local_addr().unwrap();
