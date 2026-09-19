@@ -297,6 +297,14 @@ The fingerprint of a node's `wss://` listener certificate is logged when the lis
 
 About the data-plane `encryption_algorithm` option: `aes-gcm` (default), `aes-256-gcm`, and `chacha20` provide authenticated encryption, while `xor` is obfuscation only — it offers no integrity or replay protection, so traffic can be tampered with undetected. It exists for legacy interoperability; a warning is logged whenever it is selected, and you should avoid it unless an old peer requires it.
 
+Nodes connecting to a central config server (`easytier-web`) have the same concern: the web management tunnel is Noise-encrypted, but without server authentication an active man-in-the-middle can relay the session and intercept submitted management credentials. Newer servers therefore use an authenticated Noise_XX handshake with a persistent server key. Pin the server key fingerprint in the config-server URL fragment to enable fail-closed verification:
+
+```bash
+sudo easytier-core --config-server 'udp://config-server.example.com:22020/mytoken#fingerprint=sha256:<64-hex-chars>'
+```
+
+The fingerprint is logged by `easytier-web` at startup (it is persisted in `<db>.noise-static-key` next to the database and stays stable across restarts). A client with a pin refuses to connect if the server cannot perform the authenticated handshake or the fingerprint does not match; without a pin, clients upgrade automatically when the server supports it and fall back to the legacy unauthenticated handshake (with a warning) for older servers.
+
 ## Related Projects
 
 - [ZeroTier](https://www.zerotier.com/): A global virtual network for connecting devices.

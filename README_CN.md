@@ -296,6 +296,14 @@ sudo easytier-core -p 'wss://server.example.com:11010#fingerprint=sha256:<64位�
 
 关于数据面加密算法选项 `encryption_algorithm`：`aes-gcm`（默认）、`aes-256-gcm`、`chacha20` 均为带认证的加密；而 `xor` 仅为混淆手段——没有完整性与防重放保护，报文可被被动篡改而不被发现。该选项仅为兼容旧版本节点而保留，选中时会打印警告，除非确有旧对端需要，否则应避免使用。
 
+连接中央配置服务器（`easytier-web`）的节点也有类似问题：Web 管理隧道虽经 Noise 加密，但若不认证服务器身份，主动中间人可以中继会话并截获提交的管理凭证。较新的服务端因此改用带服务端静态密钥的 Noise_XX 认证握手。在配置服务器 URL 的 fragment 中固定其密钥指纹即可启用 fail-closed 校验：
+
+```bash
+sudo easytier-core --config-server 'udp://config-server.example.com:22020/mytoken#fingerprint=sha256:<64位十六进制>'
+```
+
+`easytier-web` 启动时会在日志中打印该指纹（密钥持久化在数据库旁的 `<db>.noise-static-key` 文件中，重启后保持不变）。配置了 pin 的客户端在服务端不支持认证握手或指纹不匹配时会拒绝连接（fail-closed）；未配置 pin 的客户端会在服务端支持时自动升级，对旧服务端回退到旧的未认证握手并打印警告。
+
 ## 相关项目
 
 - [ZeroTier](https://www.zerotier.com/)：用于连接设备的全球虚拟网络。

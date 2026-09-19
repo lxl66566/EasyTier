@@ -107,6 +107,28 @@ async fn connect_config_server(
 pub struct ConfigServerEndpoint {
     connect_url: Url,
     token: String,
+    server_noise_pin: Option<[u8; 32]>,
+}
+
+/// Extracts a server static-key pin from the URL fragment
+/// (`#fingerprint=sha256:<hex>`). A present but malformed pin is an error:
+/// silently ignoring it would turn an intended fail-closed configuration
+/// into an unauthenticated one.
+fn parse_noise_pin_fragment(url: &Url) -> anyhow::Result<Option<[u8; 32]>> {
+    let Some(fragment) = url.fragment() else {
+        return Ok(None);
+    };
+    for pair in fragment.split('&') {
+        let Some(value) = pair.strip_prefix("fingerprint=") else {
+            continue;
+        };
+        return crate::tunnel::fingerprint::parse_sha256_fingerprint(value)
+            .map(Some)
+            .ok_or_else(|| {
+                anyhow::anyhow!("invalid server fingerprint in config server URL: {value}")
+            });
+    }
+    Ok(None)
 }
 
 impl ConfigServerEndpoint {
@@ -116,6 +138,7 @@ impl ConfigServerEndpoint {
         if !supports_scheme(&endpoint) {
             anyhow::bail!("unsupported config server scheme: {}", endpoint.scheme());
         }
+        let server_noise_pin = parse_noise_pin_fragment(&endpoint)?;
 
         let token = endpoint
             .path_segments()
@@ -130,10 +153,15 @@ impl ConfigServerEndpoint {
         }
 
         let mut connect_url = endpoint;
+        connect_url.set_fragment(None);
         if !matches!(connect_url.scheme(), "ws" | "wss") {
             connect_url.set_path("");
         }
-        Ok(Self { connect_url, token })
+        Ok(Self {
+            connect_url,
+            token,
+            server_noise_pin,
+        })
     }
 
     pub fn connect_url(&self) -> &Url {
@@ -142,6 +170,11 @@ impl ConfigServerEndpoint {
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Pinned SHA-256 fingerprint of the server's noise v2 static public key.
+    pub fn server_noise_pin(&self) -> Option<[u8; 32]> {
+        self.server_noise_pin
     }
 }
 
@@ -152,6 +185,9 @@ pub struct WebClientConfig {
     pub device_os: DeviceOsInfo,
     pub easytier_version: String,
     pub secure_mode: bool,
+    /// Pinned SHA-256 fingerprint of the config server's noise v2 static
+    /// key. When set, only authenticated Noise_XX connections are allowed.
+    pub server_noise_pin: Option<[u8; 32]>,
 }
 
 #[async_trait]
@@ -311,6 +347,20 @@ impl<F> WebClient<F> {
     }
 }
 
+/// Warn once per process that the config server only offers the
+/// unauthenticated noise v1 web tunnel.
+fn warn_once_noise_v1_fallback() {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    WARNED.get_or_init(|| {
+        tracing::warn!(
+            "config server only supports the noise v1 (unauthenticated) web tunnel; \
+             continuing without server verification. Upgrade easytier-web and pin \
+             '#fingerprint=sha256:<hash>' in the config server URL once it supports \
+             noise v2"
+        );
+    });
+}
+
 async fn web_client_routine(
     controller: Arc<WebClientController>,
     connected: Arc<AtomicBool>,
@@ -329,19 +379,42 @@ async fn web_client_routine(
         connected.store(true, Ordering::Release);
         tracing::info!(?connection, "connected to config server");
         let mut session = WebClientSession::new(connection, controller.clone());
-        let support_encryption = match time::timeout(FEATURE_TIMEOUT, session.get_feature()).await {
-            Ok(Ok(feature)) => feature.support_encryption,
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "GetFeature RPC failed; using legacy tunnel");
-                false
-            }
-            Err(_) => {
-                tracing::warn!("GetFeature RPC timed out; using legacy tunnel");
-                false
-            }
-        };
+        let (support_encryption, support_noise_v2) =
+            match time::timeout(FEATURE_TIMEOUT, session.get_feature()).await {
+                Ok(Ok(feature)) => (feature.support_encryption, feature.support_noise_v2),
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "GetFeature RPC failed; using legacy tunnel");
+                    (false, false)
+                }
+                Err(_) => {
+                    tracing::warn!("GetFeature RPC timed out; using legacy tunnel");
+                    (false, false)
+                }
+            };
+        let local_secure_support = web_security::web_secure_tunnel_supported();
+        let pin = controller.config.server_noise_pin;
 
-        if support_encryption && web_security::web_secure_tunnel_supported() {
+        // Fail-closed rule for pinned endpoints: only a locally supported,
+        // server-advertised Noise_XX handshake may carry the management
+        // session. Never silently fall back to noise v1 or plaintext.
+        if pin.is_some() && !(support_encryption && support_noise_v2 && local_secure_support) {
+            drop(session);
+            connected.store(false, Ordering::Release);
+            tracing::warn!(
+                support_encryption,
+                support_noise_v2,
+                local_secure_support,
+                "config server cannot perform the pinned noise v2 handshake; \
+                 refusing an unauthenticated connection"
+            );
+            time::sleep(RETRY_INTERVAL).await;
+            continue;
+        }
+
+        if support_encryption && local_secure_support {
+            if !support_noise_v2 {
+                warn_once_noise_v1_fallback();
+            }
             drop(session);
             let connection = match connect_config_server(connector.as_ref(), CONNECT_TIMEOUT).await
             {
@@ -353,12 +426,8 @@ async fn web_client_routine(
                     continue;
                 }
             };
-            let connection = match web_security::upgrade_client_tunnel(
-                connection,
-                web_security::ClientHandshakeMode::V1,
-            )
-            .await
-            {
+            let mode = web_security::ClientHandshakeMode::negotiate(pin, support_noise_v2);
+            let connection = match web_security::upgrade_client_tunnel(connection, mode).await {
                 Ok(connection) => connection,
                 Err(error) => {
                     connected.store(false, Ordering::Release);
@@ -717,6 +786,42 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_parses_and_strips_server_noise_pin() {
+        let digest = [0x33u8; 32];
+        let pin = crate::tunnel::fingerprint::format_sha256_fingerprint(&digest);
+        let endpoint = ConfigServerEndpoint::parse(
+            &format!("udp://example.com/team#fingerprint={pin}"),
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(endpoint.server_noise_pin(), Some(digest));
+        // The fragment carries connection options only; it must not leak
+        // into the URL actually dialed.
+        assert_eq!(endpoint.connect_url().as_str(), "udp://example.com");
+
+        // unrelated fragment pairs and absent fragments mean no pin
+        let endpoint =
+            ConfigServerEndpoint::parse("udp://example.com/team#other=1", |_| true).unwrap();
+        assert_eq!(endpoint.server_noise_pin(), None);
+        let endpoint = ConfigServerEndpoint::parse("udp://example.com/team", |_| true).unwrap();
+        assert_eq!(endpoint.server_noise_pin(), None);
+    }
+
+    #[test]
+    fn endpoint_rejects_malformed_server_noise_pin() {
+        // Malformed pins fail closed instead of silently disabling pinning.
+        let error = ConfigServerEndpoint::parse(
+            "udp://example.com/team#fingerprint=sha256:not-hex",
+            |_| true,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("invalid server fingerprint"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn heartbeat_request_carries_registered_and_failed_instance_ids() {
         let runtime_id = uuid::Uuid::new_v4();
         let registered = uuid::Uuid::new_v4();
@@ -729,6 +834,7 @@ mod tests {
                 device_os: DeviceOsInfo::default(),
                 easytier_version: "test-version".to_owned(),
                 secure_mode: false,
+                server_noise_pin: None,
             },
             runtime_id,
             vec![registered],
