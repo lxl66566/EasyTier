@@ -359,10 +359,6 @@ pub(crate) fn validate_algorithm(algorithm: &str) -> Result<(), Error> {
     }
 }
 
-pub(super) fn effective_algorithm_uses_xor(algorithm: &str) -> bool {
-    algorithm.parse() == Ok(EncryptionAlgorithm::Xor)
-}
-
 /// Create an encryptor based on the algorithm name.
 ///
 /// Callers that accept user configuration validate it during construction.
@@ -459,14 +455,6 @@ mod tests {
                 166, 217, 166, 152, 28, 230, 146, 109, 150, 196, 66, 242, 231, 140,
             ]
         );
-    }
-
-    #[test]
-    fn effective_algorithm_only_reports_explicit_xor() {
-        assert!(effective_algorithm_uses_xor("xor"));
-        assert!(!effective_algorithm_uses_xor(""));
-        assert!(!effective_algorithm_uses_xor("unsupported"));
-        assert!(!effective_algorithm_uses_xor("aes-gcm"));
     }
 
     #[cfg(not(any(

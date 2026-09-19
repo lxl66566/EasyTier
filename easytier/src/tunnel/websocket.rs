@@ -334,6 +334,9 @@ static SERVER_TLS_CERT: LazyLock<ServerTlsCert> = LazyLock::new(ServerTlsCert::g
 
 struct ServerTlsCert {
     acceptor: TlsAcceptor,
+    // Exposed for tests that pin the in-process listener certificate; the
+    // log line in `generate` is the production surface.
+    #[cfg_attr(not(test), allow(dead_code))]
     fingerprint: [u8; 32],
 }
 

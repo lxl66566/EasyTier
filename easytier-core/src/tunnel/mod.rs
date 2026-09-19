@@ -29,11 +29,6 @@ pub mod udp;
 pub mod web_security;
 pub mod wrapper;
 
-/// Reports whether the configured name resolves to the insecure XOR cipher.
-pub fn effective_encryption_uses_xor(algorithm: &str) -> bool {
-    encrypt::effective_algorithm_uses_xor(algorithm)
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum TunnelError {
     #[error("io error: {0}")]
