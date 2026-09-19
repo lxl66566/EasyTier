@@ -35,6 +35,9 @@ message GetFeatureRequest {}
 
 message GetFeatureResponse {
   bool support_encryption = 1;
+  // Server can perform the authenticated Noise_XX (v2) web handshake and
+  // accepts fingerprint pinning. Absent on servers that only know Noise_NN.
+  bool support_noise_v2 = 2;
 }
 
 service WebServerService {

@@ -136,6 +136,10 @@ pub struct ClientManager {
 
     geoip_db: Arc<Option<maxminddb::Reader<Vec<u8>>>>,
     heartbeat_policy: HeartbeatPolicy,
+
+    /// Server identity for the authenticated noise v2 handshake; `None`
+    /// keeps the legacy unauthenticated mode.
+    noise_static_key: Option<Arc<web_security::WebNoiseStaticKey>>,
 }
 
 impl ClientManager {
@@ -145,6 +149,7 @@ impl ClientManager {
         heartbeat_policy: HeartbeatPolicy,
         feature_flags: Arc<FeatureFlags>,
         webhook_config: SharedWebhookConfig,
+        noise_static_key: Option<web_security::WebNoiseStaticKey>,
     ) -> Self {
         let client_sessions = Arc::new(DashMap::new());
         let sessions: Arc<DashMap<url::Url, Arc<Session>>> = client_sessions.clone();
@@ -168,6 +173,7 @@ impl ClientManager {
 
             geoip_db: Arc::new(load_geoip_db(geoip_db)),
             heartbeat_policy,
+            noise_static_key: noise_static_key.map(Arc::new),
         }
     }
 
@@ -186,11 +192,16 @@ impl ClientManager {
         let heartbeat_policy = self.heartbeat_policy;
         let feature_flags = self.feature_flags.clone();
         let webhook_config = self.webhook_config.clone();
+        let noise_static_key = self.noise_static_key.clone();
+        let noise_v2_supported = noise_static_key.is_some();
         self.tasks.spawn(async move {
             while let Ok(tunnel) = listener.accept().await {
-                let (tunnel, secure) =
-                    match web_security::accept_or_upgrade_server_tunnel(tunnel, None).await
-                    {
+                let (tunnel, secure) = match web_security::accept_or_upgrade_server_tunnel(
+                    tunnel,
+                    noise_static_key.as_deref(),
+                )
+                .await
+                {
                     Ok(v) => v,
                     Err(error) => {
                         tracing::warn!(%error, "failed to accept secure tunnel, dropping connection");
@@ -214,6 +225,7 @@ impl ClientManager {
                     feature_flags.clone(),
                     webhook_config.clone(),
                     next_session_epoch.fetch_add(1, Ordering::Relaxed) + 1,
+                    noise_v2_supported,
                 );
                 session.serve(tunnel).await;
                 let session = Arc::new(session);
@@ -757,6 +769,7 @@ mod tests {
             HeartbeatPolicy::from_millis(0, 15_000).unwrap(),
             Arc::new(FeatureFlags::default()),
             webhook_config,
+            None,
         );
         let config_server_addr = add_random_udp_listener(&mut mgr).await;
         let machine_id = uuid::Uuid::new_v4();
@@ -793,6 +806,7 @@ mod tests {
             Arc::new(crate::webhook::WebhookConfig::new(
                 None, None, None, None, None,
             )),
+            None,
         );
         let user_id = db.auto_create_user("token").await.unwrap().id;
         let machine_id = uuid::Uuid::new_v4();
@@ -817,6 +831,7 @@ mod tests {
                 None, None, None, None, None,
             )),
             1,
+            false,
         ));
         assert!(!session.is_running());
         mgr.client_sessions.insert(client_url, session);
@@ -1157,6 +1172,7 @@ mod tests {
             Arc::new(crate::webhook::WebhookConfig::new(
                 None, None, None, None, None,
             )),
+            None,
         );
         let listener_url = mgr.add_listener(listener).await.unwrap();
 
@@ -1173,6 +1189,7 @@ mod tests {
             uuid::Uuid::new_v4(),
             "test",
             false,
+            None,
             Arc::new(native_instance_manager()),
             None,
         );
@@ -1222,6 +1239,7 @@ mod tests {
             HeartbeatPolicy::from_millis(0, 15_000).unwrap(),
             Arc::new(FeatureFlags::default()),
             webhook_config,
+            None,
         );
         let config_server_addr = add_random_udp_listener(&mut mgr).await;
 
@@ -1288,6 +1306,7 @@ mod tests {
             HeartbeatPolicy::from_millis(0, 15_000).unwrap(),
             Arc::new(FeatureFlags::default()),
             webhook_config,
+            None,
         );
         let config_server_addr = add_random_udp_listener(&mut mgr).await;
 
@@ -1480,6 +1499,7 @@ mod tests {
             HeartbeatPolicy::from_millis(0, 15_000).unwrap(),
             Arc::new(FeatureFlags::default()),
             webhook_config,
+            None,
         );
         let config_server_addr = add_random_udp_listener(&mut mgr).await;
         let machine_id = uuid::Uuid::new_v4();

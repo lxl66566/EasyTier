@@ -67,6 +67,16 @@ impl WebNoiseStaticKey {
     }
 }
 
+impl std::fmt::Debug for WebNoiseStaticKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never leak key material through Debug; identify by public fingerprint.
+        formatter
+            .debug_struct("WebNoiseStaticKey")
+            .field("fingerprint", &self.public_fingerprint())
+            .finish()
+    }
+}
+
 /// Server handshake preference: V2 (Noise_XX with an authenticated static
 /// key) when a key is configured, V1 (Noise_NN) otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
