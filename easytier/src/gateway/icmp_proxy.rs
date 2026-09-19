@@ -1,7 +1,12 @@
 use std::{
+    io::ErrorKind,
     mem::MaybeUninit,
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use easytier_core::{
@@ -11,6 +16,13 @@ use easytier_core::{
 use socket2::Socket;
 
 use crate::common::netns::NetNS;
+
+/// Poll interval for the blocking ICMP receive loop. `shutdown()` on a raw
+/// ICMP socket does not interrupt a blocked `recv_from` on Windows, so the
+/// read must time out periodically to notice `close()` and let the
+/// `spawn_blocking` thread return (tokio waits for blocking threads on
+/// runtime drop, otherwise the runtime hangs forever).
+const ICMP_RECV_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Default)]
 pub(crate) struct RuntimeIcmpProxyHost;
@@ -27,6 +39,7 @@ impl RuntimeIcmpProxyHost {
             Ipv4Addr::UNSPECIFIED,
             0,
         )))?;
+        socket.set_read_timeout(Some(ICMP_RECV_POLL_INTERVAL))?;
         Ok(socket)
     }
 }
@@ -34,6 +47,7 @@ impl RuntimeIcmpProxyHost {
 #[derive(Debug)]
 struct RuntimeIcmpSocket {
     socket: Arc<Socket>,
+    closed: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -46,19 +60,34 @@ impl IcmpProxySocket for RuntimeIcmpSocket {
 
     async fn recv(&self) -> Result<(IpAddr, Vec<u8>), ProxyRuntimeError> {
         let socket = self.socket.clone();
+        let closed = self.closed.clone();
         tokio::task::spawn_blocking(move || {
             let mut buffer = vec![0_u8; 8192];
             let uninitialized: &mut [MaybeUninit<u8>] =
                 unsafe { std::mem::transmute(&mut buffer[..]) };
-            let (length, peer_ip) = socket_recv(&socket, uninitialized)?;
-            buffer.truncate(length);
-            Ok((peer_ip, buffer))
+            loop {
+                match socket_recv(&socket, uninitialized) {
+                    Ok((length, peer_ip)) => {
+                        buffer.truncate(length);
+                        return Ok((peer_ip, buffer));
+                    }
+                    Err(error) => match error.kind() {
+                        ErrorKind::TimedOut | ErrorKind::WouldBlock
+                            if closed.load(Ordering::Acquire) =>
+                        {
+                            return Err(std::io::Error::other("icmp socket closed").into());
+                        }
+                        _ => return Err(error.into()),
+                    },
+                }
+            }
         })
         .await
         .map_err(|error| ProxyRuntimeError::Other(error.into()))?
     }
 
     fn close(&self) {
+        self.closed.store(true, Ordering::Release);
         let _ = self.socket.shutdown(std::net::Shutdown::Both);
     }
 }
@@ -74,6 +103,7 @@ impl IcmpProxyHost for RuntimeIcmpProxyHost {
         })?;
         Ok(Arc::new(RuntimeIcmpSocket {
             socket: Arc::new(socket),
+            closed: Arc::new(AtomicBool::new(false)),
         }))
     }
 }
