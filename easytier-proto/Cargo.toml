@@ -1,7 +1,6 @@
 [package]
 name = "easytier-proto"
 description = "EasyTier protobuf and generated RPC types."
-homepage = "https://github.com/EasyTier/EasyTier"
 repository = "https://github.com/EasyTier/EasyTier"
 version = "2.7.0"
 edition.workspace = true
@@ -11,6 +10,11 @@ keywords = ["vpn", "p2p", "network", "easytier"]
 categories = ["network-programming"]
 license-file = "../LICENSE"
 build = "build/main.rs"
+
+# prost-types is referenced only when the json-rpc feature is off; keep the
+# unused-dependency lint quiet for builds that enable it.
+[lints]
+cargo = { unused_dependencies = "allow" }
 
 [dependencies]
 anyhow = { version = "1.0", optional = true }

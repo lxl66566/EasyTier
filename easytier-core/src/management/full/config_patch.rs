@@ -827,10 +827,7 @@ mod tests {
 
         // A duplicate within one request and a retry after a lost response
         // must both end up as a single forward; the second bind would fail.
-        assert!(patch_port_forwards(
-            &config,
-            vec![forward.clone(), forward.clone()]
-        ));
+        assert!(patch_port_forwards(&config, vec![forward, forward]));
         assert!(patch_port_forwards(&config, vec![forward]));
         assert_eq!(config.get_port_forwards().len(), 1);
     }

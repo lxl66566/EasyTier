@@ -36,7 +36,7 @@ impl ConfigFileStorage for NativeConfigFileStorage {
         let path = path.to_owned();
         let contents = contents.to_owned();
         tokio::task::spawn_blocking(move || {
-            let mut options = OpenOptions::new();
+            let options = OpenOptions::new();
             #[cfg(unix)]
             {
                 atomic_write_file::unix::OpenOptionsExt::preserve_mode(&mut options, false);

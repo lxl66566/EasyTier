@@ -1,4 +1,7 @@
 //! Test-only convenience around the production CoreInstance composition.
+// The main consumers are Linux-gated test modules; parts of the surface stay
+// unused on other platforms.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::sync::Arc;
 

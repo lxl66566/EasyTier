@@ -2275,7 +2275,6 @@ dependencies = [
  "bytecodec",
  "byteorder",
  "bytes",
- "cfg_aliases",
  "chrono",
  "cidr",
  "clap",
@@ -2299,7 +2298,7 @@ dependencies = [
  "gethostname 0.5.0",
  "git-version",
  "globwalk",
- "guarden 0.2.0",
+ "guarden",
  "hickory-client",
  "hickory-proto",
  "hickory-resolver",
@@ -2421,7 +2420,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.15",
  "getrandom 0.3.2",
- "guarden 0.2.0",
+ "guarden",
  "hmac",
  "http-body-util",
  "hyper",
@@ -2581,7 +2580,6 @@ dependencies = [
  "dashmap",
  "easytier",
  "futures",
- "guarden 0.1.2",
  "jsonwebtoken",
  "mimalloc",
  "mockall",
@@ -2592,7 +2590,6 @@ dependencies = [
  "sea-orm-migration",
  "serde",
  "serde_json",
- "serde_yaml",
  "sqlx",
  "tempfile",
  "thiserror 1.0.63",
@@ -3693,35 +3690,13 @@ dependencies = [
 
 [[package]]
 name = "guarden"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca87812d87fa82896df1adfb5c111cdeaae3edb6da028f5df002dcbd7df71454"
-dependencies = [
- "futures",
- "guarden-macros 0.1.2",
- "tokio",
-]
-
-[[package]]
-name = "guarden"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8408903291a7d0cc74169d5de4dd1919a9a402a2f67fcd7df3303ed045fae73"
 dependencies = [
  "futures-core",
- "guarden-macros 0.2.0",
+ "guarden-macros",
  "tokio",
-]
-
-[[package]]
-name = "guarden-macros"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b42f4b8de91cbd793ce8e6cf8d4821ef02d2d5b4468e0a55a36c65c5581de53"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -8383,19 +8358,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap 2.14.0",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
 name = "serde_yml"
 version = "0.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10569,12 +10531,6 @@ dependencies = [
  "crypto-common",
  "subtle",
 ]
-
-[[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

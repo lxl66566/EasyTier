@@ -1,7 +1,6 @@
 [package]
 name = "easytier"
 description = "A full meshed p2p VPN, connecting all your devices in one network with one command."
-homepage = "https://github.com/EasyTier/EasyTier"
 repository = "https://github.com/EasyTier/EasyTier"
 version = "2.7.0"
 edition.workspace = true
@@ -10,7 +9,6 @@ authors = ["kkrainbow"]
 keywords = ["vpn", "p2p", "network", "easytier"]
 categories = ["network-programming", "command-line-utilities"]
 license-file = "LICENSE"
-readme = "README.md"
 build = "build/main.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -116,14 +114,6 @@ tokio-rustls = { version = "0.26", default-features = false, optional = true }
 tun = { package = "tun-easytier", git = "https://github.com/EasyTier/rust-tun", features = [
     "async",
 ], optional = true }
-# for net ns
-nix = { version = "0.29.0", features = [
-    "sched",
-    "socket",
-    "ioctl",
-    "net",
-    "fs",
-] }
 
 uuid = { version = "1.5.0", features = [
     "v4",
@@ -236,6 +226,16 @@ machine-uid = "0.5.3"
 
 [target.'cfg(any(target_os = "linux"))'.dependencies]
 netlink-sys = { version = "0.8.7", optional = true }
+
+# for net ns
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29.0", features = [
+    "sched",
+    "socket",
+    "ioctl",
+    "net",
+    "fs",
+] }
 [target.'cfg(all(windows, any(target_arch = "x86_64", target_arch = "x86")))'.dependencies]
 windivert = { git = "https://github.com/EasyTier/windivert-rust.git", rev = "adcc56d1550f7b5377ec2b3429f413ee24a77375", features = [
     "static",
@@ -280,7 +280,6 @@ jemalloc-sys = { package = "tikv-jemalloc-sys", version = "0.6.0", features = [
 ], optional = true }
 
 [build-dependencies]
-cfg_aliases = "0.2.1"
 globwalk = "0.8.1"
 regex = "1"
 thunk-rs = { git = "https://github.com/easytier/thunk.git", default-features = false, features = [

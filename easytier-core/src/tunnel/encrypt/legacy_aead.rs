@@ -221,19 +221,19 @@ impl Encryptor for ReplayProtectedEncryptor {
 
     fn decrypt(&self, zc_packet: &mut ZCPacket) -> Result<(), Error> {
         let nonce = aead_tail_nonce(zc_packet);
-        if let Some(nonce) = nonce.as_ref() {
-            if !self.rx.pre_check(nonce) {
-                return Err(Error::ReplayDetected);
-            }
+        if let Some(nonce) = nonce.as_ref()
+            && !self.rx.pre_check(nonce)
+        {
+            return Err(Error::ReplayDetected);
         }
         self.inner.decrypt(zc_packet)?;
         // Account only after the AEAD authenticated the packet, so forged
         // traffic cannot pollute windows. The nonce itself is authenticated
         // indirectly: mutating it makes decryption fail.
-        if let Some(nonce) = nonce.as_ref() {
-            if !self.rx.commit(nonce) {
-                return Err(Error::ReplayDetected);
-            }
+        if let Some(nonce) = nonce.as_ref()
+            && !self.rx.commit(nonce)
+        {
+            return Err(Error::ReplayDetected);
         }
         Ok(())
     }

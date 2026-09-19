@@ -929,6 +929,7 @@ pub(super) type SessionRpcClient = Box<dyn WebClientService<Controller = BaseCon
 pub(super) type SessionConfigClient = Box<dyn ConfigRpc<Controller = BaseController> + Send>;
 
 impl Session {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         storage: WeakRefStorage,
         client_url: url::Url,

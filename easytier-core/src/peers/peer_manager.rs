@@ -3197,7 +3197,7 @@ impl PeerPacketRouter {
             .plaintext_drop_log_count
             .fetch_add(1, Ordering::Relaxed)
             + 1;
-        if drops == 1 || drops % PLAINTEXT_DROP_LOG_INTERVAL == 0 {
+        if drops == 1 || drops.is_multiple_of(PLAINTEXT_DROP_LOG_INTERVAL) {
             tracing::warn!(
                 drops,
                 ?from_peer_id,

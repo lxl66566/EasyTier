@@ -353,7 +353,6 @@ impl AttachedPeerRuntime {
             // Dropping the drop guard cancels `cleanup_done`, releasing any
             // `close()` waiter; the connections are left to the peer
             // managers' own teardown, whose runtime is gone anyway.
-            drop(connections);
             drop(cleanup_done);
             tracing::warn!(
                 "attached peer dropped without an ambient Tokio runtime; \

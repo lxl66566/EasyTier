@@ -2,6 +2,8 @@
 // bb335d60348386526684d9249d7ae733772279e4, with its network transport
 // replaced by EasyTier's socket factories. See LICENSE in this
 // directory for the upstream license.
+// Test-only helpers here are exercised by the Linux-gated upnp tests.
+#![cfg_attr(not(all(test, target_os = "linux")), allow(dead_code))]
 
 mod errors;
 mod messages;

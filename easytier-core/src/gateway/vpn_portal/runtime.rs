@@ -149,6 +149,10 @@ pub trait PortalHost: Send + Sync + 'static {
     }
 }
 
+/// One tokio mutex per portal client, keyed by client name; the outer map is
+/// shared so session-slot claim and release stay atomic.
+type SessionLocks = Arc<RwLock<BTreeMap<String, Arc<Mutex<()>>>>>;
+
 #[derive(Debug, Clone)]
 struct ClientStatus {
     state: PortalClientState,
@@ -226,7 +230,7 @@ pub struct PortalModule {
     host: Option<Arc<dyn PortalHost>>,
     events: Arc<dyn CoreEventSink>,
     statuses: Arc<RwLock<BTreeMap<String, ClientStatus>>>,
-    session_locks: Arc<RwLock<BTreeMap<String, Arc<Mutex<()>>>>>,
+    session_locks: SessionLocks,
     /// Keyed by client name for the lifetime of the module. Entries outlive
     /// removal from the configured set, so re-adding the same identity
     /// resumes its counters and removed series keep exporting their last
@@ -499,7 +503,7 @@ impl PortalModule {
         runtime_config: CoreRuntimeConfigStore,
         config: Arc<StdRwLock<PortalRuntimeConfig>>,
         statuses: Arc<RwLock<BTreeMap<String, ClientStatus>>>,
-        session_locks: Arc<RwLock<BTreeMap<String, Arc<Mutex<()>>>>>,
+        session_locks: SessionLocks,
         traffic_metrics: Arc<StdRwLock<BTreeMap<String, PortalClientTrafficMetrics>>>,
         events: Arc<dyn CoreEventSink>,
         cancel: CancellationToken,
@@ -556,7 +560,7 @@ impl PortalModule {
         runtime_config: CoreRuntimeConfigStore,
         config: Arc<StdRwLock<PortalRuntimeConfig>>,
         statuses: Arc<RwLock<BTreeMap<String, ClientStatus>>>,
-        session_locks: Arc<RwLock<BTreeMap<String, Arc<Mutex<()>>>>>,
+        session_locks: SessionLocks,
         traffic_metrics: Arc<StdRwLock<BTreeMap<String, PortalClientTrafficMetrics>>>,
         events: Arc<dyn CoreEventSink>,
         cancel: CancellationToken,
@@ -591,7 +595,7 @@ impl PortalModule {
     /// `update_clients`, which run under the same write lock.
     async fn reserve_session_slot(
         config: &Arc<StdRwLock<PortalRuntimeConfig>>,
-        session_locks: &Arc<RwLock<BTreeMap<String, Arc<Mutex<()>>>>>,
+        session_locks: &SessionLocks,
         client_name: &str,
     ) -> Option<(PortalClientConfig, Arc<Mutex<()>>)> {
         let mut locks = session_locks.write().await;
@@ -610,10 +614,7 @@ impl PortalModule {
     /// session still holds a clone. Entries held by a live session are left
     /// alone so a queued session stays serialized against it; without this
     /// cleanup a session racing a removal would leave a ghost entry forever.
-    async fn release_session_slot(
-        session_locks: &Arc<RwLock<BTreeMap<String, Arc<Mutex<()>>>>>,
-        name: &str,
-    ) {
+    async fn release_session_slot(session_locks: &SessionLocks, name: &str) {
         let mut locks = session_locks.write().await;
         if locks
             .get(name)
@@ -1197,7 +1198,7 @@ fn has_ipv4_source(payload: &[u8], expected: Ipv4Addr) -> bool {
 const SOURCE_MISMATCH_LOG_INTERVAL: u64 = 100;
 
 fn should_log_source_mismatch(total: u64) -> bool {
-    total == 1 || total % SOURCE_MISMATCH_LOG_INTERVAL == 0
+    total == 1 || total.is_multiple_of(SOURCE_MISMATCH_LOG_INTERVAL)
 }
 
 #[cfg(test)]
@@ -2083,8 +2084,7 @@ mod tests {
             clients: vec![client("alice", Ipv4Addr::new(10, 82, 0, 2), &["ops"])],
         };
         let statuses = Arc::new(RwLock::new(BTreeMap::new()));
-        let session_locks: Arc<RwLock<BTreeMap<String, Arc<Mutex<()>>>>> =
-            Arc::new(RwLock::new(BTreeMap::new()));
+        let session_locks: SessionLocks = Arc::new(RwLock::new(BTreeMap::new()));
         let (_to_runtime, from_client) = mpsc::channel(1);
         let (to_client, _from_runtime) = mpsc::channel(1);
         let (_endpoint_sender, endpoint) = watch::channel("portal://alice".to_owned());

@@ -36,6 +36,7 @@ pub struct WebClient {
 }
 
 impl WebClient {
+    #[allow(clippy::too_many_arguments)]
     pub fn new<T, S, H>(
         connector: T,
         token: S,

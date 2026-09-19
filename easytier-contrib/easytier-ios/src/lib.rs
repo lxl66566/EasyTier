@@ -372,12 +372,10 @@ pub extern "C" fn easytier_ios_collect_network_infos(max_length: c_int) -> *mut 
             // The FFI contract frees nothing on failure; release any entries
             // it may already have written so they cannot leak.
             for info in &infos {
-                // SAFETY: entries are either null or strings allocated by
-                // easytier-ffi; free_string accepts null.
-                unsafe {
-                    easytier_ffi::free_string(info.key);
-                    easytier_ffi::free_string(info.value);
-                }
+                // Entries are either null or strings allocated by easytier-ffi;
+                // free_string accepts null.
+                easytier_ffi::free_string(info.key);
+                easytier_ffi::free_string(info.value);
             }
             return ptr::null_mut();
         }

@@ -47,6 +47,7 @@ use easytier_core::{
 
 //region packet
 #[derive(Debug, Constructor)]
+#[allow(clippy::redundant_field_names)]
 struct QuicPacket {
     addr: SocketAddr,
     payload: BytesMut,
@@ -212,6 +213,7 @@ impl AsyncUdpSocket for QuicSocket {
 
 //region addr
 #[derive(Debug, Clone, Copy, Constructor)]
+#[allow(clippy::redundant_field_names)]
 struct QuicAddr {
     peer_id: PeerId,
     packet_type: PacketType,

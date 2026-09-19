@@ -22,7 +22,7 @@ pub fn parse_sha256_fingerprint(value: &str) -> Option<[u8; 32]> {
     }
     let bytes = hex.as_bytes();
     let mut digest = [0u8; 32];
-    for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+    for (i, chunk) in bytes.as_chunks::<2>().0.iter().enumerate() {
         let hi = hex_val(chunk[0])?;
         let lo = hex_val(chunk[1])?;
         digest[i] = (hi << 4) | lo;

@@ -239,6 +239,7 @@ mod portable_runtime {
     };
 
     use tokio::sync::Notify;
+    #[cfg(unix)]
     use tokio_util::task::AbortOnDropHandle;
 
     #[cfg(feature = "proxy-packet")]
@@ -2592,18 +2593,22 @@ virtual_ip = "10.82.0.2/24"
         }
     }
 
+    // Used by the unix-gated `stop_cancels_pending_listener_start` test.
+    #[cfg(unix)]
     #[derive(Debug, Default)]
     struct BlockingListenerState {
         start_entered: Notify,
         drop_calls: AtomicUsize,
     }
 
+    #[cfg(unix)]
     #[derive(Debug)]
     struct BlockingSocketListener {
         url: Url,
         state: Arc<BlockingListenerState>,
     }
 
+    #[cfg(unix)]
     #[async_trait]
     impl SocketListener for BlockingSocketListener {
         type Accepted = AcceptedTransport<TestTcpSocket>;
@@ -2622,16 +2627,19 @@ virtual_ip = "10.82.0.2/24"
         }
     }
 
+    #[cfg(unix)]
     impl Drop for BlockingSocketListener {
         fn drop(&mut self) {
             self.state.drop_calls.fetch_add(1, Ordering::Relaxed);
         }
     }
 
+    #[cfg(unix)]
     struct BlockingExternalListenerFactory {
         state: Arc<BlockingListenerState>,
     }
 
+    #[cfg(unix)]
     impl ExternalListenerFactory<AcceptedTransport<TestTcpSocket>> for BlockingExternalListenerFactory {
         fn supports_scheme(&self, scheme: &str) -> bool {
             scheme == "unix"

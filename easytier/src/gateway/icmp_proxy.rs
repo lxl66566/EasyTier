@@ -72,10 +72,12 @@ impl IcmpProxySocket for RuntimeIcmpSocket {
                         return Ok((peer_ip, buffer));
                     }
                     Err(error) => match error.kind() {
-                        ErrorKind::TimedOut | ErrorKind::WouldBlock
-                            if closed.load(Ordering::Acquire) =>
-                        {
-                            return Err(std::io::Error::other("icmp socket closed").into());
+                        ErrorKind::TimedOut | ErrorKind::WouldBlock => {
+                            if closed.load(Ordering::Acquire) {
+                                return Err(std::io::Error::other("icmp socket closed").into());
+                            }
+                            // Timed out but not closed: poll again.
+                            continue;
                         }
                         _ => return Err(error.into()),
                     },

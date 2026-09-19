@@ -10,9 +10,13 @@ mod credential_tests;
 #[cfg(feature = "upnp")]
 mod upnp_test;
 
+// Helpers below are used only by the Linux-gated test modules.
+#[cfg(target_os = "linux")]
 use crate::instance::test_instance::TestInstance as Instance;
+#[cfg(target_os = "linux")]
 use easytier_core::config::PeerId;
 
+#[cfg(target_os = "linux")]
 trait InstanceTestExt {
     fn add_connector_url(&self, url: url::Url);
 
@@ -21,6 +25,7 @@ trait InstanceTestExt {
     fn ring_listener_url(&self) -> url::Url;
 }
 
+#[cfg(target_os = "linux")]
 impl InstanceTestExt for Instance {
     fn add_connector_url(&self, url: url::Url) {
         self.get_core_instance()
@@ -49,14 +54,17 @@ pub fn remove_env_var<K: AsRef<std::ffi::OsStr>>(key: K) {
     unsafe { std::env::remove_var(key) }
 }
 
+#[cfg(target_os = "linux")]
 pub fn get_guest_veth_name(net_ns: &str) -> &str {
     Box::leak(format!("veth_{}_g", net_ns).into_boxed_str())
 }
 
+#[cfg(target_os = "linux")]
 pub fn get_host_veth_name(net_ns: &str) -> &str {
     Box::leak(format!("veth_{}_h", net_ns).into_boxed_str())
 }
 
+#[cfg(target_os = "linux")]
 pub fn del_netns(name: &str) {
     // del veth host
     let _ = std::process::Command::new("ip")
@@ -68,6 +76,7 @@ pub fn del_netns(name: &str) {
         .output();
 }
 
+#[cfg(target_os = "linux")]
 pub fn create_netns(name: &str, ipv4: &str, ipv6: &str) {
     // create netns
     let _ = std::process::Command::new("ip")
@@ -137,6 +146,7 @@ pub fn create_netns(name: &str, ipv4: &str, ipv6: &str) {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn prepare_bridge(name: &str) {
     // del bridge with brctl
     let _ = std::process::Command::new("brctl")
@@ -149,6 +159,7 @@ pub fn prepare_bridge(name: &str) {
         .output();
 }
 
+#[cfg(target_os = "linux")]
 pub fn add_ns_to_bridge(br_name: &str, ns_name: &str) {
     // use brctl to add ns to bridge
     let _ = std::process::Command::new("brctl")
@@ -163,6 +174,7 @@ pub fn add_ns_to_bridge(br_name: &str, ns_name: &str) {
         .unwrap();
 }
 
+#[cfg(target_os = "linux")]
 fn check_route(
     ipv4: &str,
     dst_peer_id: PeerId,
@@ -182,6 +194,7 @@ fn check_route(
     );
 }
 
+#[cfg(target_os = "linux")]
 fn check_route_ex(
     routes: Vec<easytier_proto::core_peer::peer::Route>,
     peer_id: PeerId,
@@ -197,6 +210,7 @@ fn check_route_ex(
     assert!(found, "routes: {:?}, dst_peer_id: {}", routes, peer_id);
 }
 
+#[cfg(target_os = "linux")]
 async fn wait_proxy_route_appear(
     core: &std::sync::Arc<crate::instance::composition::NativeCoreInstance>,
     ipv4: &str,
@@ -219,6 +233,7 @@ async fn wait_proxy_route_appear(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn set_link_status(net_ns: &str, up: bool) {
     let ret = std::process::Command::new("ip")
         .args([
@@ -236,6 +251,7 @@ fn set_link_status(net_ns: &str, up: bool) {
     tracing::info!("set link status: {:?}, net_ns: {}, up: {}", ret, net_ns, up);
 }
 
+#[cfg(target_os = "linux")]
 pub async fn drop_insts(insts: Vec<Instance>) {
     let mut set = tokio::task::JoinSet::new();
     for mut inst in insts {
@@ -253,6 +269,7 @@ pub async fn drop_insts(insts: Vec<Instance>) {
     while set.join_next().await.is_some() {}
 }
 
+#[cfg(target_os = "linux")]
 pub async fn ping_test(from_netns: &str, target_ip: &str, payload_size: Option<usize>) -> bool {
     use crate::common::netns::{NetNS, ROOT_NETNS_NAME};
     let _g = NetNS::new(Some(ROOT_NETNS_NAME.to_owned())).guard();

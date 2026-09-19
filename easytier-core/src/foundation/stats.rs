@@ -510,6 +510,9 @@ impl Default for UnsafeCounter {
     }
 }
 
+// The unsafe markers are API compatibility only; the docs on `UnsafeCounter`
+// explain why, so skip the per-fn `# Safety` sections.
+#[allow(clippy::missing_safety_doc)]
 impl UnsafeCounter {
     pub fn new() -> Self {
         Self {

@@ -252,7 +252,9 @@ pub(crate) mod tests {
     use atomic_shim::AtomicU64;
     use std::{sync::Arc, time::Instant};
 
-    use futures::{Future, SinkExt, StreamExt};
+    #[cfg(target_os = "linux")]
+    use futures::Future;
+    use futures::{SinkExt, StreamExt};
     use tokio_util::bytes::{BufMut, Bytes, BytesMut};
 
     use easytier_core::{
@@ -540,6 +542,7 @@ pub(crate) mod tests {
         bps as usize
     }
 
+    #[cfg(target_os = "linux")]
     pub async fn wait_for_condition<F, FRet>(mut condition: F, timeout: std::time::Duration)
     where
         F: FnMut() -> FRet + Send,

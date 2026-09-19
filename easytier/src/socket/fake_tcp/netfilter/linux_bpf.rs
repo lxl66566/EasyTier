@@ -221,11 +221,7 @@ fn build_tcp_filter(
         b.set_label(l_v4_proto_ok);
         let l_v4_fragment_ok = b.new_label();
         b.push(stmt(BPF_LD | BPF_H | BPF_ABS, 6));
-        b.push_jset(
-            IPV4_FRAGMENT_OFFSET_MASK,
-            l_reject,
-            l_v4_fragment_ok,
-        );
+        b.push_jset(IPV4_FRAGMENT_OFFSET_MASK, l_reject, l_v4_fragment_ok);
 
         b.set_label(l_v4_fragment_ok);
         let dst_ip = match dst_addr.ip() {

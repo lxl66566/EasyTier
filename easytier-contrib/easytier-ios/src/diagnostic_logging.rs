@@ -317,15 +317,14 @@ impl RotatingLog {
         }
         if self.active_bytes > 0
             && self.active_bytes.saturating_add(event.len() as u64) > MAX_LOG_BYTES
+            && let Err(error) = self.rotate()
         {
-            if let Err(error) = self.rotate() {
-                // Rotation failed but `rotate` kept the previous handle open,
-                // so append the full event even past MAX_LOG_BYTES instead
-                // of dropping it; the oversized file is truncated on the
-                // next open.
-                self.note_rotation_failure(&error);
-                return self.append(event);
-            }
+            // Rotation failed but `rotate` kept the previous handle open,
+            // so append the full event even past MAX_LOG_BYTES instead
+            // of dropping it; the oversized file is truncated on the
+            // next open.
+            self.note_rotation_failure(&error);
+            return self.append(event);
         }
         let remaining = MAX_LOG_BYTES.saturating_sub(self.active_bytes) as usize;
         self.append(&event[..event.len().min(remaining)])
@@ -595,7 +594,7 @@ mod tests {
         const EVENTS: usize = 200;
         for index in 0..EVENTS {
             let mut event = writer.make_writer();
-            write!(event, "drain event {index}\n").unwrap();
+            writeln!(event, "drain event {index}").unwrap();
         }
         // Every writer Drop only enqueues; the flush reply proves all 200
         // events were written and flushed before it returned.

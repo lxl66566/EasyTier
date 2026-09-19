@@ -1506,7 +1506,7 @@ impl ForeignNetworkPacketRouter {
                         counters.plaintext_dropped.inc();
                         plaintext_drop_log_count += 1;
                         if plaintext_drop_log_count == 1
-                            || plaintext_drop_log_count % PLAINTEXT_DROP_LOG_INTERVAL == 0
+                            || plaintext_drop_log_count.is_multiple_of(PLAINTEXT_DROP_LOG_INTERVAL)
                         {
                             tracing::warn!(
                                 drops = plaintext_drop_log_count,

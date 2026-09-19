@@ -33,6 +33,7 @@ impl ReplayWindow256 {
     }
 
     /// Highest sequence recorded so far (for assertions and diagnostics).
+    #[cfg(test)]
     pub(crate) fn max_seq(&self) -> u64 {
         self.max_seq
     }

@@ -27,7 +27,7 @@ impl CredentialStorage for FileCredentialStorage {
 }
 
 fn restricted_atomic_file(path: &std::path::Path) -> std::io::Result<AtomicWriteFile> {
-    let mut options = OpenOptions::new();
+    let options = OpenOptions::new();
     #[cfg(unix)]
     {
         atomic_write_file::unix::OpenOptionsExt::preserve_mode(&mut options, false);
