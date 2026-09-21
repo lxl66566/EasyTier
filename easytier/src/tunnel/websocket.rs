@@ -1,4 +1,5 @@
 use super::FromUrl;
+use super::tls_verification::{init_crypto_provider, pinned_fingerprint};
 use crate::tunnel::common::bind;
 use crate::{proto::common::TunnelInfo, socket::tcp::RuntimeTcpSocket};
 use bytes::BytesMut;
@@ -7,8 +8,7 @@ use easytier_core::{
     packet::{ZCPacket, ZCPacketType},
     socket::tcp::VirtualTcpSocket,
     tunnel::{
-        IpVersion, Tunnel, TunnelError,
-        fingerprint::{format_sha256_fingerprint, parse_sha256_fingerprint},
+        IpVersion, Tunnel, TunnelError, fingerprint::format_sha256_fingerprint,
         wrapper::TunnelWrapper,
     },
 };
@@ -132,138 +132,6 @@ async fn map_from_ws_message(
     )))
 }
 
-#[derive(Debug)]
-struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
-
-impl SkipServerVerification {
-    fn new(provider: Arc<rustls::crypto::CryptoProvider>) -> Arc<Self> {
-        Arc::new(Self(provider))
-    }
-}
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-/// Verifies the server end-entity certificate against a pinned SHA-256
-/// fingerprint instead of a PKI. Handshake signature schemes still follow the
-/// process-wide crypto provider; only the certificate identity is pinned.
-/// Fingerprint comparison is not constant-time: pins are public values.
-#[derive(Debug)]
-struct PinnedServerVerification {
-    provider: Arc<rustls::crypto::CryptoProvider>,
-    expected: [u8; 32],
-}
-
-impl PinnedServerVerification {
-    fn new(provider: Arc<rustls::crypto::CryptoProvider>, expected: [u8; 32]) -> Arc<Self> {
-        Arc::new(Self { provider, expected })
-    }
-
-    fn verify_pinned(
-        &self,
-        end_entity: &rustls::pki_types::CertificateDer<'_>,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        let digest: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
-        if digest != self.expected {
-            return Err(rustls::Error::General(format!(
-                "wss server certificate fingerprint mismatch: expected {}, got {}",
-                format_sha256_fingerprint(&self.expected),
-                format_sha256_fingerprint(&digest),
-            )));
-        }
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-}
-
-impl rustls::client::danger::ServerCertVerifier for PinnedServerVerification {
-    fn verify_server_cert(
-        &self,
-        end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        self.verify_pinned(end_entity)
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.provider
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
 /// Warn once per process that unpinned wss tunnels trust any server
 /// certificate, which an active man-in-the-middle can exploit.
 fn warn_no_pin() {
@@ -277,49 +145,11 @@ fn warn_no_pin() {
     });
 }
 
-/// Extracts a pinned certificate fingerprint from the url fragment
-/// (`#fingerprint=sha256:<hex>`). A present but malformed pin is an error:
-/// silently ignoring it would turn an intended fail-closed configuration into
-/// an open one.
-fn pinned_fingerprint(url: &url::Url) -> Result<Option<[u8; 32]>, TunnelError> {
-    let Some(fragment) = url.fragment() else {
-        return Ok(None);
-    };
-    for pair in fragment.split('&') {
-        let Some(value) = pair.strip_prefix("fingerprint=") else {
-            continue;
-        };
-        return parse_sha256_fingerprint(value).map(Some).ok_or_else(|| {
-            TunnelError::InvalidProtocol(format!(
-                "invalid wss certificate fingerprint in url fragment: {value}"
-            ))
-        });
-    }
-    Ok(None)
-}
-
-fn init_crypto_provider() {
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
-}
-
 fn get_tls_client_config(pinned: Option<[u8; 32]>) -> rustls::ClientConfig {
-    init_crypto_provider();
-    let provider = rustls::crypto::CryptoProvider::get_default().unwrap();
-    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = match pinned {
-        Some(expected) => PinnedServerVerification::new(provider.clone(), expected),
-        None => {
-            warn_no_pin();
-            SkipServerVerification::new(provider.clone())
-        }
-    };
-    let mut config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
-    config.enable_sni = true;
-    config.enable_early_data = false;
-    config
+    if pinned.is_none() {
+        warn_no_pin();
+    }
+    super::tls_verification::tls_client_config(pinned)
 }
 
 /// Self-signed certificate served by wss listeners.
@@ -694,9 +524,8 @@ pub mod tests {
     }
 
     fn pinned_verifier(expected: [u8; 32]) -> Arc<dyn rustls::client::danger::ServerCertVerifier> {
-        init_crypto_provider();
-        let provider = rustls::crypto::CryptoProvider::get_default().unwrap();
-        PinnedServerVerification::new(provider.clone(), expected)
+        use crate::tunnel::tls_verification::PinnedServerVerification;
+        PinnedServerVerification::new(crate::tunnel::tls_verification::ring_provider(), expected)
     }
 
     #[test]

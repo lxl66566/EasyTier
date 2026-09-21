@@ -11,6 +11,9 @@ use strum::{Display, EnumString, IntoStaticStr, VariantArray};
 pub mod common;
 pub(crate) mod protocol;
 
+#[cfg(any(feature = "quic", feature = "websocket"))]
+mod tls_verification;
+
 #[cfg(feature = "wireguard")]
 pub mod wireguard;
 
