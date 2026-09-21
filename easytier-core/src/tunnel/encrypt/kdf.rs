@@ -48,6 +48,12 @@ const ARGON2_P: u32 = 1;
 /// derived keys.
 const ARGON2_SALT: &[u8] = b"easytier-kdf-v2";
 
+/// Domain-separated salt for the `secret-challenge-v2` handshake proof key
+/// (crypto-review N2). Distinct from [`ARGON2_SALT`] so a captured proof and
+/// the data-plane keys expose different argon2id images; neither derivation
+/// can be replayed in the other domain.
+const ARGON2_CHALLENGE_SALT: &[u8] = b"easytier-kdf-v2-challenge";
+
 /// The two legacy data-plane keys derived from one secret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DerivedKeys {
@@ -60,20 +66,31 @@ pub struct DerivedKeys {
 /// (config reloads) from paying the cost again for the same secret.
 static KEY_CACHE: OnceLock<Mutex<HashMap<Box<str>, DerivedKeys>>> = OnceLock::new();
 
+/// Cache for the handshake proof key: a separate entry space from
+/// [`KEY_CACHE`] because the domain salt and output length differ. Keyed by
+/// secret, so the effective cache key is (secret, salt domain) as required.
+static CHALLENGE_KEY_CACHE: OnceLock<Mutex<HashMap<Box<str>, [u8; 32]>>> = OnceLock::new();
+
 /// Cache capacity. A process realistically serves a handful of secrets; when
 /// the cap is hit the cache is rebuilt lazily instead of growing unbounded.
 const KEY_CACHE_CAP: usize = 16;
 
-fn argon2_derive(secret: &str) -> DerivedKeys {
-    let params = Params::new(ARGON2_M_KIB, ARGON2_T, ARGON2_P, Some(48))
+/// Shared argon2id core for every derivation domain (same parameters, same
+/// secret input; only the salt and output length vary by caller).
+fn argon2_hash(secret: &str, salt: &[u8], out: &mut [u8]) {
+    let params = Params::new(ARGON2_M_KIB, ARGON2_T, ARGON2_P, Some(out.len()))
         .expect("argon2id parameters are valid");
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    argon2
+        .hash_password_into(secret.as_bytes(), salt, out)
+        .expect("argon2id derivation with valid parameters cannot fail");
+}
+
+fn argon2_derive(secret: &str) -> DerivedKeys {
     // One run for both keys: the 48-byte tag is split into the AES-128 key
     // and the 256-bit key, so the suite shares a single derivation cost.
     let mut out = [0u8; 48];
-    argon2
-        .hash_password_into(secret.as_bytes(), ARGON2_SALT, &mut out)
-        .expect("argon2id derivation with valid parameters cannot fail");
+    argon2_hash(secret, ARGON2_SALT, &mut out);
     let mut keys = DerivedKeys {
         key_128: [0u8; 16],
         key_256: [0u8; 32],
@@ -96,6 +113,30 @@ pub fn derive_key_pair_argon2id(secret: &str) -> DerivedKeys {
     }
     guard.insert(secret.into(), keys);
     keys
+}
+
+/// Argon2id-stretched HMAC key for `secret-challenge-v2` handshake proofs,
+/// cached per secret (crypto-review N2).
+///
+/// The v1 proof keyed HMAC-SHA256 directly with the network secret, so one
+/// captured proof allowed offline dictionary attacks at plain SHA-256 speed.
+/// v2 keys the proof with this stretched value instead: guessing the secret
+/// from a proof now costs one argon2id per candidate. The derivation is
+/// process-cached per secret, so repeated handshakes pay the argon2id cost
+/// once per secret, not per connection.
+pub fn derive_challenge_key_argon2id(secret: &str) -> [u8; 32] {
+    let cache = CHALLENGE_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap();
+    if let Some(key) = guard.get(secret) {
+        return *key;
+    }
+    let mut key = [0u8; 32];
+    argon2_hash(secret, ARGON2_CHALLENGE_SALT, &mut key);
+    if guard.len() >= KEY_CACHE_CAP {
+        guard.clear();
+    }
+    guard.insert(secret.into(), key);
+    key
 }
 
 /// Legacy data-plane encryptor that carries both KDF suites and selects one
@@ -190,6 +231,21 @@ mod tests {
         let legacy_256 = derive_key_256("secret");
         assert_ne!(keys.key_128, legacy_128);
         assert_ne!(keys.key_256, legacy_256);
+    }
+
+    #[test]
+    fn challenge_key_is_domain_separated_from_data_plane_keys() {
+        // crypto-review N2: the proof key must live in its own argon2id domain
+        // (different salt) so proofs and data-plane traffic never share key
+        // material, and cache hits must return the same derivation.
+        let challenge = derive_challenge_key_argon2id("secret");
+        assert_eq!(derive_challenge_key_argon2id("secret"), challenge);
+        assert_ne!(derive_challenge_key_argon2id("secret2"), challenge);
+
+        let data_plane = derive_key_pair_argon2id("secret");
+        assert_ne!(challenge, data_plane.key_256);
+        // Also independent of the raw secret bytes (stretched, not echoed).
+        assert_ne!(challenge.as_slice(), b"secret".as_slice());
     }
 
     #[test]

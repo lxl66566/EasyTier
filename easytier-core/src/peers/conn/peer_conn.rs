@@ -16,8 +16,9 @@ use tokio::sync::Mutex;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use guarden::guard;
-use hmac::Mac;
+use hmac::{Hmac, Mac};
 use prost::Message;
+use sha2::Sha256;
 
 use tokio::{sync::broadcast, task::JoinSet};
 
@@ -54,6 +55,7 @@ use crate::{
     },
     tunnel::{
         Tunnel, TunnelError, ZCPacketStream,
+        encrypt::derive_challenge_key_argon2id,
         filter::{StatsRecorderTunnelFilter, TunnelFilter, TunnelFilterChain, TunnelWithFilter},
         mpsc::{MpscTunnel, MpscTunnelSender},
         stats::{Throughput, WindowLatency},
@@ -91,6 +93,16 @@ pub const KDF_V2_FEATURE: &str = "kdf-v2";
 /// endpoints requires secure mode's noise transcript proof.
 pub const SECRET_CHALLENGE_FEATURE: &str = "secret-challenge-v1";
 
+/// Handshake feature: `secret-challenge-v2`, the stretched-proof upgrade of
+/// [`SECRET_CHALLENGE_FEATURE`] (crypto-review N2).
+///
+/// When both sides declare it, challenge proofs are keyed with an
+/// argon2id-stretched secret ([`derive_challenge_key_argon2id`]) instead of
+/// the raw network secret, so a captured proof no longer permits offline
+/// dictionary attacks at plain SHA-256 speed. Falls back to v1 (then to the
+/// static-digest flow) with peers that do not declare it.
+pub const SECRET_CHALLENGE_V2_FEATURE: &str = "secret-challenge-v2";
+
 /// Size of the fresh per-connection nonces and proofs, matching
 /// [`NetworkSecretDigest`] and HMAC-SHA256 output.
 const CHALLENGE_FIELD_LEN: usize = 32;
@@ -102,7 +114,21 @@ fn handshake_features() -> Vec<String> {
         HEADER_AAD_FEATURE.to_owned(),
         KDF_V2_FEATURE.to_owned(),
         SECRET_CHALLENGE_FEATURE.to_owned(),
+        SECRET_CHALLENGE_V2_FEATURE.to_owned(),
     ]
+}
+
+/// Challenge protocol version negotiated from the handshake features: the
+/// newest `secret-challenge-*` feature both sides declare (crypto-review N2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChallengeVersion {
+    /// `secret-challenge-v1`: proofs are HMAC-SHA256 keyed with the raw
+    /// network secret.
+    V1,
+    /// `secret-challenge-v2`: proofs are HMAC-SHA256 keyed with an
+    /// argon2id-stretched secret ([`derive_challenge_key_argon2id`]) over a
+    /// domain-separated transcript.
+    V2,
 }
 
 /// Which side of a legacy handshake a challenge proof is computed for; the
@@ -145,6 +171,34 @@ fn challenge_transcript(
 
     let mut buf = Vec::new();
     buf.extend_from_slice(b"easytier-legacy-hs-challenge-v1");
+    buf.extend_from_slice(role.tag());
+    put_len_prefixed(&mut buf, network_name.as_bytes());
+    buf.extend_from_slice(&initiator_peer_id.to_be_bytes());
+    buf.extend_from_slice(&responder_peer_id.to_be_bytes());
+    put_len_prefixed(&mut buf, initiator_nonce);
+    put_len_prefixed(&mut buf, responder_nonce);
+    buf
+}
+
+/// Domain-separated transcript for `secret-challenge-v2` proofs. Same fields
+/// as the v1 transcript under a distinct prefix, so v1 and v2 proofs over
+/// identical handshakes are unrelated and a version-confusion attack fails
+/// closed on proof mismatch.
+fn challenge_v2_transcript(
+    role: ChallengeRole,
+    network_name: &str,
+    initiator_peer_id: PeerId,
+    responder_peer_id: PeerId,
+    initiator_nonce: &[u8],
+    responder_nonce: &[u8],
+) -> Vec<u8> {
+    fn put_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
+        buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(bytes);
+    }
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"easytier-legacy-hs-challenge-v2");
     buf.extend_from_slice(role.tag());
     put_len_prefixed(&mut buf, network_name.as_bytes());
     buf.extend_from_slice(&initiator_peer_id.to_be_bytes());
@@ -695,14 +749,57 @@ impl PeerConn {
             .is_some_and(|secret| !secret.is_empty())
     }
 
-    /// Whether the initiator's handshake request selects the
-    /// `secret-challenge-v1` flow: it declared the feature, targets our
-    /// network, and we hold the secret it must prove.
-    fn should_challenge_initiator(&self) -> bool {
-        self.info.as_ref().is_some_and(|info| {
-            info.features.iter().any(|f| f == SECRET_CHALLENGE_FEATURE)
-                && info.network_name == self.context.network_name()
-        }) && self.local_network_has_secret()
+    /// Which challenge protocol the initiator's handshake request selects:
+    /// the newest `secret-challenge-*` feature both sides declare, requiring
+    /// that the request targets our network and we hold the secret it must
+    /// prove. `None` keeps the static-digest flow for featureless initiators.
+    fn negotiated_challenge_version(&self) -> Option<ChallengeVersion> {
+        let info = self.info.as_ref()?;
+        if info.network_name != self.context.network_name() || !self.local_network_has_secret() {
+            return None;
+        }
+        if info
+            .features
+            .iter()
+            .any(|f| f == SECRET_CHALLENGE_V2_FEATURE)
+        {
+            Some(ChallengeVersion::V2)
+        } else if info.features.iter().any(|f| f == SECRET_CHALLENGE_FEATURE) {
+            Some(ChallengeVersion::V1)
+        } else {
+            None
+        }
+    }
+
+    /// Transcript for one challenge round under the negotiated version.
+    #[allow(clippy::too_many_arguments)]
+    fn challenge_transcript_for(
+        version: ChallengeVersion,
+        role: ChallengeRole,
+        network_name: &str,
+        initiator_peer_id: PeerId,
+        responder_peer_id: PeerId,
+        initiator_nonce: &[u8],
+        responder_nonce: &[u8],
+    ) -> Vec<u8> {
+        match version {
+            ChallengeVersion::V1 => challenge_transcript(
+                role,
+                network_name,
+                initiator_peer_id,
+                responder_peer_id,
+                initiator_nonce,
+                responder_nonce,
+            ),
+            ChallengeVersion::V2 => challenge_v2_transcript(
+                role,
+                network_name,
+                initiator_peer_id,
+                responder_peer_id,
+                initiator_nonce,
+                responder_nonce,
+            ),
+        }
     }
 
     /// Challenge-response rounds of the responder side (crypto-review S1.2).
@@ -711,7 +808,7 @@ impl PeerConn {
     /// answer with the initiator's proof over the same transcript. On
     /// success the initiator's digest is adopted as ours — it proved
     /// knowledge of the secret, which is what the digest comparison encodes.
-    async fn respond_with_challenge(&mut self) -> Result<(), Error> {
+    async fn respond_with_challenge(&mut self, version: ChallengeVersion) -> Result<(), Error> {
         let info = self.info.as_ref().expect("handshake request is decoded");
         let initiator_peer_id = info.my_peer_id;
         let network_name = info.network_name.clone();
@@ -721,23 +818,18 @@ impl PeerConn {
             })?;
         let responder_nonce: [u8; CHALLENGE_FIELD_LEN] = rand::random();
 
-        let responder_transcript = challenge_transcript(
-            ChallengeRole::Responder,
-            &network_name,
-            initiator_peer_id,
-            self.my_peer_id,
-            &initiator_nonce,
-            &responder_nonce,
-        );
-        let initiator_transcript = challenge_transcript(
-            ChallengeRole::Initiator,
-            &network_name,
-            initiator_peer_id,
-            self.my_peer_id,
-            &initiator_nonce,
-            &responder_nonce,
-        );
-        let proof = self.network_secret_proof(&responder_transcript)?;
+        let transcript = |role| {
+            Self::challenge_transcript_for(
+                version,
+                role,
+                &network_name,
+                initiator_peer_id,
+                self.my_peer_id,
+                &initiator_nonce,
+                &responder_nonce,
+            )
+        };
+        let proof = self.network_secret_proof(version, &transcript(ChallengeRole::Responder))?;
 
         self.send_handshake(
             HandshakeSecret::Challenge {
@@ -762,33 +854,64 @@ impl PeerConn {
             .secret_proof
             .try_into()
             .map_err(|_| Error::WaitRespError("initiator proof missing or malformed".to_owned()))?;
-        self.verify_challenge_proof(&initiator_proof, &initiator_transcript)?;
+        self.verify_challenge_proof(
+            version,
+            &initiator_proof,
+            &transcript(ChallengeRole::Initiator),
+        )?;
 
         let local_digest = self.context.secret_digest(&self.context.network_identity());
         self.info.as_mut().unwrap().network_secret_digest = local_digest;
         Ok(())
     }
 
-    fn network_secret_proof(&self, transcript: &[u8]) -> Result<[u8; CHALLENGE_FIELD_LEN], Error> {
-        self.context
-            .secret_proof(transcript)
-            .map(|mac| {
-                let mut proof = [0u8; CHALLENGE_FIELD_LEN];
-                proof.copy_from_slice(&mac.finalize().into_bytes());
-                proof
-            })
-            .ok_or_else(|| {
+    fn network_secret_proof(
+        &self,
+        version: ChallengeVersion,
+        transcript: &[u8],
+    ) -> Result<[u8; CHALLENGE_FIELD_LEN], Error> {
+        let mac = match version {
+            ChallengeVersion::V1 => self.context.secret_proof(transcript).ok_or_else(|| {
                 Error::WaitRespError("no network secret for challenge response".to_owned())
-            })
+            })?,
+            ChallengeVersion::V2 => self.challenge_v2_mac(transcript)?,
+        };
+        let mut proof = [0u8; CHALLENGE_FIELD_LEN];
+        proof.copy_from_slice(&mac.finalize().into_bytes());
+        Ok(proof)
     }
 
-    fn verify_challenge_proof(&self, proof: &[u8], transcript: &[u8]) -> Result<(), Error> {
-        self.context
-            .secret_proof(transcript)
+    /// v2 proof MAC keyed with the argon2id-stretched secret (crypto-review
+    /// N2): never the raw secret, and cached per secret so repeated
+    /// handshakes pay one argon2id per secret per process.
+    fn challenge_v2_mac(&self, transcript: &[u8]) -> Result<Hmac<Sha256>, Error> {
+        let secret = self
+            .context
+            .network_identity()
+            .network_secret
+            .filter(|secret| !secret.is_empty())
             .ok_or_else(|| {
+                Error::WaitRespError("no network secret for challenge response".to_owned())
+            })?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&derive_challenge_key_argon2id(&secret))
+            .map_err(|_| Error::WaitRespError("failed to init challenge proof hmac".to_owned()))?;
+        mac.update(transcript);
+        Ok(mac)
+    }
+
+    fn verify_challenge_proof(
+        &self,
+        version: ChallengeVersion,
+        proof: &[u8],
+        transcript: &[u8],
+    ) -> Result<(), Error> {
+        let mac = match version {
+            ChallengeVersion::V1 => self.context.secret_proof(transcript).ok_or_else(|| {
                 Error::WaitRespError("no network secret for challenge verification".to_owned())
-            })?
-            .verify_slice(proof)
+            })?,
+            ChallengeVersion::V2 => self.challenge_v2_mac(transcript)?,
+        };
+        mac.verify_slice(proof)
             .map_err(|_| Error::SecretKeyError("handshake challenge proof mismatch".to_owned()))
     }
 
@@ -821,6 +944,20 @@ impl PeerConn {
             ));
         }
 
+        // We always declare v2; use it when the responder did too, otherwise
+        // fall back to v1. A relay forging the v2 feature on either side only
+        // desynchronizes the versions, and the differing proof keys make the
+        // mismatched proof fail verification.
+        let version = if rsp
+            .features
+            .iter()
+            .any(|f| f == SECRET_CHALLENGE_V2_FEATURE)
+        {
+            ChallengeVersion::V2
+        } else {
+            ChallengeVersion::V1
+        };
+
         let invalid = || Error::WaitRespError("malformed challenge response".to_owned());
         let responder_nonce: [u8; CHALLENGE_FIELD_LEN] = rsp
             .challenge_nonce
@@ -831,7 +968,8 @@ impl PeerConn {
             rsp.secret_proof.clone().try_into().map_err(|_| invalid())?;
 
         let transcript = |role| {
-            challenge_transcript(
+            Self::challenge_transcript_for(
+                version,
                 role,
                 &rsp.network_name,
                 self.my_peer_id,
@@ -842,10 +980,14 @@ impl PeerConn {
         };
         // Authenticate the responder; its proof covers our fresh nonce, so a
         // replayed captured response cannot pass.
-        self.verify_challenge_proof(&responder_proof, &transcript(ChallengeRole::Responder))?;
+        self.verify_challenge_proof(
+            version,
+            &responder_proof,
+            &transcript(ChallengeRole::Responder),
+        )?;
 
         // Prove ourselves over the same transcript.
-        let proof = self.network_secret_proof(&transcript(ChallengeRole::Initiator))?;
+        let proof = self.network_secret_proof(version, &transcript(ChallengeRole::Initiator))?;
         self.send_handshake(
             HandshakeSecret::Challenge {
                 nonce: initiator_nonce,
@@ -1512,8 +1654,8 @@ impl PeerConn {
             self.info = Some(rsp);
             self.is_client = Some(false);
 
-            if self.should_challenge_initiator() {
-                self.respond_with_challenge().await?;
+            if let Some(version) = self.negotiated_challenge_version() {
+                self.respond_with_challenge(version).await?;
             } else {
                 let send_digest = self.get_network_identity() == self.context.network_identity();
                 self.send_handshake(

@@ -29,7 +29,9 @@ pub(crate) mod replay_window;
 
 pub mod xor;
 
-pub use kdf::{KdfSuite, NegotiatedKdfEncryptor, derive_key_pair_argon2id};
+pub use kdf::{
+    KdfSuite, NegotiatedKdfEncryptor, derive_challenge_key_argon2id, derive_key_pair_argon2id,
+};
 
 // The disabled backends keep the same error Interface as the AEAD backends.
 #[allow(dead_code)]

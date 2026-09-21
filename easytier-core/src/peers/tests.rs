@@ -13,7 +13,9 @@ use crate::{
     peers::{
         PeerConnectionOrigin, PeerPacketIngress,
         conn::{
-            peer_conn::{PeerConn, PeerConnId, SECRET_CHALLENGE_FEATURE},
+            peer_conn::{
+                PeerConn, PeerConnId, SECRET_CHALLENGE_FEATURE, SECRET_CHALLENGE_V2_FEATURE,
+            },
             peer_map::PeerMap,
             peer_session::PeerSessionStore,
         },
@@ -24,7 +26,10 @@ use crate::{
         test_support::NoopPeerContext,
     },
     proto::peer_rpc::HandshakeRequest,
-    tunnel::{Tunnel, TunnelError, ring::create_ring_tunnel_pair, wrapper::TunnelWrapper},
+    tunnel::{
+        Tunnel, TunnelError, encrypt::derive_challenge_key_argon2id, ring::create_ring_tunnel_pair,
+        wrapper::TunnelWrapper,
+    },
 };
 
 impl PeerConn {
@@ -59,7 +64,8 @@ async fn peer_conn_handshake_over_memory_tunnel() {
             "liveness-echo-v1",
             "header-aad-v1",
             "kdf-v2",
-            "secret-challenge-v1"
+            "secret-challenge-v1",
+            "secret-challenge-v2"
         ]
     );
     assert_eq!(
@@ -68,7 +74,8 @@ async fn peer_conn_handshake_over_memory_tunnel() {
             "liveness-echo-v1",
             "header-aad-v1",
             "kdf-v2",
-            "secret-challenge-v1"
+            "secret-challenge-v1",
+            "secret-challenge-v2"
         ]
     );
     assert!(client.supports_header_aad());
@@ -123,7 +130,8 @@ async fn peer_conn_noise_handshake_advertises_liveness_echo() {
             "liveness-echo-v1",
             "header-aad-v1",
             "kdf-v2",
-            "secret-challenge-v1"
+            "secret-challenge-v1",
+            "secret-challenge-v2"
         ]
     );
     assert_eq!(
@@ -132,7 +140,8 @@ async fn peer_conn_noise_handshake_advertises_liveness_echo() {
             "liveness-echo-v1",
             "header-aad-v1",
             "kdf-v2",
-            "secret-challenge-v1"
+            "secret-challenge-v1",
+            "secret-challenge-v2"
         ]
     );
     assert!(client.supports_header_aad());
@@ -703,4 +712,272 @@ async fn peer_map_reselects_cached_connection_after_close() {
         client_map.get_peer_default_conn_id(2).await,
         Some(first_conn_id)
     );
+}
+
+// --- secret-challenge-v2 (crypto-review N2: stretched proof keys) ---
+
+/// Test-local reimplementation of the `secret-challenge-v2` transcript
+/// format. Keeping an independent copy here catches accidental drift in the
+/// production builder, which would silently break interop between builds.
+fn v2_transcript(
+    role: &[u8],
+    network_name: &str,
+    initiator_peer_id: u32,
+    responder_peer_id: u32,
+    initiator_nonce: &[u8],
+    responder_nonce: &[u8],
+) -> Vec<u8> {
+    fn put_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
+        buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(bytes);
+    }
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"easytier-legacy-hs-challenge-v2");
+    buf.extend_from_slice(role);
+    put_len_prefixed(&mut buf, network_name.as_bytes());
+    buf.extend_from_slice(&initiator_peer_id.to_be_bytes());
+    buf.extend_from_slice(&responder_peer_id.to_be_bytes());
+    put_len_prefixed(&mut buf, initiator_nonce);
+    put_len_prefixed(&mut buf, responder_nonce);
+    buf
+}
+
+fn hmac_sha256(key: &[u8], transcript: &[u8]) -> [u8; 32] {
+    use hmac::Mac;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
+    mac.update(transcript);
+    mac.finalize().into_bytes().into()
+}
+
+/// Parses a captured handshake packet into its protobuf form.
+fn parse_handshake(pkt: &ZCPacket) -> HandshakeRequest {
+    HandshakeRequest::decode(pkt.payload()).unwrap()
+}
+
+#[test]
+fn challenge_v2_stretched_proof_is_not_recomputable_from_the_raw_secret() {
+    // Pure-property check for N2: the v2 proof key must be the argon2id
+    // stretched secret, never the raw secret bytes (guards against
+    // implementation regressions to the v1 keying).
+    let transcript = v2_transcript(b":initiator", "net", 1, 2, &[1u8; 32], &[2u8; 32]);
+    let stretched = hmac_sha256(&derive_challenge_key_argon2id("secret"), &transcript);
+    let raw = hmac_sha256(b"secret", &transcript);
+    assert_ne!(stretched, raw);
+    assert_eq!(
+        stretched,
+        hmac_sha256(&derive_challenge_key_argon2id("secret"), &transcript)
+    );
+}
+
+#[tokio::test]
+async fn challenge_v2_handshake_proves_with_stretched_key() {
+    // Both sides are current builds, so the handshake must negotiate v2 and
+    // both proofs must verify under the argon2id-stretched key. The proofs
+    // are recomputed here from the captured wire to pin the actual version
+    // and keying used on the wire.
+    let (client_tunnel, server_tunnel, client_log, server_log) = recording_channel_tunnel_pair();
+    let mut client = PeerConn::new(
+        1,
+        secret_context("secret"),
+        client_tunnel,
+        Arc::new(PeerSessionStore::new()),
+    );
+    let mut server = PeerConn::new(
+        2,
+        secret_context("secret"),
+        server_tunnel,
+        Arc::new(PeerSessionStore::new()),
+    );
+    let (client_ret, server_ret) = tokio::join!(
+        client.do_handshake_as_client(),
+        server.do_handshake_as_server()
+    );
+    client_ret.unwrap();
+    server_ret.unwrap();
+
+    let client_packets = handshake_packets(&client_log);
+    let server_packets = handshake_packets(&server_log);
+    assert_eq!(client_packets.len(), 2); // msg1, msg3
+    assert_eq!(server_packets.len(), 1); // msg2
+    let msg1 = parse_handshake(&client_packets[0]);
+    let msg2 = parse_handshake(&server_packets[0]);
+    let msg3 = parse_handshake(&client_packets[1]);
+
+    assert!(
+        msg1.features
+            .contains(&SECRET_CHALLENGE_V2_FEATURE.to_string())
+    );
+    assert!(
+        msg2.features
+            .contains(&SECRET_CHALLENGE_V2_FEATURE.to_string())
+    );
+
+    let stretched = derive_challenge_key_argon2id("secret");
+    let responder_proof = hmac_sha256(
+        &stretched,
+        &v2_transcript(
+            b":responder",
+            "net",
+            1,
+            2,
+            &msg1.challenge_nonce,
+            &msg2.challenge_nonce,
+        ),
+    );
+    let initiator_proof = hmac_sha256(
+        &stretched,
+        &v2_transcript(
+            b":initiator",
+            "net",
+            1,
+            2,
+            &msg1.challenge_nonce,
+            &msg2.challenge_nonce,
+        ),
+    );
+    assert_eq!(msg2.secret_proof, responder_proof.to_vec());
+    assert_eq!(msg3.secret_proof, initiator_proof.to_vec());
+
+    // The same proofs must NOT verify under v1 keying: they are stretched,
+    // not raw-secret HMACs.
+    let raw_secret_proof = |role: &[u8]| {
+        use hmac::Mac;
+        crate::peers::context::secret_proof_from_secret(
+            "secret",
+            &v2_transcript(
+                role,
+                "net",
+                1,
+                2,
+                &msg1.challenge_nonce,
+                &msg2.challenge_nonce,
+            ),
+        )
+        .unwrap()
+        .finalize()
+        .into_bytes()
+        .to_vec()
+    };
+    assert_ne!(msg2.secret_proof, raw_secret_proof(b":responder"));
+    assert_ne!(msg3.secret_proof, raw_secret_proof(b":initiator"));
+}
+
+/// Handshake rewriter simulating an active relay (crypto-review N3): every
+/// handshake packet is decoded, mutated, and re-encoded in flight. The
+/// rewrite callback receives the direction (`true` = initiator to
+/// responder) so tests can tamper one or both directions.
+type HandshakeRewrite = Box<dyn Fn(bool, &mut HandshakeRequest) + Send + Sync>;
+
+fn mitm_rewriting_tunnel_pair(rewrite: HandshakeRewrite) -> (Box<dyn Tunnel>, Box<dyn Tunnel>) {
+    fn endpoint(
+        tx: tokio::sync::mpsc::UnboundedSender<ZCPacket>,
+        rx: tokio::sync::mpsc::UnboundedReceiver<ZCPacket>,
+    ) -> Box<dyn Tunnel> {
+        let sink = futures::sink::unfold(tx, |tx, pkt: ZCPacket| async move {
+            tx.send(pkt).map_err(|_| TunnelError::Shutdown).map(|_| tx)
+        });
+        let stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|pkt| (Ok(pkt), rx))
+        });
+        Box::new(TunnelWrapper::new(Box::pin(stream), Box::pin(sink), None))
+    }
+
+    fn channel() -> (
+        tokio::sync::mpsc::UnboundedSender<ZCPacket>,
+        tokio::sync::mpsc::UnboundedReceiver<ZCPacket>,
+    ) {
+        tokio::sync::mpsc::unbounded_channel()
+    }
+
+    let (c_out_tx, mut c_out_rx) = channel(); // client -> mitm
+    let (s_in_tx, s_in_rx) = channel(); // mitm -> server
+    let (s_out_tx, mut s_out_rx) = channel(); // server -> mitm
+    let (c_in_tx, c_in_rx) = channel(); // mitm -> client
+
+    let client = endpoint(c_out_tx, c_in_rx);
+    let server = endpoint(s_out_tx, s_in_rx);
+
+    let rewrite = std::sync::Arc::new(rewrite);
+    tokio::spawn(async move {
+        fn forward(
+            pkt: ZCPacket,
+            initiator_to_responder: bool,
+            rewrite: &HandshakeRewrite,
+        ) -> ZCPacket {
+            let is_handshake = pkt
+                .peer_manager_header()
+                .is_some_and(|hdr| hdr.packet_type == PacketType::HandShake as u8);
+            if !is_handshake {
+                return pkt;
+            }
+            let mut req = HandshakeRequest::decode(pkt.payload()).unwrap();
+            rewrite(initiator_to_responder, &mut req);
+            let mut out = ZCPacket::new_with_payload(&req.encode_to_vec());
+            out.fill_peer_manager_hdr(
+                pkt.peer_manager_header().unwrap().from_peer_id.get(),
+                pkt.peer_manager_header().unwrap().to_peer_id.get(),
+                PacketType::HandShake as u8,
+            );
+            out
+        }
+
+        loop {
+            tokio::select! {
+                pkt = c_out_rx.recv() => {
+                    let Some(pkt) = pkt else { break };
+                    if s_in_tx.send(forward(pkt, true, &rewrite)).is_err() {
+                        break;
+                    }
+                }
+                pkt = s_out_rx.recv() => {
+                    let Some(pkt) = pkt else { break };
+                    if c_in_tx.send(forward(pkt, false, &rewrite)).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    (client, server)
+}
+
+/// Runs a secret-gated legacy handshake through a rewriting relay and
+/// returns both handshake results.
+async fn mitm_handshake(rewrite: HandshakeRewrite) -> (Result<(), Error>, Result<(), Error>) {
+    let (client_tunnel, server_tunnel) = mitm_rewriting_tunnel_pair(rewrite);
+    let mut client = PeerConn::new(
+        1,
+        secret_context("secret"),
+        client_tunnel,
+        Arc::new(PeerSessionStore::new()),
+    );
+    let mut server = PeerConn::new(
+        2,
+        secret_context("secret"),
+        server_tunnel,
+        Arc::new(PeerSessionStore::new()),
+    );
+    tokio::join!(
+        client.do_handshake_as_client(),
+        server.do_handshake_as_server()
+    )
+}
+
+fn strip_feature(feature: &str) -> impl Fn(bool, &mut HandshakeRequest) + Send + Sync + '_ {
+    move |_initiator_to_responder, req| {
+        req.features.retain(|f| f != feature);
+    }
+}
+
+#[tokio::test]
+async fn challenge_v2_peers_fall_back_to_v1_when_relay_strips_v2() {
+    // A relay (or a genuine pre-v2 peer) removes secret-challenge-v2 in both
+    // directions: both sides still declare secret-challenge-v1, so they fall
+    // back to the v1 flow and the handshake succeeds (interop preserved).
+    let (client_ret, server_ret) =
+        mitm_handshake(Box::new(strip_feature(SECRET_CHALLENGE_V2_FEATURE))).await;
+    client_ret.unwrap();
+    server_ret.unwrap();
 }
