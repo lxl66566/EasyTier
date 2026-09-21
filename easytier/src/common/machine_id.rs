@@ -90,6 +90,12 @@ fn default_linux_machine_id_state_dir(
 }
 
 fn default_machine_id_state_dir() -> anyhow::Result<PathBuf> {
+    default_state_dir()
+}
+
+/// Default per-user EasyTier state directory, shared by state that must
+/// survive restarts (machine id, quic server certificate).
+pub fn default_state_dir() -> anyhow::Result<PathBuf> {
     cfg_select! {
         target_os = "linux" => Ok(default_linux_machine_id_state_dir(
             env::var_os("XDG_DATA_HOME"),

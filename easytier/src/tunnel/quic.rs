@@ -1,11 +1,13 @@
-//! QUIC tunnels built on a custom quinn crypto session.
+//! QUIC tunnels with TLS 1.3 (quinn rustls) as the transport security layer.
 //!
-//! The session performs no handshake and no key exchange: packets are only
-//! guarded by an unkeyed SeaHash checksum, so `quic://` links provide
-//! integrity against accidental corruption but **no confidentiality or
-//! origin authentication** despite the QUIC/TLS name. Confidentiality must
-//! come from the EasyTier data plane (`enable_encryption`, or secure mode).
-//! Dialing or listening warns once per process (see [`warn_unencrypted`]).
+//! By default both sides speak standard QUIC version 1 with a rustls TLS 1.3
+//! handshake (AES-GCM/ChaCha20 via the ring provider). Servers present a
+//! self-signed certificate whose private key is persisted in the per-user
+//! state directory so the fingerprint is stable across restarts. Clients do
+//! not verify the certificate identity yet, so the tunnel is encrypted but
+//! not authenticated (see [`warn_no_pin`]); certificate pinning arrives in a
+//! follow-up change. The pre-TLS checksum-only session is kept as [`crypto`]
+//! (legacy) and the TLS path never falls back to it.
 
 use crate::proto::common::TunnelInfo;
 use anyhow::Context;
@@ -36,10 +38,15 @@ use tokio::{
 };
 use tokio_util::task::AbortOnDropHandle;
 
+mod cert;
 mod session_socket;
 pub(crate) use session_socket::QuicUdpSessionSocket;
 
 // region config
+/// Legacy quinn crypto session: no handshake, no key exchange; packets carry
+/// only an unkeyed SeaHash checksum (bound to the packet number on ETQ1).
+/// Kept for plaintext interop with peers that have not upgraded to the TLS
+/// transport; see [`legacy_server_config`] and [`legacy_client_config`].
 mod crypto {
     use crate::tunnel::quic::QUIC_VERSION_ETQ1;
     use crate::utils::BoxExt;
@@ -378,7 +385,8 @@ mod crypto {
 /// EasyTier custom QUIC version "ETQ1" (0x45545131, outside the reserved
 /// `0x??a?a?a?a` grease pattern).
 ///
-/// Connections negotiated on this version bind the packet integrity checksum
+/// ETQ1 belongs to the legacy plaintext session (see [`crypto`]):
+/// connections negotiated on this version bind the packet integrity checksum
 /// to the packet number. With the legacy checksum, a 1-byte-encoded packet
 /// number that arrives re-ordered beyond the decode window (RFC 9000
 /// Appendix A) is decoded as a future packet number; the checksum still
@@ -388,23 +396,33 @@ mod crypto {
 /// mirroring real QUIC where the AEAD nonce is derived from the packet
 /// number.
 ///
-/// Used by both the QUIC proxy and the quic:// tunnel. Peers that only speak
-/// version 1 reject it via version negotiation, so dialers must fall back to
-/// [`client_config`] on `VersionMismatch` (see [`connect_with_etq1`]).
+/// Used by plaintext dialers. Peers that only speak version 1 reject it via
+/// version negotiation, so plaintext dialers must fall back to version 1 on
+/// `VersionMismatch` (see [`connect_with_etq1`]).
 pub const QUIC_VERSION_ETQ1: u32 = 0x45545131;
 
-/// Warn once per process that QUIC tunnels are not transport-encrypted.
-///
-/// Fires from both [`client_config`] and [`server_config`], which every QUIC
-/// endpoint (tunnel dial/listen, QUIC proxy) goes through.
-fn warn_unencrypted() {
+/// Warn once per process that quic tunnels without a pinned fingerprint are
+/// encrypted but not authenticated.
+fn warn_no_pin() {
     static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     WARNED.get_or_init(|| {
         tracing::warn!(
-            "quic tunnels are not encrypted: EasyTier's QUIC transport uses a \
-             checksum-only session without TLS, so on-path attackers can read \
-             and inject packets. Confidentiality relies on EasyTier's own \
-             data-plane encryption (enable_encryption / secure mode)."
+            "quic server certificate is not verified: no fingerprint pinned in the \
+             peer url, so an active man-in-the-middle can impersonate the server. \
+             Append '#fingerprint=sha256:<hash>' to the peer url to pin it."
+        );
+    });
+}
+
+/// Warn once per process that a quic endpoint is running the legacy
+/// plaintext session, which provides no confidentiality or authentication.
+fn warn_plain() {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    WARNED.get_or_init(|| {
+        tracing::warn!(
+            "legacy plaintext quic mode: packets are only guarded by an unkeyed \
+             checksum, so on-path attackers can read and inject them. This mode \
+             exists for old peers; drop '#plain=1' to use TLS."
         );
     });
 }
@@ -424,24 +442,57 @@ pub fn transport_config() -> Arc<TransportConfig> {
     Arc::new(config)
 }
 
-pub fn server_config() -> ServerConfig {
-    warn_unencrypted();
+/// TLS 1.3 server config presenting the persisted self-signed certificate
+/// (see [`cert`]). Fails loudly when the persisted certificate file is
+/// broken.
+pub fn server_config() -> anyhow::Result<ServerConfig> {
+    let server_cert = cert::quic_server_cert()?;
+    let quic_tls = quinn::crypto::rustls::QuicServerConfig::try_from(server_cert.tls_config())
+        .context("build quic TLS server config")?;
+    let mut config = ServerConfig::with_crypto(Arc::new(quic_tls));
+    config.transport_config(transport_config());
+    Ok(config)
+}
+
+/// TLS 1.3 client config that accepts any server certificate: the tunnel is
+/// encrypted but not authenticated ([`warn_no_pin`] fires once per process).
+pub fn client_config() -> ClientConfig {
+    warn_no_pin();
+    let mut tls = super::tls_verification::tls_client_config(None);
+    tls.alpn_protocols = vec![cert::QUIC_ALPN.to_vec()];
+    let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
+        .expect("ring TLS 1.3 always provides an initial cipher suite");
+    let mut config = ClientConfig::new(Arc::new(quic_tls));
+    // Standard version 1 only: the TLS path never follows a version
+    // negotiation towards the legacy plaintext versions.
+    config.version(1);
+    config.transport_config(transport_config());
+    config
+}
+
+/// Legacy checksum-only server config: no handshake, no key exchange, no
+/// confidentiality. Kept for plaintext interop with peers that have not
+/// upgraded.
+pub fn legacy_server_config() -> ServerConfig {
+    warn_plain();
     let mut config = ServerConfig::with_crypto(Arc::new(crypto::CryptoConfig));
     config.transport_config(transport_config());
     config
 }
 
-pub fn client_config() -> ClientConfig {
-    warn_unencrypted();
+/// Legacy checksum-only client config (plaintext, version 1).
+pub fn legacy_client_config() -> ClientConfig {
+    warn_plain();
     let mut config = ClientConfig::new(Arc::new(crypto::CryptoConfig));
+    config.version(1);
     config.transport_config(transport_config());
     config
 }
 
-/// Client config negotiating [`QUIC_VERSION_ETQ1`], the first choice of
-/// dialers that support the fallback (see [`connect_with_etq1`]).
-pub fn etq1_client_config() -> ClientConfig {
-    let mut config = client_config();
+/// Legacy checksum-only client config negotiating [`QUIC_VERSION_ETQ1`],
+/// the first choice of plaintext dialers (see [`connect_with_etq1`]).
+pub fn legacy_etq1_client_config() -> ClientConfig {
+    let mut config = legacy_client_config();
     config.version(QUIC_VERSION_ETQ1);
     config
 }
@@ -453,27 +504,37 @@ pub(crate) fn endpoint_config_with_versions(versions: Vec<u32>) -> EndpointConfi
     config
 }
 
-/// Endpoint config accepting both [`QUIC_VERSION_ETQ1`] and legacy version
-/// 1, so new dialers negotiate ETQ1 while old peers keep working.
+/// Endpoint config for the TLS path: version 1 only, both for outgoing
+/// connections and for the version list advertised in version negotiation.
+/// A spoofed version negotiation can therefore never steer a TLS endpoint
+/// onto a legacy plaintext version.
 pub fn endpoint_config() -> EndpointConfig {
+    endpoint_config_with_versions(vec![1])
+}
+
+/// Endpoint config for the legacy plaintext path, accepting both
+/// [`QUIC_VERSION_ETQ1`] and version 1 so plaintext peers of either vintage
+/// keep working.
+pub fn legacy_endpoint_config() -> EndpointConfig {
     endpoint_config_with_versions(vec![QUIC_VERSION_ETQ1, 1])
 }
 
 /// Dial `endpoint` preferring [`QUIC_VERSION_ETQ1`], falling back to legacy
-/// version 1 when the remote rejects ETQ1 via version negotiation.
+/// version 1 when the remote rejects ETQ1 via version negotiation. Both
+/// legs speak the legacy plaintext session.
 pub(crate) async fn connect_with_etq1(
     endpoint: &Endpoint,
     addr: SocketAddr,
     server_name: &str,
 ) -> anyhow::Result<Connection> {
     match endpoint
-        .connect_with(etq1_client_config(), addr, server_name)
+        .connect_with(legacy_etq1_client_config(), addr, server_name)
         .with_context(|| format!("failed to start connection to {addr}"))?
         .await
     {
         Ok(connection) => Ok(connection),
         Err(ConnectionError::VersionMismatch) => endpoint
-            .connect_with(client_config(), addr, server_name)
+            .connect_with(legacy_client_config(), addr, server_name)
             .with_context(|| format!("failed to start connection to {addr}"))?
             .await
             .with_context(|| format!("failed to connect to {addr}")),
@@ -508,7 +569,11 @@ pub(crate) async fn upgrade_connected(
     let mut endpoint =
         Endpoint::new_with_abstract_socket(endpoint_config(), None, socket, runtime)?;
     endpoint.set_default_client_config(client_config());
-    let connection = connect_with_etq1(&endpoint, remote_addr, "localhost").await?;
+    let connection = endpoint
+        .connect(remote_addr, "localhost")
+        .with_context(|| format!("failed to start connection to {remote_addr}"))?
+        .await
+        .with_context(|| format!("failed to connect to {remote_addr}"))?;
     let (write, read) = connection
         .open_bi()
         .await
@@ -671,7 +736,7 @@ impl QuicAcceptedSession {
         ))?;
         let endpoint = Endpoint::new_with_abstract_socket(
             endpoint_config(),
-            Some(server_config()),
+            Some(server_config()?),
             socket,
             runtime,
         )?;
