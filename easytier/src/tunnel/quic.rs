@@ -3,11 +3,16 @@
 //! By default both sides speak standard QUIC version 1 with a rustls TLS 1.3
 //! handshake (AES-GCM/ChaCha20 via the ring provider). Servers present a
 //! self-signed certificate whose private key is persisted in the per-user
-//! state directory so the fingerprint is stable across restarts. Clients do
-//! not verify the certificate identity yet, so the tunnel is encrypted but
-//! not authenticated (see [`warn_no_pin`]); certificate pinning arrives in a
-//! follow-up change. The pre-TLS checksum-only session is kept as [`crypto`]
-//! (legacy) and the TLS path never falls back to it.
+//! state directory so the fingerprint is stable across restarts; clients can
+//! pin it via the peer url fragment `#fingerprint=sha256:<hex>`. Without a
+//! pin the tunnel is encrypted but not authenticated (an active
+//! man-in-the-middle can impersonate the server); see [`warn_no_pin`].
+//!
+//! The pre-TLS checksum-only session is kept as an explicitly opt-in legacy
+//! mode for peers that have not upgraded: append `#plain=1` to the peer url
+//! to dial plaintext, or to the listener url to accept plaintext (the
+//! listener then serves legacy clients only, not TLS). No TLS-to-plaintext
+//! fallback ever happens automatically; see [`warn_plain`].
 
 use crate::proto::common::TunnelInfo;
 use anyhow::Context;
@@ -45,8 +50,9 @@ pub(crate) use session_socket::QuicUdpSessionSocket;
 // region config
 /// Legacy quinn crypto session: no handshake, no key exchange; packets carry
 /// only an unkeyed SeaHash checksum (bound to the packet number on ETQ1).
-/// Kept for plaintext interop with peers that have not upgraded to the TLS
-/// transport; see [`legacy_server_config`] and [`legacy_client_config`].
+/// Reached solely through the `#plain=1` opt-in for peers that have not
+/// upgraded to the TLS transport; see [`legacy_server_config`] and
+/// [`legacy_client_config`].
 mod crypto {
     use crate::tunnel::quic::QUIC_VERSION_ETQ1;
     use crate::utils::BoxExt;
@@ -396,9 +402,9 @@ mod crypto {
 /// mirroring real QUIC where the AEAD nonce is derived from the packet
 /// number.
 ///
-/// Used by plaintext dialers. Peers that only speak version 1 reject it via
-/// version negotiation, so plaintext dialers must fall back to version 1 on
-/// `VersionMismatch` (see [`connect_with_etq1`]).
+/// Used by the `#plain=1` paths of the quic:// tunnel. Peers that only speak
+/// version 1 reject it via version negotiation, so plaintext dialers must
+/// fall back to version 1 on `VersionMismatch` (see [`connect_with_etq1`]).
 pub const QUIC_VERSION_ETQ1: u32 = 0x45545131;
 
 /// Warn once per process that quic tunnels without a pinned fingerprint are
@@ -457,8 +463,20 @@ pub fn server_config() -> anyhow::Result<ServerConfig> {
 /// TLS 1.3 client config that accepts any server certificate: the tunnel is
 /// encrypted but not authenticated ([`warn_no_pin`] fires once per process).
 pub fn client_config() -> ClientConfig {
-    warn_no_pin();
-    let mut tls = super::tls_verification::tls_client_config(None);
+    tls_client_config(None)
+}
+
+/// TLS 1.3 client config that fails closed unless the server certificate
+/// matches the pinned SHA-256 `fingerprint`.
+pub fn pinned_client_config(fingerprint: [u8; 32]) -> ClientConfig {
+    tls_client_config(Some(fingerprint))
+}
+
+fn tls_client_config(pinned: Option<[u8; 32]>) -> ClientConfig {
+    if pinned.is_none() {
+        warn_no_pin();
+    }
+    let mut tls = super::tls_verification::tls_client_config(pinned);
     tls.alpn_protocols = vec![cert::QUIC_ALPN.to_vec()];
     let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
         .expect("ring TLS 1.3 always provides an initial cipher suite");
@@ -471,8 +489,8 @@ pub fn client_config() -> ClientConfig {
 }
 
 /// Legacy checksum-only server config: no handshake, no key exchange, no
-/// confidentiality. Kept for plaintext interop with peers that have not
-/// upgraded.
+/// confidentiality. Only reachable through the explicit `#plain=1`
+/// listener opt-in.
 pub fn legacy_server_config() -> ServerConfig {
     warn_plain();
     let mut config = ServerConfig::with_crypto(Arc::new(crypto::CryptoConfig));
@@ -519,6 +537,74 @@ pub fn legacy_endpoint_config() -> EndpointConfig {
     endpoint_config_with_versions(vec![QUIC_VERSION_ETQ1, 1])
 }
 
+/// Connection options carried in quic url fragments:
+///
+/// - `#fingerprint=sha256:<hex>` (peer urls): pin the TLS server certificate,
+///   failing closed on mismatch or malformed value.
+/// - `#plain=1` (peer or listener urls): use the legacy plaintext session.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuicUrlOptions {
+    pub(crate) plain: bool,
+    fingerprint: Option<[u8; 32]>,
+}
+
+impl QuicUrlOptions {
+    /// TLS client config matching these options (only meaningful for peer
+    /// urls; see [`url_options`]).
+    pub(crate) fn tls_client_config(self) -> ClientConfig {
+        match self.fingerprint {
+            Some(fingerprint) => pinned_client_config(fingerprint),
+            None => client_config(),
+        }
+    }
+}
+
+/// Parses quic connection options from the url fragment. Unknown pairs are
+/// ignored for forward compatibility; a present but malformed `plain` or
+/// `fingerprint` value is an error, and combining `#plain=1` with a pin is
+/// rejected because plaintext has no certificate to verify.
+pub(crate) fn url_options(url: &url::Url) -> Result<QuicUrlOptions, TunnelError> {
+    let mut options = QuicUrlOptions::default();
+    let Some(fragment) = url.fragment() else {
+        return Ok(options);
+    };
+    for pair in fragment.split('&') {
+        if let Some(value) = pair.strip_prefix("plain=") {
+            options.plain = match value {
+                "1" => true,
+                "0" => false,
+                _ => {
+                    return Err(TunnelError::InvalidProtocol(format!(
+                        "invalid quic plain option in url fragment: {value} (expected 1 or 0)"
+                    )));
+                }
+            };
+        }
+    }
+    options.fingerprint = super::tls_verification::pinned_fingerprint(url)?;
+    if options.plain && options.fingerprint.is_some() {
+        return Err(TunnelError::InvalidProtocol(
+            "#plain=1 speaks plaintext quic, so a pinned fingerprint cannot be verified; \
+             remove one of the two options"
+                .to_owned(),
+        ));
+    }
+    Ok(options)
+}
+
+/// Listener-side variant of [`url_options`]: `#plain=1` selects the legacy
+/// plaintext listener; fingerprint pins are rejected because a listener has
+/// no server certificate to verify.
+pub(crate) fn listener_url_options(url: &url::Url) -> Result<QuicUrlOptions, TunnelError> {
+    let options = url_options(url)?;
+    if options.fingerprint.is_some() {
+        return Err(TunnelError::InvalidProtocol(
+            "fingerprint pins belong in peer urls, not quic listener urls".to_owned(),
+        ));
+    }
+    Ok(options)
+}
+
 /// Dial `endpoint` preferring [`QUIC_VERSION_ETQ1`], falling back to legacy
 /// version 1 when the remote rejects ETQ1 via version negotiation. Both
 /// legs speak the legacy plaintext session.
@@ -560,20 +646,33 @@ pub(crate) async fn upgrade_connected(
     connected: ConnectedUdpSession,
     remote_url: url::Url,
 ) -> Result<Box<dyn Tunnel>, TunnelError> {
+    let options = url_options(&remote_url)?;
     let socket = Arc::new(QuicUdpSessionSocket::new(connected)?);
     let local_addr = socket.local_addr()?;
     let remote_addr = socket.peer_addr();
     let runtime = default_runtime().ok_or(TunnelError::InternalError(
         "no async runtime found".to_owned(),
     ))?;
-    let mut endpoint =
-        Endpoint::new_with_abstract_socket(endpoint_config(), None, socket, runtime)?;
-    endpoint.set_default_client_config(client_config());
-    let connection = endpoint
-        .connect(remote_addr, "localhost")
-        .with_context(|| format!("failed to start connection to {remote_addr}"))?
-        .await
-        .with_context(|| format!("failed to connect to {remote_addr}"))?;
+    let mut endpoint = Endpoint::new_with_abstract_socket(
+        if options.plain {
+            legacy_endpoint_config()
+        } else {
+            endpoint_config()
+        },
+        None,
+        socket,
+        runtime,
+    )?;
+    let connection = if options.plain {
+        connect_with_etq1(&endpoint, remote_addr, "localhost").await?
+    } else {
+        endpoint.set_default_client_config(options.tls_client_config());
+        endpoint
+            .connect(remote_addr, "localhost")
+            .with_context(|| format!("failed to start connection to {remote_addr}"))?
+            .await
+            .with_context(|| format!("failed to connect to {remote_addr}"))?
+    };
     let (write, read) = connection
         .open_bi()
         .await
@@ -727,6 +826,7 @@ impl QuicAcceptedSession {
         active_session: OwnedSemaphorePermit,
         handshakes: Arc<Semaphore>,
     ) -> Result<Self, TunnelError> {
+        let options = listener_url_options(&local_url)?;
         let socket = Arc::new(QuicUdpSessionSocket::from_accepted(
             session,
             active_session,
@@ -734,12 +834,17 @@ impl QuicAcceptedSession {
         let runtime = default_runtime().ok_or(TunnelError::InternalError(
             "no async runtime found".to_owned(),
         ))?;
-        let endpoint = Endpoint::new_with_abstract_socket(
-            endpoint_config(),
-            Some(server_config()?),
-            socket,
-            runtime,
-        )?;
+        // `#plain=1` serves the legacy plaintext session only (no TLS on the
+        // same port): a version-1 Initial packet is ambiguous between the
+        // legacy checksum session and TLS, so accepting both is not possible
+        // without trying to decrypt every packet with both key sets.
+        let (endpoint_conf, server_conf) = if options.plain {
+            (legacy_endpoint_config(), legacy_server_config())
+        } else {
+            (endpoint_config(), server_config()?)
+        };
+        let endpoint =
+            Endpoint::new_with_abstract_socket(endpoint_conf, Some(server_conf), socket, runtime)?;
         let (completed_tx, completed) = channel(100);
         let accept_task = AbortOnDropHandle::new(tokio::spawn(run_quic_accepted_session(
             endpoint,
@@ -788,8 +893,10 @@ mod tests {
             UdpBindOptions, UdpSessionAcceptKind, UdpSessionListenRequest, UdpSessionProtocol,
             VirtualUdpSocket,
         },
+        tunnel::fingerprint::format_sha256_fingerprint,
     };
     use futures::{SinkExt, StreamExt};
+    use tokio::task::JoinHandle;
 
     use crate::{
         common::netns::NetNS, host_runtime::native_host_runtime,
@@ -797,6 +904,193 @@ mod tests {
     };
 
     use super::*;
+
+    /// Spawns a quic listener with `fragment` appended to its url and echoes
+    /// every accepted tunnel until the returned task is aborted.
+    async fn spawn_echo_listener(fragment: &str) -> (SocketAddr, JoinHandle<()>) {
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut listener = new_runtime_udp_session_listener(
+            format!("quic://{bind_addr}{fragment}").parse().unwrap(),
+            UdpSessionListenRequest::new(
+                UdpBindOptions::port_bound_listener(bind_addr).with_only_v6(false),
+            ),
+            UdpSessionAcceptKind::Classified(UdpSessionProtocol::Quic),
+            NetNS::new(None),
+        );
+        listener.listen().await.unwrap();
+        let remote_addr = listener.bound_socket().unwrap().local_addr().unwrap();
+        let local_url = listener.local_url();
+        let task = tokio::spawn(async move {
+            let session = listener.accept().await.unwrap();
+            let admission = ServerProtocolAdmissionController::quic()
+                .try_admit()
+                .unwrap();
+            let mut accepted = QuicAcceptedSession::new(session, local_url, admission).unwrap();
+            while let Ok(tunnel) = accepted.accept().await {
+                _tunnel_echo_server(tunnel, false).await;
+            }
+        });
+        (remote_addr, task)
+    }
+
+    /// Dials a quic tunnel through the full client path, including fragment
+    /// parsing.
+    async fn connect_tunnel(
+        remote_addr: SocketAddr,
+        fragment: &str,
+    ) -> Result<Box<dyn Tunnel>, TunnelError> {
+        let connected = connect_udp(
+            native_host_runtime(),
+            remote_addr,
+            Vec::new(),
+            UdpBindOptions::direct_connect(),
+            UdpSessionMode::Classified(UdpSessionProtocol::Quic),
+        )
+        .await
+        .unwrap();
+        let remote_url: url::Url = format!("quic://{remote_addr}{fragment}").parse().unwrap();
+        upgrade_connected(connected, remote_url).await
+    }
+
+    async fn assert_tunnel_echo(tunnel: Box<dyn Tunnel>, payload: &[u8]) {
+        let (mut recv, mut send) = tunnel.split();
+        send.send(ZCPacket::new_with_payload(payload))
+            .await
+            .unwrap();
+        let packet = tokio::time::timeout(Duration::from_secs(5), recv.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(packet.payload(), payload);
+        let _ = send.close().await;
+    }
+
+    fn pinned_fingerprint_of_process_cert() -> String {
+        format_sha256_fingerprint(&cert::quic_server_cert().unwrap().fingerprint())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tls_tunnel_roundtrip_with_pin() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (remote_addr, server_task) = spawn_echo_listener("").await;
+            let pin = pinned_fingerprint_of_process_cert();
+            let tunnel = connect_tunnel(remote_addr, &format!("#fingerprint={pin}"))
+                .await
+                .unwrap();
+            assert_tunnel_echo(tunnel, b"pinned quic tls").await;
+            server_task.abort();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tls_tunnel_rejects_wrong_pin() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (remote_addr, server_task) = spawn_echo_listener("").await;
+            let mut fingerprint = cert::quic_server_cert().unwrap().fingerprint();
+            fingerprint[0] ^= 0xff;
+            let pin = format_sha256_fingerprint(&fingerprint);
+            let error = connect_tunnel(remote_addr, &format!("#fingerprint={pin}"))
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{error:?}").to_lowercase().contains("fingerprint"),
+                "unexpected error: {error:?}"
+            );
+            server_task.abort();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plain_tunnel_interops_with_plain_listener() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            // Both sides opted into '#plain=1': the legacy checksum session
+            // must still work end to end.
+            let (remote_addr, server_task) = spawn_echo_listener("#plain=1").await;
+            let tunnel = connect_tunnel(remote_addr, "#plain=1").await.unwrap();
+            assert_tunnel_echo(tunnel, b"legacy plaintext quic").await;
+            server_task.abort();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tls_client_does_not_fall_back_to_plain_listener() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            // A TLS client against a '#plain=1' listener must not silently
+            // downgrade: the handshake cannot succeed and no fallback runs.
+            let (remote_addr, server_task) = spawn_echo_listener("#plain=1").await;
+            let result =
+                tokio::time::timeout(Duration::from_secs(2), connect_tunnel(remote_addr, "")).await;
+            assert!(
+                result.is_err(),
+                "TLS client must not reach a plain listener"
+            );
+            server_task.abort();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn url_options_parse_plain_and_pins() {
+        assert_eq!(
+            url_options(&"quic://h:1".parse().unwrap()).unwrap(),
+            QuicUrlOptions::default()
+        );
+        assert!(
+            url_options(&"quic://h:1#plain=1".parse().unwrap())
+                .unwrap()
+                .plain
+        );
+        assert!(
+            !url_options(&"quic://h:1#plain=0".parse().unwrap())
+                .unwrap()
+                .plain
+        );
+        // unknown pairs are ignored
+        assert!(
+            url_options(&"quic://h:1#other=1&plain=1".parse().unwrap())
+                .unwrap()
+                .plain
+        );
+        // malformed values fail closed instead of silently disabling the opt-in
+        assert!(url_options(&"quic://h:1#plain=yes".parse().unwrap()).is_err());
+        assert!(url_options(&"quic://h:1#fingerprint=sha256:not-hex".parse().unwrap()).is_err());
+
+        let digest = [0xabu8; 32];
+        let value = format_sha256_fingerprint(&digest);
+        let options =
+            url_options(&format!("quic://h:1#fingerprint={value}").parse().unwrap()).unwrap();
+        assert_eq!(options.fingerprint, Some(digest));
+
+        // plain + pin is contradictory: plaintext has no certificate
+        assert!(
+            url_options(
+                &format!("quic://h:1#plain=1&fingerprint={value}")
+                    .parse()
+                    .unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn listener_options_reject_pins() {
+        assert!(
+            listener_url_options(&"quic://h:1#plain=1".parse().unwrap())
+                .unwrap()
+                .plain
+        );
+        assert!(
+            listener_url_options(&"quic://h:1#fingerprint=sha256:abc".parse().unwrap()).is_err()
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn accepted_udp_session_supports_multiple_quic_connections() {
