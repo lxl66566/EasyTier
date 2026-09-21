@@ -285,7 +285,15 @@ sudo easytier-core --network-name mysharednode --network-secret mysharednode
 
 #### Transport Security
 
-Despite the name, EasyTier's `quic://` tunnels are **not encrypted by the transport**: the QUIC layer uses a checksum-only session without a TLS handshake, so anyone on the network path can read and inject packets. Confidentiality and integrity should come from EasyTier's data-plane encryption — keep `enable_encryption` enabled (default) or, ideally, enable secure mode.
+`quic://` tunnels run a real TLS 1.3 handshake (quinn/rustls with the ring provider); the QUIC transport is encrypted and integrity-protected on its own. The server presents a self-signed certificate whose private key is persisted in the per-user EasyTier state directory (e.g. `~/.local/share/easytier/quic-server-key.pem` on Linux, `%LOCALAPPDATA%\easytier\` on Windows), so the certificate fingerprint is stable across restarts. By default the client does not verify the certificate identity, which means an active man-in-the-middle can still impersonate the server. To prevent that, pin the server certificate fingerprint in the peer URL fragment:
+
+```bash
+sudo easytier-core -p 'quic://server.example.com:11010#fingerprint=sha256:<64-hex-chars>'
+```
+
+The fingerprint of a node's quic listener certificate is logged when the listener starts. A pinned connection whose fingerprint does not match is rejected (fail closed).
+
+For peers that have not upgraded to the TLS transport yet, the old checksum-only (plaintext) session is available as an explicit opt-in: append `#plain=1` to the peer URL to dial plaintext, or to the listener URL (`-l 'quic://0.0.0.0:11010#plain=1'`) to serve plaintext clients. A `#plain=1` listener accepts legacy clients only — TLS and plaintext cannot share one port — and no TLS-to-plaintext fallback ever happens automatically. Plaintext mode provides no encryption or authentication and logs a warning; keep `enable_encryption` (default) or secure mode enabled for such links.
 
 `wss://` tunnels do run TLS, but by default the client accepts any server certificate, so an active man-in-the-middle can still impersonate the server. To prevent that, pin the server certificate fingerprint in the peer URL fragment:
 

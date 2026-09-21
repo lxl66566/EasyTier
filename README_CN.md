@@ -284,7 +284,15 @@ sudo easytier-core --network-name mysharednode --network-secret mysharednode
 
 #### 传输层安全
 
-与名称给人的印象不同，EasyTier 的 `quic://` 隧道**在传输层并不加密**：QUIC 层使用仅带校验和的自定义会话，没有 TLS 握手，网络路径上的任何人都可以读取和注入报文。机密性与完整性应由 EasyTier 自身的数据面加密提供——保持 `enable_encryption` 开启（默认）或更优的 secure mode。
+`quic://` 隧道运行真正的 TLS 1.3 握手（quinn/rustls，ring provider），QUIC 传输层自身即具备加密与完整性保护。服务器使用自签证书，其私钥持久化在用户的 EasyTier 状态目录中（如 Linux 的 `~/.local/share/easytier/quic-server-key.pem`、Windows 的 `%LOCALAPPDATA%\easytier\`），因此证书指纹跨重启保持稳定。默认情况下客户端不校验证书身份，主动中间人仍可冒充服务器。可在节点 URL 的 fragment 中固定服务器证书指纹来防范：
+
+```bash
+sudo easytier-core -p 'quic://server.example.com:11010#fingerprint=sha256:<64位十六进制>'
+```
+
+节点 `quic://` 监听器启动时会在日志中打印其证书指纹。固定了指纹的连接一旦不匹配即被拒绝（fail-closed）。
+
+对于尚未升级到 TLS 传输的对端，旧的仅校验和（明文）会话保留为显式开关：在节点 URL 后附加 `#plain=1` 以明文拨号，或在监听 URL 后附加（`-l 'quic://0.0.0.0:11010#plain=1'`）以接收明文客户端。`#plain=1` 监听器只接收旧版客户端——TLS 与明文无法共用同一端口——且任何 TLS 到明文的回退都不会自动发生。明文模式不提供加密与认证，并会打印警告；此类链路请保持 `enable_encryption`（默认）或 secure mode 开启。
 
 `wss://` 隧道虽然使用 TLS，但默认情况下客户端接受任意服务器证书，主动中间人仍可冒充服务器。可在节点 URL 的 fragment 中固定服务器证书指纹来防范：
 
