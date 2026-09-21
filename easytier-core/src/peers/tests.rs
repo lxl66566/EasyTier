@@ -14,7 +14,8 @@ use crate::{
         PeerConnectionOrigin, PeerPacketIngress,
         conn::{
             peer_conn::{
-                PeerConn, PeerConnId, SECRET_CHALLENGE_FEATURE, SECRET_CHALLENGE_V2_FEATURE,
+                KDF_V2_FEATURE, PeerConn, PeerConnId, SECRET_CHALLENGE_FEATURE,
+                SECRET_CHALLENGE_V2_FEATURE,
             },
             peer_map::PeerMap,
             peer_session::PeerSessionStore,
@@ -726,10 +727,25 @@ fn v2_transcript(
     responder_peer_id: u32,
     initiator_nonce: &[u8],
     responder_nonce: &[u8],
+    initiator_features: &[String],
+    responder_features: &[String],
 ) -> Vec<u8> {
     fn put_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
         buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
         buf.extend_from_slice(bytes);
+    }
+    // Sorted, length-prefixed feature lists mirroring the production
+    // canonical encoding (crypto-review N3).
+    fn canonical_features(features: &[String]) -> Vec<u8> {
+        let mut sorted: Vec<&str> = features.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(sorted.len() as u32).to_be_bytes());
+        for feature in sorted {
+            buf.extend_from_slice(&(feature.len() as u32).to_be_bytes());
+            buf.extend_from_slice(feature.as_bytes());
+        }
+        buf
     }
 
     let mut buf = Vec::new();
@@ -740,6 +756,8 @@ fn v2_transcript(
     buf.extend_from_slice(&responder_peer_id.to_be_bytes());
     put_len_prefixed(&mut buf, initiator_nonce);
     put_len_prefixed(&mut buf, responder_nonce);
+    put_len_prefixed(&mut buf, &canonical_features(initiator_features));
+    put_len_prefixed(&mut buf, &canonical_features(responder_features));
     buf
 }
 
@@ -760,7 +778,17 @@ fn challenge_v2_stretched_proof_is_not_recomputable_from_the_raw_secret() {
     // Pure-property check for N2: the v2 proof key must be the argon2id
     // stretched secret, never the raw secret bytes (guards against
     // implementation regressions to the v1 keying).
-    let transcript = v2_transcript(b":initiator", "net", 1, 2, &[1u8; 32], &[2u8; 32]);
+    let features = ["a".to_string(), "b".to_string()];
+    let transcript = v2_transcript(
+        b":initiator",
+        "net",
+        1,
+        2,
+        &[1u8; 32],
+        &[2u8; 32],
+        &features,
+        &features,
+    );
     let stretched = hmac_sha256(&derive_challenge_key_argon2id("secret"), &transcript);
     let raw = hmac_sha256(b"secret", &transcript);
     assert_ne!(stretched, raw);
@@ -774,8 +802,8 @@ fn challenge_v2_stretched_proof_is_not_recomputable_from_the_raw_secret() {
 async fn challenge_v2_handshake_proves_with_stretched_key() {
     // Both sides are current builds, so the handshake must negotiate v2 and
     // both proofs must verify under the argon2id-stretched key. The proofs
-    // are recomputed here from the captured wire to pin the actual version
-    // and keying used on the wire.
+    // are recomputed here from the captured wire to pin the actual version,
+    // keying, and feature binding used on the wire.
     let (client_tunnel, server_tunnel, client_log, server_log) = recording_channel_tunnel_pair();
     let mut client = PeerConn::new(
         1,
@@ -814,30 +842,31 @@ async fn challenge_v2_handshake_proves_with_stretched_key() {
     );
 
     let stretched = derive_challenge_key_argon2id("secret");
-    let responder_proof = hmac_sha256(
-        &stretched,
-        &v2_transcript(
-            b":responder",
-            "net",
-            1,
-            2,
-            &msg1.challenge_nonce,
-            &msg2.challenge_nonce,
-        ),
+    let expected = |role: &[u8], proof_features: &[Vec<String>]| {
+        hmac_sha256(
+            &stretched,
+            &v2_transcript(
+                role,
+                "net",
+                1,
+                2,
+                &msg1.challenge_nonce,
+                &msg2.challenge_nonce,
+                &proof_features[0],
+                &proof_features[1],
+            ),
+        )
+    };
+    // Both proofs bind both feature declarations as seen on the wire.
+    let wire_features = [msg1.features.clone(), msg2.features.clone()];
+    assert_eq!(
+        msg2.secret_proof,
+        expected(b":responder", &wire_features).to_vec()
     );
-    let initiator_proof = hmac_sha256(
-        &stretched,
-        &v2_transcript(
-            b":initiator",
-            "net",
-            1,
-            2,
-            &msg1.challenge_nonce,
-            &msg2.challenge_nonce,
-        ),
+    assert_eq!(
+        msg3.secret_proof,
+        expected(b":initiator", &wire_features).to_vec()
     );
-    assert_eq!(msg2.secret_proof, responder_proof.to_vec());
-    assert_eq!(msg3.secret_proof, initiator_proof.to_vec());
 
     // The same proofs must NOT verify under v1 keying: they are stretched,
     // not raw-secret HMACs.
@@ -852,6 +881,8 @@ async fn challenge_v2_handshake_proves_with_stretched_key() {
                 2,
                 &msg1.challenge_nonce,
                 &msg2.challenge_nonce,
+                &msg1.features,
+                &msg2.features,
             ),
         )
         .unwrap()
@@ -980,4 +1011,68 @@ async fn challenge_v2_peers_fall_back_to_v1_when_relay_strips_v2() {
         mitm_handshake(Box::new(strip_feature(SECRET_CHALLENGE_V2_FEATURE))).await;
     client_ret.unwrap();
     server_ret.unwrap();
+}
+
+#[tokio::test]
+async fn challenge_v2_rejects_relay_stripping_kdf_v2_from_the_initiator() {
+    // crypto-review N3: a malicious relay strips kdf-v2 from the initiator's
+    // declaration (initiator -> responder direction only). The responder
+    // proves over the stripped list it saw, the initiator recomputes with its
+    // own intact list, and the proof mismatch refuses the downgraded
+    // handshake instead of silently falling back to SipHash keys.
+    let strip_one_direction = |feature: &'static str| {
+        move |initiator_to_responder: bool, req: &mut HandshakeRequest| {
+            if initiator_to_responder {
+                req.features.retain(|f| f != feature);
+            }
+        }
+    };
+    let (client_ret, server_ret) =
+        mitm_handshake(Box::new(strip_one_direction(KDF_V2_FEATURE))).await;
+    assert!(
+        matches!(client_ret.unwrap_err(), Error::SecretKeyError(e) if e.contains("proof mismatch")),
+        "the initiator must reject the tampered proof"
+    );
+    // The responder fails too: the initiator never sends a valid msg3 after
+    // rejecting msg2 (timeout or closed conn).
+    assert!(server_ret.is_err());
+}
+
+#[tokio::test]
+async fn challenge_v2_rejects_relay_stripping_kdf_v2_from_the_responder() {
+    // Same attack on the responder -> initiator direction: the responder
+    // signed its full feature list, the initiator verifies against the
+    // stripped list it received, and the proof fails.
+    let strip_one_direction = |feature: &'static str| {
+        move |initiator_to_responder: bool, req: &mut HandshakeRequest| {
+            if !initiator_to_responder {
+                req.features.retain(|f| f != feature);
+            }
+        }
+    };
+    let (client_ret, server_ret) =
+        mitm_handshake(Box::new(strip_one_direction(KDF_V2_FEATURE))).await;
+    assert!(
+        matches!(client_ret.unwrap_err(), Error::SecretKeyError(e) if e.contains("proof mismatch")),
+        "the initiator must reject the stripped responder declaration"
+    );
+    assert!(server_ret.is_err());
+}
+
+#[test]
+fn canonical_feature_encoding_is_order_independent_and_unambiguous() {
+    use crate::peers::conn::peer_conn::canonical_features;
+
+    let a = ["kdf-v2".to_string(), "header-aad-v1".to_string()];
+    let b = ["header-aad-v1".to_string(), "kdf-v2".to_string()];
+    assert_eq!(canonical_features(&a), canonical_features(&b));
+
+    // Length prefixes keep concatenated and split lists distinct: no two
+    // different declarations may produce the same transcript bytes.
+    let concatenated = ["kdf-v2header-aad-v1".to_string()];
+    let split = ["kdf-v2header-aad".to_string(), "-v1".to_string()];
+    assert_ne!(
+        canonical_features(&concatenated),
+        canonical_features(&split)
+    );
 }

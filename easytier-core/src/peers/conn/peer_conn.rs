@@ -180,10 +180,31 @@ fn challenge_transcript(
     buf
 }
 
-/// Domain-separated transcript for `secret-challenge-v2` proofs. Same fields
-/// as the v1 transcript under a distinct prefix, so v1 and v2 proofs over
-/// identical handshakes are unrelated and a version-confusion attack fails
-/// closed on proof mismatch.
+/// Canonical encoding of one side's declared handshake feature list for
+/// `secret-challenge-v2` transcripts (crypto-review N3).
+///
+/// Sorted and length-prefixed so the encoding is unambiguous and
+/// order-independent; both sides derive the identical bytes from the feature
+/// lists they saw on the wire. Every proof covers both sides' lists, so a
+/// relay stripping or forging any feature bit breaks the proof of whichever
+/// side received the tampered list.
+pub(crate) fn canonical_features(features: &[String]) -> Vec<u8> {
+    let mut sorted: Vec<&str> = features.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let mut buf = Vec::with_capacity(4 + sorted.len() * 8);
+    buf.extend_from_slice(&(sorted.len() as u32).to_be_bytes());
+    for feature in sorted {
+        buf.extend_from_slice(&(feature.len() as u32).to_be_bytes());
+        buf.extend_from_slice(feature.as_bytes());
+    }
+    buf
+}
+
+/// Domain-separated transcript for `secret-challenge-v2` proofs. Extends the
+/// v1 fields under a distinct prefix with both sides' canonically encoded
+/// feature declarations, so v1 and v2 proofs over identical handshakes are
+/// unrelated (version confusion fails closed) and feature stripping is
+/// authenticated (downgrade fails closed).
 fn challenge_v2_transcript(
     role: ChallengeRole,
     network_name: &str,
@@ -191,6 +212,8 @@ fn challenge_v2_transcript(
     responder_peer_id: PeerId,
     initiator_nonce: &[u8],
     responder_nonce: &[u8],
+    initiator_features: &[String],
+    responder_features: &[String],
 ) -> Vec<u8> {
     fn put_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
         buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
@@ -205,6 +228,8 @@ fn challenge_v2_transcript(
     buf.extend_from_slice(&responder_peer_id.to_be_bytes());
     put_len_prefixed(&mut buf, initiator_nonce);
     put_len_prefixed(&mut buf, responder_nonce);
+    put_len_prefixed(&mut buf, &canonical_features(initiator_features));
+    put_len_prefixed(&mut buf, &canonical_features(responder_features));
     buf
 }
 
@@ -771,7 +796,9 @@ impl PeerConn {
         }
     }
 
-    /// Transcript for one challenge round under the negotiated version.
+    /// Transcript for one challenge round under the negotiated version. The
+    /// feature lists are the ones each side saw on the wire (or its own for
+    /// the local side); v1 transcripts ignore them, v2 binds them.
     #[allow(clippy::too_many_arguments)]
     fn challenge_transcript_for(
         version: ChallengeVersion,
@@ -781,6 +808,8 @@ impl PeerConn {
         responder_peer_id: PeerId,
         initiator_nonce: &[u8],
         responder_nonce: &[u8],
+        initiator_features: &[String],
+        responder_features: &[String],
     ) -> Vec<u8> {
         match version {
             ChallengeVersion::V1 => challenge_transcript(
@@ -798,6 +827,8 @@ impl PeerConn {
                 responder_peer_id,
                 initiator_nonce,
                 responder_nonce,
+                initiator_features,
+                responder_features,
             ),
         }
     }
@@ -812,6 +843,11 @@ impl PeerConn {
         let info = self.info.as_ref().expect("handshake request is decoded");
         let initiator_peer_id = info.my_peer_id;
         let network_name = info.network_name.clone();
+        // Bind the feature lists exactly as they arrived: if a relay tampered
+        // with the initiator's declaration, the initiator cannot verify our
+        // proof against its own list (crypto-review N3).
+        let initiator_features = info.features.clone();
+        let responder_features = handshake_features();
         let initiator_nonce: [u8; CHALLENGE_FIELD_LEN] =
             info.challenge_nonce.clone().try_into().map_err(|_| {
                 Error::WaitRespError("challenge nonce missing or malformed".to_owned())
@@ -827,6 +863,8 @@ impl PeerConn {
                 self.my_peer_id,
                 &initiator_nonce,
                 &responder_nonce,
+                &initiator_features,
+                &responder_features,
             )
         };
         let proof = self.network_secret_proof(version, &transcript(ChallengeRole::Responder))?;
@@ -967,6 +1005,11 @@ impl PeerConn {
         let responder_proof: [u8; CHALLENGE_FIELD_LEN] =
             rsp.secret_proof.clone().try_into().map_err(|_| invalid())?;
 
+        // Bind our own declaration and the responder's declaration as it
+        // arrived: a relay stripping or forging either list breaks the
+        // responder's proof against our recomputation (crypto-review N3).
+        let initiator_features = handshake_features();
+        let responder_features = rsp.features.clone();
         let transcript = |role| {
             Self::challenge_transcript_for(
                 version,
@@ -976,6 +1019,8 @@ impl PeerConn {
                 rsp.my_peer_id,
                 &initiator_nonce,
                 &responder_nonce,
+                &initiator_features,
+                &responder_features,
             )
         };
         // Authenticate the responder; its proof covers our fresh nonce, so a
