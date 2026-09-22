@@ -12,7 +12,7 @@ use crate::{
     tunnel::{
         SplitTunnel, StreamItem, Tunnel, TunnelError, ZCPacketSink, ZCPacketStream,
         filter::{TunnelFilter, TunnelWithFilter},
-        fingerprint::format_sha256_fingerprint,
+        fingerprint::{fingerprint_eq, format_sha256_fingerprint},
         secure_datagram::{SecureDatagramDirection, SecureDatagramSession},
     },
 };
@@ -424,7 +424,7 @@ async fn upgrade_client_v2(
         .get_remote_static()
         .map(|key| Sha256::digest(key).into());
     match (pin, remote_static) {
-        (Some(expected), Some(digest)) if digest == expected => {}
+        (Some(expected), Some(digest)) if fingerprint_eq(&expected, &digest) => {}
         (Some(expected), Some(digest)) => {
             return Err(TunnelError::InvalidPacket(format!(
                 "web server static key fingerprint mismatch: expected {}, got {}",

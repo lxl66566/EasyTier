@@ -2446,6 +2446,7 @@ dependencies = [
  "snow",
  "strum 0.27.2",
  "stun_codec",
+ "subtle",
  "thiserror 1.0.63",
  "tokio",
  "tokio-rustls",

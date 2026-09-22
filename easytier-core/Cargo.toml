@@ -57,6 +57,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10.8"
+# already in the graph via snow/curve25519-dalek; direct use for constant-time comparisons
+subtle = "2.6"
 smoltcp = { git = "https://github.com/smoltcp-rs/smoltcp.git", rev = "0a926767a68bc88d5512afefa7529c5ecdade4ea", optional = true, default-features = false }
 stun_codec = "0.3.4"
 thiserror = "1.0"

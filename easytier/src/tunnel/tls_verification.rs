@@ -9,7 +9,7 @@
 
 use easytier_core::tunnel::{
     TunnelError,
-    fingerprint::{format_sha256_fingerprint, parse_sha256_fingerprint},
+    fingerprint::{fingerprint_eq, format_sha256_fingerprint, parse_sha256_fingerprint},
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -87,7 +87,9 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 /// Verifies the server end-entity certificate against a pinned SHA-256
 /// fingerprint instead of a PKI. Handshake signature schemes still follow the
 /// process-wide crypto provider; only the certificate identity is pinned.
-/// Fingerprint comparison is not constant-time: pins are public values.
+/// Fingerprint comparison is constant-time via [`fingerprint_eq`]: pins are
+/// public values so the risk is low, but the shared helper keeps every
+/// pinning surface uniform.
 #[derive(Debug)]
 pub(crate) struct PinnedServerVerification {
     provider: Arc<rustls::crypto::CryptoProvider>,
@@ -107,7 +109,7 @@ impl PinnedServerVerification {
         end_entity: &rustls::pki_types::CertificateDer<'_>,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let digest: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
-        if digest != self.expected {
+        if !fingerprint_eq(&self.expected, &digest) {
             return Err(rustls::Error::General(format!(
                 "server certificate fingerprint mismatch: expected {}, got {}",
                 format_sha256_fingerprint(&self.expected),

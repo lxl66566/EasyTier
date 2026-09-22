@@ -1,5 +1,8 @@
-//! SHA-256 fingerprint parsing and formatting shared by transport pinning
-//! surfaces (wss certificate pins, web portal server identity pins).
+//! SHA-256 fingerprint parsing, formatting and comparison shared by
+//! transport pinning surfaces (wss certificate pins, web portal server
+//! identity pins).
+
+use subtle::ConstantTimeEq as _;
 
 const HEX_ALPHABET: &[u8; 16] = b"0123456789abcdef";
 
@@ -41,6 +44,14 @@ pub fn format_sha256_fingerprint(digest: &[u8; 32]) -> String {
     out
 }
 
+/// Constant-time equality for pinned fingerprints. Compared values are
+/// public, so timing leaks are a minor risk, but every pinning surface
+/// (web noise pins, wss/quic certificate pins) goes through this one
+/// helper so none of them can short-circuit on the first differing byte.
+pub fn fingerprint_eq(expected: &[u8; 32], actual: &[u8; 32]) -> bool {
+    expected.ct_eq(actual).into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +83,20 @@ mod tests {
     fn accepts_uppercase_hex() {
         let value = format!("sha256:{}", "Ab".repeat(32));
         assert_eq!(parse_sha256_fingerprint(&value), Some([0xabu8; 32]));
+    }
+
+    #[test]
+    fn fingerprint_eq_matches_only_identical_digests() {
+        // Correctness at the first, middle and last differing byte; timing
+        // uniformity itself cannot be asserted in a unit test, it follows
+        // from the constant-time implementation (subtle's ct_eq).
+        let digest = [0x5au8; 32];
+        assert!(fingerprint_eq(&digest, &digest));
+        for position in [0, 15, 31] {
+            let mut other = digest;
+            other[position] ^= 1;
+            assert!(!fingerprint_eq(&digest, &other), "position {position}");
+        }
+        assert!(!fingerprint_eq(&digest, &[0x5bu8; 32]));
     }
 }
