@@ -15,6 +15,12 @@ use crate::{foundation::time::error::Elapsed, packet::ZCPacket, proto::common::T
 
 pub use crate::socket::IpVersion;
 
+/// Generic argon2id derivation shared by every derivation domain. Re-exported
+/// for the runtime crate (`easytier`), which derives the wg:// tunnel static
+/// keys with the same argon2id core and process-wide cache as the data-plane
+/// suites (crypto-review S1.1).
+pub use self::encrypt::kdf::derive_domain_key_argon2id;
+
 pub(crate) mod encrypt;
 pub mod filter;
 pub mod fingerprint;

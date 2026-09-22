@@ -36,9 +36,10 @@ pub enum KdfSuite {
 /// recommended option).
 ///
 /// Derivation happens at startup per network secret (and per PeerManager
-/// rebuild, see [`KEY_CACHE`]), never per packet. 19 MiB of transient memory
-/// keeps public servers and embedded targets comfortable while making offline
-/// guessing several orders of magnitude slower than the v1 derivation.
+/// rebuild, see [`DOMAIN_KEY_CACHE`]), never per packet. 19 MiB of transient
+/// memory keeps public servers and embedded targets comfortable while making
+/// offline guessing several orders of magnitude slower than the v1
+/// derivation.
 const ARGON2_M_KIB: u32 = 19456;
 const ARGON2_T: u32 = 2;
 const ARGON2_P: u32 = 1;
@@ -61,18 +62,22 @@ pub struct DerivedKeys {
     pub key_256: [u8; 32],
 }
 
-/// Process-wide cache of argon2id derivations, keyed by secret. Argon2id is
-/// expensive by design; the cache keeps repeated PeerManager construction
-/// (config reloads) from paying the cost again for the same secret.
-static KEY_CACHE: OnceLock<Mutex<HashMap<Box<str>, DerivedKeys>>> = OnceLock::new();
+/// Per-domain cache entries: secret -> derived key bytes.
+type DomainKeyMap = HashMap<Box<str>, Box<[u8]>>;
 
-/// Cache for the handshake proof key: a separate entry space from
-/// [`KEY_CACHE`] because the domain salt and output length differ. Keyed by
-/// secret, so the effective cache key is (secret, salt domain) as required.
-static CHALLENGE_KEY_CACHE: OnceLock<Mutex<HashMap<Box<str>, [u8; 32]>>> = OnceLock::new();
+/// (salt domain, output length) -> that domain's cache.
+type DomainKeyCaches = HashMap<(&'static [u8], usize), DomainKeyMap>;
 
-/// Cache capacity. A process realistically serves a handful of secrets; when
-/// the cap is hit the cache is rebuilt lazily instead of growing unbounded.
+/// Process-wide cache of argon2id derivations, keyed by (salt domain, secret)
+/// — the effective key is (secret, salt domain), so domains never collide.
+/// Argon2id is expensive by design; the cache keeps repeated PeerManager
+/// construction (config reloads) and per-connection derivation requests (the
+/// wg:// tunnel keys) from paying the cost again for the same secret.
+static DOMAIN_KEY_CACHE: OnceLock<Mutex<DomainKeyCaches>> = OnceLock::new();
+
+/// Cache capacity per salt domain. A process realistically serves a handful
+/// of secrets; when the cap is hit the domain's cache is rebuilt lazily
+/// instead of growing unbounded.
 const KEY_CACHE_CAP: usize = 16;
 
 /// Shared argon2id core for every derivation domain (same parameters, same
@@ -86,32 +91,40 @@ fn argon2_hash(secret: &str, salt: &[u8], out: &mut [u8]) {
         .expect("argon2id derivation with valid parameters cannot fail");
 }
 
-fn argon2_derive(secret: &str) -> DerivedKeys {
+/// Generic domain-separated argon2id derivation with process-wide caching.
+///
+/// Every caller picks its own fixed `salt` constant (a domain separator, so
+/// one domain's derived keys can never be replayed in another) and output
+/// length. The cache key is (salt, out_len, secret), so repeated calls pay the
+/// argon2id cost once per secret per domain. The data-plane 48-byte
+/// derivation's salt domain is unchanged (see [`ARGON2_SALT`]).
+pub fn derive_domain_key_argon2id(secret: &str, salt: &'static [u8], out_len: usize) -> Vec<u8> {
+    let cache = DOMAIN_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut domains = cache.lock().unwrap();
+    let domain = domains.entry((salt, out_len)).or_default();
+    if let Some(keys) = domain.get(secret) {
+        return keys.to_vec();
+    }
+    let mut out = vec![0u8; out_len];
+    argon2_hash(secret, salt, &mut out);
+    if domain.len() >= KEY_CACHE_CAP {
+        domain.clear();
+    }
+    domain.insert(secret.into(), out.clone().into_boxed_slice());
+    out
+}
+
+/// Argon2id-derived legacy data-plane keys, cached per secret.
+pub fn derive_key_pair_argon2id(secret: &str) -> DerivedKeys {
     // One run for both keys: the 48-byte tag is split into the AES-128 key
     // and the 256-bit key, so the suite shares a single derivation cost.
-    let mut out = [0u8; 48];
-    argon2_hash(secret, ARGON2_SALT, &mut out);
+    let out = derive_domain_key_argon2id(secret, ARGON2_SALT, 48);
     let mut keys = DerivedKeys {
         key_128: [0u8; 16],
         key_256: [0u8; 32],
     };
     keys.key_128.copy_from_slice(&out[..16]);
     keys.key_256.copy_from_slice(&out[16..]);
-    keys
-}
-
-/// Argon2id-derived legacy data-plane keys, cached per secret.
-pub fn derive_key_pair_argon2id(secret: &str) -> DerivedKeys {
-    let cache = KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().unwrap();
-    if let Some(keys) = guard.get(secret) {
-        return *keys;
-    }
-    let keys = argon2_derive(secret);
-    if guard.len() >= KEY_CACHE_CAP {
-        guard.clear();
-    }
-    guard.insert(secret.into(), keys);
     keys
 }
 
@@ -125,17 +138,9 @@ pub fn derive_key_pair_argon2id(secret: &str) -> DerivedKeys {
 /// process-cached per secret, so repeated handshakes pay the argon2id cost
 /// once per secret, not per connection.
 pub fn derive_challenge_key_argon2id(secret: &str) -> [u8; 32] {
-    let cache = CHALLENGE_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().unwrap();
-    if let Some(key) = guard.get(secret) {
-        return *key;
-    }
+    let out = derive_domain_key_argon2id(secret, ARGON2_CHALLENGE_SALT, 32);
     let mut key = [0u8; 32];
-    argon2_hash(secret, ARGON2_CHALLENGE_SALT, &mut key);
-    if guard.len() >= KEY_CACHE_CAP {
-        guard.clear();
-    }
-    guard.insert(secret.into(), key);
+    key.copy_from_slice(&out);
     key
 }
 
@@ -246,6 +251,51 @@ mod tests {
         assert_ne!(challenge, data_plane.key_256);
         // Also independent of the raw secret bytes (stretched, not echoed).
         assert_ne!(challenge.as_slice(), b"secret".as_slice());
+    }
+
+    #[test]
+    fn domain_key_cache_separates_salt_domains_and_lengths() {
+        // The generic entry underpins every domain: same secret plus a
+        // different salt (or length) must derive unrelated keys, and each
+        // domain must keep its own cache entries.
+        const SALT_A: &[u8] = b"easytier-test-domain-a";
+        const SALT_B: &[u8] = b"easytier-test-domain-b";
+
+        let a = derive_domain_key_argon2id("secret", SALT_A, 64);
+        let b = derive_domain_key_argon2id("secret", SALT_B, 64);
+        assert_eq!(a.len(), 64);
+        assert_ne!(a, b);
+        assert_ne!(
+            a[..32].to_vec(),
+            derive_domain_key_argon2id("secret", SALT_A, 32)
+        );
+
+        // Cache determinism per domain.
+        assert_eq!(derive_domain_key_argon2id("secret", SALT_A, 64), a);
+        assert_eq!(derive_domain_key_argon2id("secret", SALT_B, 64), b);
+    }
+
+    #[test]
+    fn domain_key_cache_hit_skips_argon2() {
+        // A cache miss pays ~19 MiB argon2id (>1 ms); a hit is a mutex and a
+        // hashmap lookup (microseconds). Timing-based, but the two costs are
+        // separated by orders of magnitude, so the comparison is stable.
+        const SALT: &[u8] = b"easytier-test-cache-timing";
+        let secret = "cache-timing-secret";
+
+        let start = std::time::Instant::now();
+        let first = derive_domain_key_argon2id(secret, SALT, 64);
+        let cold = start.elapsed();
+
+        let start = std::time::Instant::now();
+        let second = derive_domain_key_argon2id(secret, SALT, 64);
+        let warm = start.elapsed();
+
+        assert_eq!(first, second);
+        assert!(
+            warm < cold,
+            "cache hit ({warm:?}) must be faster than the argon2id run ({cold:?})"
+        );
     }
 
     #[test]
