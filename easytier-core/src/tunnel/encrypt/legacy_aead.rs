@@ -201,8 +201,12 @@ enum SenderPrefix {
 }
 
 /// Distinct sender prefixes tracked for replay protection. One window per
-/// prefix; more concurrent senders than this evict the stalest window.
-const REPLAY_TRACKED_PREFIXES: usize = 16;
+/// prefix. Every mesh peer is itself a sender, so the capacity must cover
+/// the peer table plus recently restarted peers still inside their replay
+/// horizon; 16 (N4) was too small for mid-size meshes, 128 windows cost
+/// ~8 KB total. More concurrent senders than this evict the stalest
+/// window.
+const REPLAY_TRACKED_PREFIXES: usize = 128;
 
 /// Replay window state for one sender prefix.
 struct PrefixReplaySlot {
@@ -368,7 +372,7 @@ impl Encryptor for ReplayProtectedEncryptor {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, thread};
+    use std::{collections::HashSet, thread, time::Duration};
 
     use super::*;
     use crate::tunnel::encrypt::{create_encryptor, create_legacy_encryptor};
@@ -690,6 +694,48 @@ mod tests {
             .unwrap();
         receiver.decrypt(&mut slow_second).unwrap();
         assert_eq!(slow_second.payload(), b"slow second");
+    }
+
+    #[test]
+    fn many_senders_keep_their_replay_windows() {
+        // N4: in a mesh every peer is a sender, so the filter must track far
+        // more prefixes than a small star topology needs. Distinct prefixes
+        // come from the low bytes so small indices stay distinct.
+        let receiver = legacy_aes256();
+        let prefixes: Vec<[u8; PREFIX_LEN_V2]> = (0..REPLAY_TRACKED_PREFIXES as u64 + 12)
+            .map(|i| {
+                i.to_be_bytes()[size_of::<u64>() - PREFIX_LEN_V2..]
+                    .try_into()
+                    .unwrap()
+            })
+            .collect();
+
+        let mut first = sealed_with_nonce(&v2_nonce(&prefixes[0], 0), b"mesh traffic");
+        receiver.decrypt(&mut first).unwrap();
+        // Give the first sender a strictly older timestamp so the eviction
+        // below deterministically targets it (equal timestamps tie-break
+        // towards later slots).
+        thread::sleep(Duration::from_millis(2));
+        for (counter, prefix) in prefixes.iter().enumerate().skip(1) {
+            let mut packet = sealed_with_nonce(&v2_nonce(prefix, counter as u32), b"mesh traffic");
+            receiver.decrypt(&mut packet).unwrap();
+        }
+
+        // The most recent senders are fully protected...
+        let last = prefixes.last().unwrap();
+        let mut replay = sealed_with_nonce(
+            &v2_nonce(last, (prefixes.len() - 1) as u32),
+            b"mesh traffic",
+        );
+        assert!(matches!(
+            receiver.decrypt(&mut replay),
+            Err(Error::ReplayDetected)
+        ));
+
+        // ...while the stalest prefix was evicted once the capacity ran out:
+        // its replay is admitted, the documented best-effort bound.
+        let mut ancient = sealed_with_nonce(&v2_nonce(&prefixes[0], 0), b"mesh traffic");
+        receiver.decrypt(&mut ancient).unwrap();
     }
 
     #[test]
