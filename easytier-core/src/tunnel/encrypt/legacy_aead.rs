@@ -1,10 +1,11 @@
 //! Counter nonces and replay protection for the legacy data-plane encryptor
-//! (crypto-review S1.3 / S1.4, hardening N1).
+//! (crypto-review S1.3 / S1.4, hardening N1 / N4 / N5).
 //!
 //! The wire format is unchanged: `ciphertext ‖ tag(16B) ‖ nonce(12B)` in the
 //! AEAD tail. Receivers only read the nonce out of the tail and feed it to
 //! the AEAD, so the nonce layouts below are transparent to the cipher
-//! backends and to unupgraded peers.
+//! backends and to unupgraded peers. Magic-less random nonces (pre-fix
+//! peers) get a best-effort duplicate cache instead of a window (N5).
 
 use std::{
     mem::size_of,
@@ -217,35 +218,41 @@ struct PrefixReplaySlot {
 
 /// Best-effort replay filter for received legacy AEAD packets.
 ///
-/// - Random nonces (pre-fix peers) are passed through unchecked, matching
-///   the historical receiver behavior; replaying them stays possible, which
-///   is the price of mixed-version interoperability.
+/// - Random nonces (pre-fix peers, N5) have no sequence to window, so the
+///   only usable replay signal is the nonce itself; they go through the
+///   direct-mapped [`RandomNonceCache`], which rejects an exact duplicate
+///   of a recently authenticated nonce. Purely additive soft state:
+///   evicted or cross-restart replays still pass (strictly better than
+///   the previous always-accept).
 /// - Counter nonces (v1 and v2) are checked against the window of their
 ///   PREFIX. Windows are per prefix so a fast sender cannot push the window
 ///   of a slow sender (e.g. an idle node sending only heartbeats) out of
 ///   range.
 /// - Only authenticated packets may update the filter (see
 ///   [`ReplayProtectedEncryptor::decrypt`]), so an attacker without the
-///   network key cannot burn window slots or push `max_seq` ahead of real
-///   traffic. More than [`REPLAY_TRACKED_PREFIXES`] concurrent senders
-///   evict the stalest window; the evicted prefix then restarts from its
-///   next packet, which can admit very old replays of that prefix.
+///   network key cannot burn window slots, churn the seen-cache, or push
+///   `max_seq` ahead of real traffic. More than
+///   [`REPLAY_TRACKED_PREFIXES`] concurrent senders evict the stalest
+///   window; the evicted prefix then restarts from its next packet, which
+///   can admit very old replays of that prefix.
 struct ReplayFilter {
     slots: Mutex<Vec<PrefixReplaySlot>>,
+    random_seen: RandomNonceCache,
 }
 
 impl ReplayFilter {
     fn new() -> Self {
         Self {
             slots: Mutex::new(Vec::with_capacity(REPLAY_TRACKED_PREFIXES)),
+            random_seen: RandomNonceCache::new(),
         }
     }
 
-    /// Cheap pre-check before decryption; only rejects counter nonces that
-    /// are already provably stale for their prefix.
+    /// Cheap pre-check before decryption; rejects nonces that are already
+    /// provably stale (counter nonces) or known duplicates (random nonces).
     fn pre_check(&self, nonce: &[u8; StandardAeadTail::NONCE_SIZE]) -> bool {
         match classify_nonce(nonce) {
-            NonceClass::Random => true,
+            NonceClass::Random => !self.random_seen.contains(nonce),
             NonceClass::V1 { prefix, counter } => {
                 self.window_can_accept(SenderPrefix::V1(prefix), counter)
             }
@@ -259,7 +266,7 @@ impl ReplayFilter {
     /// detected replays.
     fn commit(&self, nonce: &[u8; StandardAeadTail::NONCE_SIZE]) -> bool {
         match classify_nonce(nonce) {
-            NonceClass::Random => true,
+            NonceClass::Random => self.random_seen.insert(nonce),
             NonceClass::V1 { prefix, counter } => {
                 self.window_accept(SenderPrefix::V1(prefix), counter)
             }
@@ -304,6 +311,68 @@ impl ReplayFilter {
         });
         accepted
     }
+}
+
+/// Best-effort seen-cache for random nonces (N5): pre-counter peers send
+/// uniformly random nonces with no sequence, so the only replay signal is
+/// the nonce itself.
+///
+/// Direct-mapped with 4096 slots: the nonce hash picks one slot, a hit
+/// with a fully equal nonce is a replay, anything else replaces the slot.
+/// This is purely additive soft state — an evicted (or cross-restart)
+/// replay can still pass, and entries are only written after the AEAD
+/// authenticated a packet, so attackers without the network key cannot
+/// churn the cache. It intercepts nothing but exact immediate duplicates;
+/// accepted packets still go through the normal AEAD path.
+struct RandomNonceCache {
+    slots: Mutex<Box<[Option<[u8; StandardAeadTail::NONCE_SIZE]>]>>,
+}
+
+impl RandomNonceCache {
+    /// Power of two so the hash can be masked into a slot index.
+    const SLOTS: usize = 4096;
+
+    fn new() -> Self {
+        Self {
+            slots: Mutex::new((0..Self::SLOTS).map(|_| None).collect()),
+        }
+    }
+
+    fn index(nonce: &[u8; StandardAeadTail::NONCE_SIZE]) -> usize {
+        nonce_hash(nonce) as usize & (Self::SLOTS - 1)
+    }
+
+    /// Read-only probe for the pre-decryption check.
+    fn contains(&self, nonce: &[u8; StandardAeadTail::NONCE_SIZE]) -> bool {
+        self.slots.lock().unwrap()[Self::index(nonce)].as_ref() == Some(nonce)
+    }
+
+    /// Check-and-set after authentication; `false` marks a replay.
+    fn insert(&self, nonce: &[u8; StandardAeadTail::NONCE_SIZE]) -> bool {
+        let mut slots = self.slots.lock().unwrap();
+        let slot = &mut slots[Self::index(nonce)];
+        if slot.as_ref() == Some(nonce) {
+            return false;
+        }
+        *slot = Some(*nonce);
+        true
+    }
+}
+
+/// FxHash-style mixing of the 12 nonce bytes (three 4-byte words). Only
+/// needs to spread nonces uniformly over the cache; no cryptographic
+/// strength required.
+fn nonce_hash(nonce: &[u8; StandardAeadTail::NONCE_SIZE]) -> u32 {
+    let words = [
+        u32::from_be_bytes(nonce[0..4].try_into().unwrap()),
+        u32::from_be_bytes(nonce[4..8].try_into().unwrap()),
+        u32::from_be_bytes(nonce[8..12].try_into().unwrap()),
+    ];
+    let mut hash = 0x9e37_79b9u32;
+    for word in words {
+        hash = (hash.rotate_left(5) ^ word).wrapping_mul(0x85eb_ca6b);
+    }
+    hash
 }
 
 /// Reads the nonce an encrypted packet carries in its AEAD tail.
@@ -620,14 +689,67 @@ mod tests {
                 .unwrap();
             receiver.decrypt(&mut packet).unwrap();
             assert_eq!(packet.payload(), b"old peer payload");
-            // Random nonces skip replay bookkeeping: an immediate resend is
-            // still accepted, preserving old-version interoperability.
+            // N5: an immediate resend of the very same nonce is now a
+            // caught replay; the next iteration shows that distinct fresh
+            // nonces keep flowing.
             let mut resent = sealed_packet(b"old peer payload");
             old_peer
                 .encrypt_with_nonce(&mut resent, Some(&nonce), AeadBinding::None)
                 .unwrap();
-            receiver.decrypt(&mut resent).unwrap();
+            assert!(matches!(
+                receiver.decrypt(&mut resent),
+                Err(Error::ReplayDetected)
+            ));
         }
+    }
+
+    #[test]
+    fn random_nonce_cache_churn_does_not_reject_fresh_nonces() {
+        let old_peer = raw_aes256();
+        let receiver = legacy_aes256();
+
+        let nonce_of = |i: u32| {
+            // First byte stays 0, clear of both magics, so every nonce is
+            // classified as random.
+            let mut nonce = [0u8; StandardAeadTail::NONCE_SIZE];
+            nonce[..4].copy_from_slice(&i.to_be_bytes());
+            nonce
+        };
+        let sealed = |i: u32| {
+            let mut packet = sealed_packet(b"old peer payload");
+            old_peer
+                .encrypt_with_nonce(&mut packet, Some(&nonce_of(i)), AeadBinding::None)
+                .unwrap();
+            packet
+        };
+
+        // Churn the whole direct-mapped cache with distinct nonces: none
+        // may be falsely rejected, hash collisions included.
+        let churned = RandomNonceCache::SLOTS as u32 * 2;
+        for i in 0..churned {
+            receiver.decrypt(&mut sealed(i)).unwrap();
+        }
+
+        // The most recent nonce is still cached, so its duplicate is caught.
+        let mut replay = sealed(churned - 1);
+        assert!(matches!(
+            receiver.decrypt(&mut replay),
+            Err(Error::ReplayDetected)
+        ));
+
+        // A slot collision replaces the entry instead of rejecting: a
+        // different nonce hashing to the same slot is admitted...
+        let base = churned;
+        let colliding = (base + 1..)
+            .find(|&j| {
+                RandomNonceCache::index(&nonce_of(j)) == RandomNonceCache::index(&nonce_of(base))
+            })
+            .unwrap();
+        receiver.decrypt(&mut sealed(base)).unwrap();
+        receiver.decrypt(&mut sealed(colliding)).unwrap();
+        // ...and the displaced entry is treated as unseen again, the
+        // documented eviction-based miss.
+        receiver.decrypt(&mut sealed(base)).unwrap();
     }
 
     #[test]
