@@ -268,6 +268,15 @@ pub trait ConfigLoader: Send + Sync {
     fn get_secure_mode(&self) -> Option<SecureModeConfig>;
     fn set_secure_mode(&self, secure_mode: Option<SecureModeConfig>);
 
+    /// Whether legacy handshakes without the full negotiated crypto suite
+    /// (`strict_crypto` network option, default false) are rejected.
+    fn get_strict_crypto(&self) -> bool {
+        false
+    }
+    fn set_strict_crypto(&self, strict: bool) {
+        let _ = strict;
+    }
+
     fn get_credential_file(&self) -> Option<std::path::PathBuf> {
         None
     }
@@ -544,6 +553,14 @@ struct Config {
     port_forward: Option<Vec<PortForwardConfig>>,
 
     secure_mode: Option<SecureModeConfig>,
+
+    /// Reject legacy peer handshakes that did not negotiate the full
+    /// `secret-challenge-v2` + `kdf-v2` + `header-aad-v1` suite (stretched
+    /// proof keys, argon2id data-plane keys, header-bound AAD). Connections
+    /// from older peers fail by design; secure-mode (noise) connections are
+    /// unaffected. Default false keeps the downgrade-tolerant behavior.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    strict_crypto: bool,
 
     flags: Option<serde_json::Map<String, serde_json::Value>>,
 
@@ -1152,6 +1169,14 @@ impl ConfigLoader for TomlConfig {
         self.config.lock().unwrap().secure_mode = secure_mode;
     }
 
+    fn get_strict_crypto(&self) -> bool {
+        self.config.lock().unwrap().strict_crypto
+    }
+
+    fn set_strict_crypto(&self, strict: bool) {
+        self.config.lock().unwrap().strict_crypto = strict;
+    }
+
     fn get_credential_file(&self) -> Option<PathBuf> {
         self.config.lock().unwrap().credential_file.clone()
     }
@@ -1281,6 +1306,17 @@ wireguard_listen = "0.0.0.0:51820"
         .to_string();
 
         assert!(error.contains("client_cidr"), "{error}");
+    }
+
+    #[test]
+    fn strict_crypto_defaults_off_and_round_trips() {
+        assert!(!TomlConfig::default().get_strict_crypto());
+
+        let config = TomlConfig::new_from_str("strict_crypto = true").unwrap();
+        assert!(config.get_strict_crypto());
+
+        config.set_strict_crypto(false);
+        assert!(!config.get_strict_crypto());
     }
 
     #[cfg(feature = "config-write")]

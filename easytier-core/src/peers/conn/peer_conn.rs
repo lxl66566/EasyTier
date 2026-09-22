@@ -107,6 +107,16 @@ pub const SECRET_CHALLENGE_V2_FEATURE: &str = "secret-challenge-v2";
 /// [`NetworkSecretDigest`] and HMAC-SHA256 output.
 const CHALLENGE_FIELD_LEN: usize = 32;
 
+/// The full modern legacy-crypto suite. With the network option
+/// `strict_crypto` enabled, a handshake whose negotiation result misses any
+/// of these features is rejected instead of falling back to the weaker
+/// legacy flows (see [`PeerConn::enforce_strict_crypto`]).
+const STRICT_CRYPTO_REQUIRED_FEATURES: [&str; 3] = [
+    SECRET_CHALLENGE_V2_FEATURE,
+    KDF_V2_FEATURE,
+    HEADER_AAD_FEATURE,
+];
+
 /// Features declared in every handshake message of this build.
 fn handshake_features() -> Vec<String> {
     vec![
@@ -1709,6 +1719,9 @@ impl PeerConn {
                 )
                 .await?;
             }
+            // Policy check on the negotiated feature set before the
+            // connection is admitted (network option `strict_crypto`).
+            self.enforce_strict_crypto()?;
         } else {
             return Err(Error::WaitRespError(format!(
                 "unexpected packet type during handshake: {}",
@@ -1761,6 +1774,9 @@ impl PeerConn {
             } else {
                 self.info = Some(rsp);
             }
+            // Policy check on the negotiated feature set before the
+            // connection is admitted (network option `strict_crypto`).
+            self.enforce_strict_crypto()?;
             self.is_client = Some(true);
         }
 
@@ -1971,6 +1987,50 @@ impl PeerConn {
         self.info
             .as_ref()
             .is_some_and(|info| info.features.iter().any(|f| f == feature))
+    }
+
+    /// Enforce the network option `strict_crypto` once a handshake has
+    /// completed: the negotiated result must cover every feature of
+    /// [`STRICT_CRYPTO_REQUIRED_FEATURES`] (stretched challenge proofs,
+    /// argon2id data-plane keys, header-bound AAD), otherwise the connection
+    /// is rejected instead of silently downgrading to the weaker legacy
+    /// flows. Both the initiator and the responder side call this before the
+    /// connection is admitted.
+    ///
+    /// Secure-mode (noise) handshakes are exempt: they authenticate with a
+    /// noise transcript and per-session keys and never rely on the legacy
+    /// feature suite this switch guards.
+    fn enforce_strict_crypto(&self) -> Result<(), Error> {
+        if self.noise_handshake_result.is_some() || !self.context.strict_crypto() {
+            return Ok(());
+        }
+        // The negotiation result is the feature set both sides declared; we
+        // always send the full list, so this reduces to what the remote
+        // declared. Check both anyway so a future build dropping one of the
+        // features fails closed here instead of silently.
+        let remote = &self.info.as_ref().expect("handshake is decoded").features;
+        let local = handshake_features();
+        let missing: Vec<&str> = STRICT_CRYPTO_REQUIRED_FEATURES
+            .into_iter()
+            .filter(|feature| {
+                !(remote.iter().any(|f| f == *feature) && local.iter().any(|f| f == *feature))
+            })
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        tracing::warn!(
+            conn_id = ?self.conn_id,
+            peer_id = self.get_peer_id(),
+            missing = ?missing,
+            "strict_crypto: rejecting legacy handshake without the full crypto suite; \
+             the peer may run an older EasyTier version"
+        );
+        Err(Error::SecretKeyError(format!(
+            "strict_crypto: refusing legacy handshake missing crypto features [{}]; \
+             the peer may run an older EasyTier version, upgrade it or disable strict_crypto",
+            missing.join(", ")
+        )))
     }
 
     pub fn get_stats(&self) -> PeerConnStats {

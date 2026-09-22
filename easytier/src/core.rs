@@ -760,6 +760,15 @@ struct NetworkOptions {
         help = t!("core_clap.credential_file").to_string()
     )]
     credential_file: Option<PathBuf>,
+
+    #[arg(
+        long,
+        env = "ET_STRICT_CRYPTO",
+        help = t!("core_clap.strict_crypto").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    strict_crypto: Option<bool>,
 }
 
 #[derive(Parser, Debug)]
@@ -1191,6 +1200,10 @@ impl NetworkOptions {
 
         if let Some(ref credential_file) = self.credential_file {
             cfg.set_credential_file(Some(credential_file.clone()));
+        }
+
+        if let Some(strict_crypto) = self.strict_crypto {
+            cfg.set_strict_crypto(strict_crypto);
         }
 
         if let Some(ref credential_secret) = self.credential {
@@ -1928,6 +1941,35 @@ enabled = true
         assert_eq!(identity.network_secret, None);
         assert_eq!(identity.network_secret_digest, None);
         assert_eq!(cfg.get_hostname(), "override-host");
+    }
+
+    #[test]
+    fn strict_crypto_cli_flag_overrides_file_and_defaults_off() {
+        let cfg = TomlConfigLoader::new_from_str("strict_crypto = true").unwrap();
+        assert!(cfg.get_strict_crypto());
+
+        // An unset CLI flag must keep the config file value.
+        NetworkOptions::default().merge_into(&cfg).unwrap();
+        assert!(cfg.get_strict_crypto());
+
+        // An explicit --strict-crypto false wins over the file value.
+        NetworkOptions {
+            strict_crypto: Some(false),
+            ..Default::default()
+        }
+        .merge_into(&cfg)
+        .unwrap();
+        assert!(!cfg.get_strict_crypto());
+
+        // --strict-crypto sets it on a default config too.
+        let default_cfg = TomlConfigLoader::default();
+        NetworkOptions {
+            strict_crypto: Some(true),
+            ..Default::default()
+        }
+        .merge_into(&default_cfg)
+        .unwrap();
+        assert!(default_cfg.get_strict_crypto());
     }
 
     #[test]

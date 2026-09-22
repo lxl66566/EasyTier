@@ -60,6 +60,7 @@ pub(crate) struct NoopPeerContext {
     network_identity: NetworkIdentity,
     flags: FlagsInConfig,
     secure_mode: Option<SecureModeConfig>,
+    strict_crypto: bool,
 }
 
 impl NoopPeerContext {
@@ -68,6 +69,7 @@ impl NoopPeerContext {
             network_identity,
             flags: FlagsInConfig::default(),
             secure_mode: None,
+            strict_crypto: false,
         }
     }
 
@@ -79,6 +81,11 @@ impl NoopPeerContext {
 
     pub(crate) fn with_flags(mut self, flags: FlagsInConfig) -> Self {
         self.flags = flags;
+        self
+    }
+
+    pub(crate) fn with_strict_crypto(mut self, strict: bool) -> Self {
+        self.strict_crypto = strict;
         self
     }
 }
@@ -105,6 +112,10 @@ impl PeerContext for NoopPeerContext {
     fn secret_proof(&self, challenge: &[u8]) -> Option<Hmac<Sha256>> {
         let secret = self.network_identity.network_secret.as_ref()?;
         secret_proof_from_secret(secret, challenge)
+    }
+
+    fn strict_crypto(&self) -> bool {
+        self.strict_crypto
     }
 }
 

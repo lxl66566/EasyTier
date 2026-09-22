@@ -80,6 +80,7 @@ pub struct PeerRuntimeSnapshotInput {
     pub ospf_update_my_foreign_network_interval_sec: u64,
     pub max_direct_conns_per_peer_in_foreign_network: usize,
     pub hmac_secret_digest: bool,
+    pub strict_crypto: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -129,6 +130,7 @@ impl PeerRuntimeSnapshot {
             ospf_update_my_foreign_network_interval_sec,
             max_direct_conns_per_peer_in_foreign_network,
             hmac_secret_digest,
+            strict_crypto,
         } = input;
         let feature_flags = PeerFeatureFlag {
             kcp_input: !flags.disable_kcp_input,
@@ -187,6 +189,7 @@ impl PeerRuntimeSnapshot {
             ospf_update_my_foreign_network_interval_sec,
             max_direct_conns_per_peer_in_foreign_network,
             hmac_secret_digest,
+            strict_crypto,
         }
     }
 
@@ -637,6 +640,13 @@ pub(crate) trait PeerContext: Send + Sync {
         false
     }
 
+    /// Whether legacy handshakes must negotiate the full
+    /// `secret-challenge-v2` + `kdf-v2` + `header-aad-v1` suite and are
+    /// rejected otherwise (network-level `strict_crypto` switch).
+    fn strict_crypto(&self) -> bool {
+        false
+    }
+
     fn advertised_ipv6_public_addr_prefix(&self) -> Option<Ipv6Cidr> {
         None
     }
@@ -860,6 +870,10 @@ impl PeerContext for CorePeerContext {
 
     fn hmac_secret_digest(&self) -> bool {
         self.snapshot().hmac_secret_digest
+    }
+
+    fn strict_crypto(&self) -> bool {
+        self.snapshot().strict_crypto
     }
 
     fn advertised_ipv6_public_addr_prefix(&self) -> Option<Ipv6Cidr> {
@@ -1138,6 +1152,7 @@ pub(crate) mod tests {
             ospf_update_my_foreign_network_interval_sec: 17,
             max_direct_conns_per_peer_in_foreign_network: 5,
             hmac_secret_digest: true,
+            strict_crypto: false,
         }
     }
 

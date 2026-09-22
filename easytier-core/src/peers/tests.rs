@@ -14,7 +14,7 @@ use crate::{
         PeerConnectionOrigin, PeerPacketIngress,
         conn::{
             peer_conn::{
-                KDF_V2_FEATURE, PeerConn, PeerConnId, SECRET_CHALLENGE_FEATURE,
+                HEADER_AAD_FEATURE, KDF_V2_FEATURE, PeerConn, PeerConnId, SECRET_CHALLENGE_FEATURE,
                 SECRET_CHALLENGE_V2_FEATURE,
             },
             peer_map::PeerMap,
@@ -1075,4 +1075,358 @@ fn canonical_feature_encoding_is_order_independent_and_unambiguous() {
         canonical_features(&concatenated),
         canonical_features(&split)
     );
+}
+
+// --- strict_crypto (crypto-review batch 2: reject legacy crypto downgrade) ---
+
+/// Secret-gated context with the network option `strict_crypto` enabled.
+fn strict_secret_context(secret: &str) -> Arc<NoopPeerContext> {
+    Arc::new(
+        NoopPeerContext::new(NetworkIdentity {
+            network_name: "net".to_string(),
+            network_secret: Some(secret.to_string()),
+            network_secret_digest: None,
+        })
+        .with_strict_crypto(true),
+    )
+}
+
+/// Test-local reimplementation of the `secret-challenge-v1` transcript, kept
+/// independent from the production builder for the same reason as
+/// [`v2_transcript`].
+fn v1_transcript(
+    role: &[u8],
+    network_name: &str,
+    initiator_peer_id: u32,
+    responder_peer_id: u32,
+    initiator_nonce: &[u8],
+    responder_nonce: &[u8],
+) -> Vec<u8> {
+    fn put_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
+        buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(bytes);
+    }
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"easytier-legacy-hs-challenge-v1");
+    buf.extend_from_slice(role);
+    put_len_prefixed(&mut buf, network_name.as_bytes());
+    buf.extend_from_slice(&initiator_peer_id.to_be_bytes());
+    buf.extend_from_slice(&responder_peer_id.to_be_bytes());
+    put_len_prefixed(&mut buf, initiator_nonce);
+    put_len_prefixed(&mut buf, responder_nonce);
+    buf
+}
+
+/// The declaration a genuine peer missing exactly `feature` would send: the
+/// current build's feature list without that one entry.
+fn declaration_without(feature: &str) -> Vec<String> {
+    [
+        "liveness-echo-v1",
+        HEADER_AAD_FEATURE,
+        KDF_V2_FEATURE,
+        SECRET_CHALLENGE_FEATURE,
+        SECRET_CHALLENGE_V2_FEATURE,
+    ]
+    .iter()
+    .filter(|f| **f != feature)
+    .map(|f| f.to_string())
+    .collect()
+}
+
+/// Proof of `role` over the two declarations exactly as a genuine peer that
+/// declares `own_features` computes it: v2 (argon2id-stretched, feature
+/// bound) when both declarations carry v2, v1 (raw-secret) otherwise.
+#[allow(clippy::too_many_arguments)]
+fn genuine_peer_proof(
+    role: &[u8],
+    initiator_features: &[String],
+    responder_features: &[String],
+    initiator_nonce: &[u8],
+    responder_nonce: &[u8],
+) -> Vec<u8> {
+    use hmac::Mac;
+    let use_v2 = initiator_features
+        .iter()
+        .chain(responder_features.iter())
+        .filter(|f| **f == SECRET_CHALLENGE_V2_FEATURE)
+        .count()
+        == 2;
+    if use_v2 {
+        hmac_sha256(
+            &derive_challenge_key_argon2id("secret"),
+            &v2_transcript(
+                role,
+                "net",
+                1,
+                2,
+                initiator_nonce,
+                responder_nonce,
+                initiator_features,
+                responder_features,
+            ),
+        )
+        .to_vec()
+    } else {
+        crate::peers::context::secret_proof_from_secret(
+            "secret",
+            &v1_transcript(role, "net", 1, 2, initiator_nonce, responder_nonce),
+        )
+        .unwrap()
+        .finalize()
+        .into_bytes()
+        .to_vec()
+    }
+}
+
+fn handshake_packet(req: &HandshakeRequest, from: u32, to: u32) -> ZCPacket {
+    let mut pkt = ZCPacket::new_with_payload(&req.encode_to_vec());
+    pkt.fill_peer_manager_hdr(from, to, PacketType::HandShake as u8);
+    pkt
+}
+
+/// Runs a strict initiator against a scripted responder that consistently
+/// declares `responder_features` (its proofs are recomputed over its own
+/// list, so it behaves like a genuine older build, not a tampering relay).
+/// Returns the initiator's handshake result.
+async fn strict_initiator_vs_scripted_responder(
+    responder_features: Vec<String>,
+) -> Result<(), Error> {
+    let (client_tunnel, scripted_tunnel, _, _) = recording_channel_tunnel_pair();
+    let mut client = PeerConn::new(
+        1,
+        strict_secret_context("secret"),
+        client_tunnel,
+        Arc::new(PeerSessionStore::new()),
+    );
+    let client_task = tokio::spawn(async move { client.do_handshake_as_client().await });
+
+    let (mut stream, mut sink) = scripted_tunnel.split();
+    let msg1 = timeout(Duration::from_secs(2), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let msg1_req = parse_handshake(&msg1);
+
+    let responder_nonce = [3u8; 32];
+    let rsp = HandshakeRequest {
+        magic: 0xd1e1a5e1,
+        my_peer_id: 2,
+        version: 1,
+        secret_proof: genuine_peer_proof(
+            b":responder",
+            &msg1_req.features,
+            &responder_features,
+            &msg1_req.challenge_nonce,
+            &responder_nonce,
+        ),
+        challenge_nonce: responder_nonce.to_vec(),
+        features: responder_features,
+        network_name: "net".to_owned(),
+        network_secret_digest: vec![0u8; 32],
+    };
+    sink.send(handshake_packet(&rsp, 2, 1)).await.unwrap();
+
+    timeout(Duration::from_secs(2), client_task)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// Runs a strict responder against a scripted initiator that consistently
+/// declares `initiator_features`. Returns the responder's handshake result.
+async fn strict_responder_vs_scripted_initiator(
+    initiator_features: Vec<String>,
+) -> Result<(), Error> {
+    let (scripted_tunnel, server_tunnel, _, _) = recording_channel_tunnel_pair();
+    let mut server = PeerConn::new(
+        2,
+        strict_secret_context("secret"),
+        server_tunnel,
+        Arc::new(PeerSessionStore::new()),
+    );
+    let server_task = tokio::spawn(async move { server.do_handshake_as_server().await });
+
+    let (mut stream, mut sink) = scripted_tunnel.split();
+    let initiator_nonce = [4u8; 32];
+    let req = HandshakeRequest {
+        magic: 0xd1e1a5e1,
+        my_peer_id: 1,
+        version: 1,
+        features: initiator_features.clone(),
+        network_name: "net".to_owned(),
+        network_secret_digest: vec![0u8; 32],
+        challenge_nonce: initiator_nonce.to_vec(),
+        secret_proof: vec![],
+    };
+    sink.send(handshake_packet(&req, 1, 0)).await.unwrap();
+
+    let msg2 = timeout(Duration::from_secs(2), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let msg2_req = parse_handshake(&msg2);
+
+    let msg3 = HandshakeRequest {
+        magic: 0xd1e1a5e1,
+        my_peer_id: 1,
+        version: 1,
+        features: initiator_features.clone(),
+        network_name: "net".to_owned(),
+        network_secret_digest: vec![0u8; 32],
+        challenge_nonce: initiator_nonce.to_vec(),
+        secret_proof: genuine_peer_proof(
+            b":initiator",
+            &initiator_features,
+            &msg2_req.features,
+            &initiator_nonce,
+            &msg2_req.challenge_nonce,
+        ),
+    };
+    sink.send(handshake_packet(&msg3, 1, 2)).await.unwrap();
+
+    timeout(Duration::from_secs(2), server_task)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn strict_crypto_accepts_fully_negotiated_handshake() {
+    // Both sides strict, both sides current builds: the full suite is
+    // negotiated and the connection is established normally.
+    let (client_tunnel, server_tunnel) = create_ring_tunnel_pair();
+    let mut client = PeerConn::new(
+        1,
+        strict_secret_context("secret"),
+        client_tunnel,
+        Arc::new(PeerSessionStore::new()),
+    );
+    let mut server = PeerConn::new(
+        2,
+        strict_secret_context("secret"),
+        server_tunnel,
+        Arc::new(PeerSessionStore::new()),
+    );
+    let (client_ret, server_ret) = tokio::join!(
+        client.do_handshake_as_client(),
+        server.do_handshake_as_server()
+    );
+    client_ret.unwrap();
+    server_ret.unwrap();
+    assert!(client.supports_header_aad() && client.supports_kdf_v2());
+    assert!(server.supports_header_aad() && server.supports_kdf_v2());
+}
+
+#[tokio::test]
+async fn strict_crypto_initiator_rejects_responder_missing_required_features() {
+    // A strict initiator must refuse a peer whose declaration misses any one
+    // of the required features, naming the missing one.
+    for feature in [
+        SECRET_CHALLENGE_V2_FEATURE,
+        KDF_V2_FEATURE,
+        HEADER_AAD_FEATURE,
+    ] {
+        let ret = strict_initiator_vs_scripted_responder(declaration_without(feature)).await;
+        assert!(
+            matches!(&ret, Err(Error::SecretKeyError(e)) if e.contains("strict_crypto") && e.contains(feature)),
+            "missing {feature} must be rejected with the feature named, got: {ret:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn strict_crypto_responder_rejects_initiator_missing_required_features() {
+    // Same policy on the responder side: the challenge itself still verifies
+    // (the scripted initiator is genuine), so only the strict check rejects.
+    for feature in [
+        SECRET_CHALLENGE_V2_FEATURE,
+        KDF_V2_FEATURE,
+        HEADER_AAD_FEATURE,
+    ] {
+        let ret = strict_responder_vs_scripted_initiator(declaration_without(feature)).await;
+        assert!(
+            matches!(&ret, Err(Error::SecretKeyError(e)) if e.contains("strict_crypto") && e.contains(feature)),
+            "missing {feature} must be rejected with the feature named, got: {ret:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn strict_crypto_rejects_relay_downgrade_of_secret_challenge_v2() {
+    // A stripping relay (or a genuine v1-only peer) forces the v2 -> v1
+    // fallback; v1 proofs carry no features so the challenge still verifies,
+    // and both strict sides must refuse the connection naming the missing
+    // feature. With strict_crypto off this is the accepted interop fallback
+    // covered by challenge_v2_peers_fall_back_to_v1_when_relay_strips_v2.
+    let (client_tunnel, server_tunnel) =
+        mitm_rewriting_tunnel_pair(Box::new(strip_feature(SECRET_CHALLENGE_V2_FEATURE)));
+    let mut client = PeerConn::new(
+        1,
+        strict_secret_context("secret"),
+        client_tunnel,
+        Arc::new(PeerSessionStore::new()),
+    );
+    let mut server = PeerConn::new(
+        2,
+        strict_secret_context("secret"),
+        server_tunnel,
+        Arc::new(PeerSessionStore::new()),
+    );
+    let (client_ret, server_ret) = tokio::join!(
+        client.do_handshake_as_client(),
+        server.do_handshake_as_server()
+    );
+    for ret in [client_ret, server_ret] {
+        assert!(
+            matches!(&ret, Err(Error::SecretKeyError(e)) if e.contains("strict_crypto") && e.contains(SECRET_CHALLENGE_V2_FEATURE)),
+            "the v2 downgrade must be rejected with the feature named, got: {ret:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn strict_crypto_leaves_secure_mode_handshake_unaffected() {
+    // Secure mode authenticates with a noise transcript and per-session keys
+    // and never relies on the legacy feature suite, so a strict node must
+    // keep accepting noise handshakes.
+    fn strict_secure_context(peer_key: u8) -> Arc<NoopPeerContext> {
+        let private = StaticSecret::from([peer_key; 32]);
+        let public = PublicKey::from(&private);
+        Arc::new(
+            NoopPeerContext::new(NetworkIdentity {
+                network_name: "net".to_owned(),
+                network_secret: Some("secret".to_owned()),
+                network_secret_digest: None,
+            })
+            .with_secure_mode(crate::proto::common::SecureModeConfig {
+                enabled: true,
+                local_private_key: Some(BASE64_STANDARD.encode(private.as_bytes())),
+                local_public_key: Some(BASE64_STANDARD.encode(public.as_bytes())),
+            })
+            .with_strict_crypto(true),
+        )
+    }
+
+    let (client_tunnel, server_tunnel) = create_ring_tunnel_pair();
+    let mut client = PeerConn::new(
+        1,
+        strict_secure_context(1),
+        client_tunnel,
+        Arc::new(PeerSessionStore::new()),
+    );
+    let mut server = PeerConn::new(
+        2,
+        strict_secure_context(2),
+        server_tunnel,
+        Arc::new(PeerSessionStore::new()),
+    );
+    let (client_ret, server_ret) = tokio::join!(
+        client.do_handshake_as_client(),
+        server.do_handshake_as_server()
+    );
+    client_ret.unwrap();
+    server_ret.unwrap();
 }

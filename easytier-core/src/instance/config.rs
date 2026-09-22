@@ -250,6 +250,7 @@ impl CoreInstanceConfig {
                 max_direct_conns_per_peer_in_foreign_network:
                     MAX_DIRECT_CONNS_PER_PEER_IN_FOREIGN_NETWORK,
                 hmac_secret_digest: false,
+                strict_crypto: config.get_strict_crypto(),
             });
         let peer = PortablePeerManagerConfig {
             snapshot: peer_snapshot,

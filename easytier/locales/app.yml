@@ -287,6 +287,9 @@ core_clap:
   credential_file:
     en: "path to credential storage file for persisting generated credentials across restarts (admin nodes)"
     zh-CN: "凭据存储文件路径，用于在管理节点重启后保留已生成的凭据"
+  strict_crypto:
+    en: "reject legacy peer handshakes that did not negotiate the full crypto suite (secret-challenge-v2 + kdf-v2 + header-aad-v1); connections from older EasyTier peers will fail by design, secure mode is unaffected"
+    zh-CN: "拒绝未协商齐完整加密套件（secret-challenge-v2 + kdf-v2 + header-aad-v1）的旧版握手；旧版本 EasyTier 节点的连接会按设计失败，secure mode 不受影响"
   check_config:
     en: Check config validity without starting the network
     zh-CN: 检查配置文件的有效性并退出

@@ -129,6 +129,7 @@ fn build_foreign_peer_context(
     snapshot.max_direct_conns_per_peer_in_foreign_network =
         parent_context_dyn.max_direct_conns_per_peer_in_foreign_network();
     snapshot.hmac_secret_digest = parent_context_dyn.hmac_secret_digest();
+    snapshot.strict_crypto = parent_context_dyn.strict_crypto();
 
     Arc::new(CorePeerContext::new_foreign(
         CoreRuntimeConfigStore::new(CoreRuntimeConfig::default(), Arc::new(snapshot)),
