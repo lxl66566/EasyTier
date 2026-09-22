@@ -347,6 +347,7 @@ impl WasiWebClientRuntime {
                     easytier_version: env!("CARGO_PKG_VERSION").to_owned(),
                     secure_mode: config.secure_mode,
                     server_noise_pin: endpoint.server_noise_pin(),
+                    allow_plain: endpoint.allow_plain(),
                 },
                 backend,
             )

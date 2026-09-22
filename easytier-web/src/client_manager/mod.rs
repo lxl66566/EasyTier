@@ -1190,6 +1190,7 @@ mod tests {
             "test",
             false,
             None,
+            false,
             Arc::new(native_instance_manager()),
             None,
         );

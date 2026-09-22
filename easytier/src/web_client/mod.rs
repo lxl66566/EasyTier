@@ -44,6 +44,7 @@ impl WebClient {
         hostname: H,
         secure_mode: bool,
         server_noise_pin: Option<[u8; 32]>,
+        allow_plain: bool,
         manager: Arc<NativeInstanceManager>,
         hooks: Option<Arc<dyn WebClientHooks>>,
     ) -> Self
@@ -60,6 +61,7 @@ impl WebClient {
             easytier_version: EASYTIER_VERSION.to_owned(),
             secure_mode,
             server_noise_pin,
+            allow_plain,
         };
         #[cfg(feature = "management")]
         let inner = easytier_core::management::WebClient::new(
@@ -160,6 +162,7 @@ pub async fn run_web_client(
         hostname,
         secure_mode,
         endpoint.server_noise_pin(),
+        endpoint.allow_plain(),
         manager,
         hooks,
     ))

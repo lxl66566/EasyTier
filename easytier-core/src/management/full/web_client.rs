@@ -108,6 +108,7 @@ pub struct ConfigServerEndpoint {
     connect_url: Url,
     token: String,
     server_noise_pin: Option<[u8; 32]>,
+    allow_plain: bool,
 }
 
 /// Extracts a server static-key pin from the URL fragment
@@ -131,6 +132,28 @@ fn parse_noise_pin_fragment(url: &Url) -> anyhow::Result<Option<[u8; 32]>> {
     Ok(None)
 }
 
+/// Extracts the explicit plaintext opt-in from the URL fragment
+/// (`#allow-plain=1`). Only `0` and `1` are accepted so a typo fails loudly
+/// instead of silently keeping the encrypted default.
+fn parse_allow_plain_fragment(url: &Url) -> anyhow::Result<bool> {
+    let Some(fragment) = url.fragment() else {
+        return Ok(false);
+    };
+    for pair in fragment.split('&') {
+        let Some(value) = pair.strip_prefix("allow-plain=") else {
+            continue;
+        };
+        return match value {
+            "0" => Ok(false),
+            "1" => Ok(true),
+            _ => Err(anyhow::anyhow!(
+                "invalid allow-plain value in config server URL: {value} (expected 0 or 1)"
+            )),
+        };
+    }
+    Ok(false)
+}
+
 impl ConfigServerEndpoint {
     pub fn parse(input: &str, supports_scheme: impl FnOnce(&Url) -> bool) -> anyhow::Result<Self> {
         let endpoint = Url::parse(input)
@@ -139,6 +162,7 @@ impl ConfigServerEndpoint {
             anyhow::bail!("unsupported config server scheme: {}", endpoint.scheme());
         }
         let server_noise_pin = parse_noise_pin_fragment(&endpoint)?;
+        let allow_plain = parse_allow_plain_fragment(&endpoint)?;
 
         let token = endpoint
             .path_segments()
@@ -161,6 +185,7 @@ impl ConfigServerEndpoint {
             connect_url,
             token,
             server_noise_pin,
+            allow_plain,
         })
     }
 
@@ -176,6 +201,11 @@ impl ConfigServerEndpoint {
     pub fn server_noise_pin(&self) -> Option<[u8; 32]> {
         self.server_noise_pin
     }
+
+    /// Explicit `#allow-plain=1` opt-in for unencrypted sessions.
+    pub fn allow_plain(&self) -> bool {
+        self.allow_plain
+    }
 }
 
 pub struct WebClientConfig {
@@ -188,6 +218,10 @@ pub struct WebClientConfig {
     /// Pinned SHA-256 fingerprint of the config server's noise v2 static
     /// key. When set, only authenticated Noise_XX connections are allowed.
     pub server_noise_pin: Option<[u8; 32]>,
+    /// Explicit `#allow-plain=1` opt-in from the config server URL. Without
+    /// it, a session that cannot be encrypted is refused instead of silently
+    /// downgraded to plaintext.
+    pub allow_plain: bool,
 }
 
 #[async_trait]
@@ -361,6 +395,68 @@ fn warn_once_noise_v1_fallback() {
     });
 }
 
+/// Warn once per process that the management session runs in plaintext by
+/// explicit `#allow-plain=1` opt-in.
+fn warn_once_plaintext_opt_in() {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    WARNED.get_or_init(|| {
+        tracing::warn!(
+            "config server session runs unencrypted, allowed by '#allow-plain=1' in \
+             the URL; a man-in-the-middle can read and modify all config-server traffic"
+        );
+    });
+}
+
+/// What to do with a freshly connected config-server session after the
+/// GetFeature exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionPlan {
+    /// Reconnect and run the noise handshake; v1 still encrypts, v2 also
+    /// authenticates the server (`noise_v2 == false` warns once).
+    Secure { noise_v2: bool },
+    /// Keep the already-open plaintext session (explicit opt-in).
+    Plain,
+    /// Refuse: a pinned endpoint must never lose server authentication.
+    RefusePinned,
+    /// Refuse: unencrypted session without the `#allow-plain=1` opt-in.
+    RefusePlaintext,
+    /// Refuse: secure mode forbids plaintext even with the opt-in.
+    RefuseSecureMode,
+}
+
+/// Picks the session continuation from the negotiated feature flags.
+///
+/// Ordering is security-critical: the pin rule runs first (a pinned
+/// endpoint may never end up on an unauthenticated path, not even with
+/// `#allow-plain=1`), then the encrypted path, and only then the plaintext
+/// decisions.
+fn plan_session(
+    support_encryption: bool,
+    support_noise_v2: bool,
+    local_secure_support: bool,
+    pin: Option<[u8; 32]>,
+    allow_plain: bool,
+    secure_mode: bool,
+) -> SessionPlan {
+    if pin.is_some() && !(support_encryption && support_noise_v2 && local_secure_support) {
+        return SessionPlan::RefusePinned;
+    }
+    if support_encryption && local_secure_support {
+        // Noise v1 still encrypts the session; only dropping to plaintext
+        // needs the explicit opt-in below.
+        return SessionPlan::Secure {
+            noise_v2: support_noise_v2,
+        };
+    }
+    if secure_mode {
+        return SessionPlan::RefuseSecureMode;
+    }
+    if !allow_plain {
+        return SessionPlan::RefusePlaintext;
+    }
+    SessionPlan::Plain
+}
+
 async fn web_client_routine(
     controller: Arc<WebClientController>,
     connected: Arc<AtomicBool>,
@@ -383,82 +479,108 @@ async fn web_client_routine(
             match time::timeout(FEATURE_TIMEOUT, session.get_feature()).await {
                 Ok(Ok(feature)) => (feature.support_encryption, feature.support_noise_v2),
                 Ok(Err(error)) => {
-                    tracing::warn!(%error, "GetFeature RPC failed; using legacy tunnel");
+                    tracing::warn!(%error, "GetFeature RPC failed; assuming no encryption support");
                     (false, false)
                 }
                 Err(_) => {
-                    tracing::warn!("GetFeature RPC timed out; using legacy tunnel");
+                    tracing::warn!("GetFeature RPC timed out; assuming no encryption support");
                     (false, false)
                 }
             };
         let local_secure_support = web_security::web_secure_tunnel_supported();
-        let pin = controller.config.server_noise_pin;
+        let plan = plan_session(
+            support_encryption,
+            support_noise_v2,
+            local_secure_support,
+            controller.config.server_noise_pin,
+            controller.config.allow_plain,
+            controller.config.secure_mode,
+        );
 
-        // Fail-closed rule for pinned endpoints: only a locally supported,
-        // server-advertised Noise_XX handshake may carry the management
-        // session. Never silently fall back to noise v1 or plaintext.
-        if pin.is_some() && !(support_encryption && support_noise_v2 && local_secure_support) {
-            drop(session);
-            connected.store(false, Ordering::Release);
-            tracing::warn!(
-                support_encryption,
-                support_noise_v2,
-                local_secure_support,
-                "config server cannot perform the pinned noise v2 handshake; \
-                 refusing an unauthenticated connection"
-            );
-            time::sleep(RETRY_INTERVAL).await;
-            continue;
-        }
-
-        if support_encryption && local_secure_support {
-            if !support_noise_v2 {
-                warn_once_noise_v1_fallback();
-            }
-            drop(session);
-            let connection = match connect_config_server(connector.as_ref(), CONNECT_TIMEOUT).await
-            {
-                Ok(connection) => connection,
-                Err(error) => {
-                    connected.store(false, Ordering::Release);
-                    tracing::warn!(%error, "failed to reconnect secure config-server tunnel");
-                    time::sleep(RETRY_INTERVAL).await;
-                    continue;
-                }
-            };
-            let mode = web_security::ClientHandshakeMode::negotiate(pin, support_noise_v2);
-            let connection = match web_security::upgrade_client_tunnel(connection, mode).await {
-                Ok(connection) => connection,
-                Err(error) => {
-                    connected.store(false, Ordering::Release);
-                    tracing::warn!(%error, "config-server secure handshake failed");
-                    time::sleep(RETRY_INTERVAL).await;
-                    continue;
-                }
-            };
-            let mut session = WebClientSession::new(connection, controller.clone());
-            session.start_heartbeat().await;
-            session.wait().await;
-            connected.store(false, Ordering::Release);
-            continue;
-        }
-
-        if support_encryption {
-            if controller.config.secure_mode {
+        match plan {
+            SessionPlan::RefusePinned => {
+                // Fail-closed rule for pinned endpoints: only a locally
+                // supported, server-advertised Noise_XX handshake may carry
+                // the management session. Never silently fall back to noise
+                // v1 or plaintext.
+                drop(session);
                 connected.store(false, Ordering::Release);
-                tracing::warn!("secure mode requires web secure-tunnel support in the local build");
+                tracing::warn!(
+                    support_encryption,
+                    support_noise_v2,
+                    local_secure_support,
+                    "config server cannot perform the pinned noise v2 handshake; \
+                     refusing an unauthenticated connection"
+                );
                 time::sleep(RETRY_INTERVAL).await;
                 continue;
             }
-            tracing::warn!(
-                "server supports encryption but the local build is using a legacy tunnel"
-            );
-        }
-        if controller.config.secure_mode {
-            connected.store(false, Ordering::Release);
-            tracing::warn!("secure mode requires config-server encryption support");
-            time::sleep(RETRY_INTERVAL).await;
-            continue;
+            SessionPlan::Secure { noise_v2 } => {
+                if !noise_v2 {
+                    warn_once_noise_v1_fallback();
+                }
+                drop(session);
+                let connection = match connect_config_server(connector.as_ref(), CONNECT_TIMEOUT)
+                    .await
+                {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        connected.store(false, Ordering::Release);
+                        tracing::warn!(%error, "failed to reconnect secure config-server tunnel");
+                        time::sleep(RETRY_INTERVAL).await;
+                        continue;
+                    }
+                };
+                let mode = web_security::ClientHandshakeMode::negotiate(
+                    controller.config.server_noise_pin,
+                    noise_v2,
+                );
+                let connection = match web_security::upgrade_client_tunnel(connection, mode).await {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        connected.store(false, Ordering::Release);
+                        tracing::warn!(%error, "config-server secure handshake failed");
+                        time::sleep(RETRY_INTERVAL).await;
+                        continue;
+                    }
+                };
+                let mut session = WebClientSession::new(connection, controller.clone());
+                session.start_heartbeat().await;
+                session.wait().await;
+                connected.store(false, Ordering::Release);
+                continue;
+            }
+            SessionPlan::RefusePlaintext => {
+                // The GetFeature exchange is plaintext, so a
+                // man-in-the-middle could have forged the "no encryption"
+                // answer. Refuse unless the user opted in explicitly.
+                drop(session);
+                connected.store(false, Ordering::Release);
+                tracing::warn!(
+                    support_encryption,
+                    local_secure_support,
+                    "config server does not support encryption; refusing an unencrypted \
+                     session. If this is intentional, append '#allow-plain=1' to the \
+                     config server URL"
+                );
+                time::sleep(RETRY_INTERVAL).await;
+                continue;
+            }
+            SessionPlan::RefuseSecureMode => {
+                drop(session);
+                connected.store(false, Ordering::Release);
+                tracing::warn!("secure mode requires config-server encryption support");
+                time::sleep(RETRY_INTERVAL).await;
+                continue;
+            }
+            SessionPlan::Plain => {
+                if support_encryption {
+                    tracing::warn!(
+                        "server supports encryption but the local build is using a legacy tunnel"
+                    );
+                }
+                warn_once_plaintext_opt_in();
+            }
         }
 
         session.start_heartbeat().await;
@@ -822,6 +944,105 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_parses_allow_plain_fragment() {
+        let endpoint =
+            ConfigServerEndpoint::parse("udp://example.com/team#allow-plain=1", |_| true).unwrap();
+        assert!(endpoint.allow_plain());
+        // The fragment carries connection options only; it must not leak
+        // into the URL actually dialed.
+        assert_eq!(endpoint.connect_url().as_str(), "udp://example.com");
+
+        // absent fragments, explicit opt-out and unrelated pairs mean no opt-in
+        assert!(
+            !ConfigServerEndpoint::parse("udp://example.com/team", |_| true)
+                .unwrap()
+                .allow_plain()
+        );
+        assert!(
+            !ConfigServerEndpoint::parse("udp://example.com/team#allow-plain=0", |_| true)
+                .unwrap()
+                .allow_plain()
+        );
+        assert!(
+            !ConfigServerEndpoint::parse("udp://example.com/team#other=1", |_| true)
+                .unwrap()
+                .allow_plain()
+        );
+        // coexists with the fingerprint pin
+        let digest = [0x44u8; 32];
+        let pin = crate::tunnel::fingerprint::format_sha256_fingerprint(&digest);
+        let endpoint = ConfigServerEndpoint::parse(
+            &format!("udp://example.com/team#fingerprint={pin}&allow-plain=1"),
+            |_| true,
+        )
+        .unwrap();
+        assert!(endpoint.allow_plain());
+        assert_eq!(endpoint.server_noise_pin(), Some(digest));
+    }
+
+    #[test]
+    fn endpoint_rejects_malformed_allow_plain() {
+        let error = ConfigServerEndpoint::parse("udp://example.com/team#allow-plain=yes", |_| true)
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid allow-plain"), "{error}");
+    }
+
+    #[test]
+    fn plaintext_sessions_require_the_explicit_opt_in() {
+        // Server (or a man-in-the-middle rewriting the plaintext GetFeature
+        // exchange) claims no encryption: refused by default, allowed with
+        // the '#allow-plain=1' opt-in.
+        assert_eq!(
+            plan_session(false, false, true, None, false, false),
+            SessionPlan::RefusePlaintext
+        );
+        assert_eq!(
+            plan_session(false, false, true, None, true, false),
+            SessionPlan::Plain
+        );
+
+        // The opt-in never downgrades a pinned endpoint: fail closed stays
+        // fail closed even when the server claims to lack v2 or encryption.
+        assert_eq!(
+            plan_session(false, false, true, Some([9; 32]), true, false),
+            SessionPlan::RefusePinned
+        );
+        assert_eq!(
+            plan_session(true, false, true, Some([9; 32]), true, false),
+            SessionPlan::RefusePinned
+        );
+
+        // Secure mode outranks the opt-in.
+        assert_eq!(
+            plan_session(false, false, true, None, true, true),
+            SessionPlan::RefuseSecureMode
+        );
+        assert_eq!(
+            plan_session(false, false, true, None, false, true),
+            SessionPlan::RefuseSecureMode
+        );
+    }
+
+    #[test]
+    fn encrypted_paths_are_preferred_when_available() {
+        assert_eq!(
+            plan_session(true, true, true, None, false, true),
+            SessionPlan::Secure { noise_v2: true }
+        );
+        // Noise v1 still encrypts: allowed with a warn, no opt-in needed.
+        assert_eq!(
+            plan_session(true, false, true, None, false, false),
+            SessionPlan::Secure { noise_v2: false }
+        );
+        // Server supports encryption but the local build cannot: plaintext
+        // rules apply.
+        assert_eq!(
+            plan_session(true, true, false, None, false, false),
+            SessionPlan::RefusePlaintext
+        );
+    }
+
+    #[test]
     fn heartbeat_request_carries_registered_and_failed_instance_ids() {
         let runtime_id = uuid::Uuid::new_v4();
         let registered = uuid::Uuid::new_v4();
@@ -835,6 +1056,7 @@ mod tests {
                 easytier_version: "test-version".to_owned(),
                 secure_mode: false,
                 server_noise_pin: None,
+                allow_plain: false,
             },
             runtime_id,
             vec![registered],
