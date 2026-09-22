@@ -194,6 +194,59 @@ impl Encryptor for UnsupportedCipher {
     }
 }
 
+/// Factory-level decrypt-logging adapter: the single log point for AEAD
+/// decrypt failures.
+///
+/// Backends only return errors; this wrapper reports every failure once as a
+/// debug line carrying the backend label and the error category. Corrupted
+/// ciphertext is attacker-controllable, so the level is debug (it must not
+/// be usable to flood the log) and packet contents are never printed.
+/// Wrapping at the factory keeps every backend (openssl, ring, rust-crypto,
+/// wasi-host) uniform and rules out double logging from backend-internal
+/// sites.
+struct DecryptLoggingCipher {
+    backend: &'static str,
+    cipher: Arc<dyn Encryptor>,
+}
+
+impl Encryptor for DecryptLoggingCipher {
+    fn decrypt(&self, zc_packet: &mut ZCPacket) -> Result<(), Error> {
+        self.cipher.decrypt(zc_packet).inspect_err(|error| {
+            tracing::debug!(backend = self.backend, %error, "aead decrypt failed");
+        })
+    }
+
+    fn encrypt(&self, zc_packet: &mut ZCPacket, binding: AeadBinding) -> Result<(), Error> {
+        self.cipher.encrypt(zc_packet, binding)
+    }
+
+    fn encrypt_with_nonce(
+        &self,
+        zc_packet: &mut ZCPacket,
+        nonce: Option<&[u8]>,
+        binding: AeadBinding,
+    ) -> Result<(), Error> {
+        self.cipher.encrypt_with_nonce(zc_packet, nonce, binding)
+    }
+
+    fn encrypt_with_suite(
+        &self,
+        zc_packet: &mut ZCPacket,
+        binding: AeadBinding,
+        kdf: KdfSuite,
+    ) -> Result<(), Error> {
+        self.cipher.encrypt_with_suite(zc_packet, binding, kdf)
+    }
+}
+
+/// Wraps an AEAD backend so its decrypt failures go through the shared
+/// [`DecryptLoggingCipher`] log point.
+// Reduced profiles without any AEAD backend never construct it.
+#[allow(dead_code)]
+fn decrypt_logged(backend: &'static str, cipher: Arc<dyn Encryptor>) -> Arc<dyn Encryptor> {
+    Arc::new(DecryptLoggingCipher { backend, cipher })
+}
+
 fn invalid_encryptor(algorithm: &str) -> Arc<dyn Encryptor> {
     Arc::new(UnsupportedCipher {
         algorithm: algorithm.to_owned(),
@@ -280,56 +333,117 @@ fn preferred_aead_backend(_algorithm: EncryptionAlgorithm) -> Option<AeadBackend
 
 #[allow(unreachable_patterns)]
 fn create_aes_128(key: [u8; 16]) -> Arc<dyn Encryptor> {
-    let fallback = match preferred_aead_backend(EncryptionAlgorithm::AesGcm) {
-        #[cfg(feature = "openssl-crypto")]
-        Some(AeadBackend::OpenSsl) => Arc::new(openssl::OpenSslCipher::new_aes128_gcm(key)),
-        #[cfg(all(not(feature = "openssl-crypto"), feature = "ring-crypto"))]
-        Some(AeadBackend::Ring) => Arc::new(ring::RingCipher::new_aes128_gcm(key)),
-        #[cfg(all(
-            not(feature = "openssl-crypto"),
-            not(feature = "ring-crypto"),
-            feature = "aes-gcm"
-        ))]
-        Some(AeadBackend::RustCrypto) => Arc::new(aes_gcm::AesGcmCipher::new_128(key)),
-        _ => unavailable_encryptor("aes-gcm"),
+    let (backend, cipher): (Option<&'static str>, Arc<dyn Encryptor>) =
+        match preferred_aead_backend(EncryptionAlgorithm::AesGcm) {
+            #[cfg(feature = "openssl-crypto")]
+            Some(AeadBackend::OpenSsl) => (
+                Some("aes-gcm/openssl"),
+                Arc::new(openssl::OpenSslCipher::new_aes128_gcm(key)),
+            ),
+            #[cfg(all(not(feature = "openssl-crypto"), feature = "ring-crypto"))]
+            Some(AeadBackend::Ring) => (
+                Some("aes-gcm/ring"),
+                Arc::new(ring::RingCipher::new_aes128_gcm(key)),
+            ),
+            #[cfg(all(
+                not(feature = "openssl-crypto"),
+                not(feature = "ring-crypto"),
+                feature = "aes-gcm"
+            ))]
+            Some(AeadBackend::RustCrypto) => (
+                Some("aes-gcm/rust-crypto"),
+                Arc::new(aes_gcm::AesGcmCipher::new_128(key)),
+            ),
+            // No backend compiled in: a config-level rejection, not a
+            // decrypt failure, so it stays unwrapped and unlogged.
+            _ => (None, unavailable_encryptor("aes-gcm")),
+        };
+    // On wasi the host adapter fronts the selected software backend; the
+    // label must name the outermost layer, the one that rejected a packet.
+    let backend = if cfg!(all(target_os = "wasi", feature = "wasi-crypto-offload")) {
+        Some("aes-gcm/wasi-host")
+    } else {
+        backend
     };
-    maybe_offload_aead(EncryptionAlgorithm::AesGcm, &key, fallback)
+    let cipher = maybe_offload_aead(EncryptionAlgorithm::AesGcm, &key, cipher);
+    match (backend, cipher) {
+        (Some(backend), cipher) => decrypt_logged(backend, cipher),
+        (None, cipher) => cipher,
+    }
 }
 
 #[allow(unreachable_patterns)]
 fn create_aes_256(key: [u8; 32]) -> Arc<dyn Encryptor> {
-    let fallback = match preferred_aead_backend(EncryptionAlgorithm::Aes256Gcm) {
-        #[cfg(feature = "openssl-crypto")]
-        Some(AeadBackend::OpenSsl) => Arc::new(openssl::OpenSslCipher::new_aes256_gcm(key)),
-        #[cfg(all(not(feature = "openssl-crypto"), feature = "ring-crypto"))]
-        Some(AeadBackend::Ring) => Arc::new(ring::RingCipher::new_aes256_gcm(key)),
-        #[cfg(all(
-            not(feature = "openssl-crypto"),
-            not(feature = "ring-crypto"),
-            feature = "aes-gcm"
-        ))]
-        Some(AeadBackend::RustCrypto) => Arc::new(aes_gcm::AesGcmCipher::new_256(key)),
-        _ => unavailable_encryptor("aes-256-gcm"),
+    let (backend, cipher): (Option<&'static str>, Arc<dyn Encryptor>) =
+        match preferred_aead_backend(EncryptionAlgorithm::Aes256Gcm) {
+            #[cfg(feature = "openssl-crypto")]
+            Some(AeadBackend::OpenSsl) => (
+                Some("aes-256-gcm/openssl"),
+                Arc::new(openssl::OpenSslCipher::new_aes256_gcm(key)),
+            ),
+            #[cfg(all(not(feature = "openssl-crypto"), feature = "ring-crypto"))]
+            Some(AeadBackend::Ring) => (
+                Some("aes-256-gcm/ring"),
+                Arc::new(ring::RingCipher::new_aes256_gcm(key)),
+            ),
+            #[cfg(all(
+                not(feature = "openssl-crypto"),
+                not(feature = "ring-crypto"),
+                feature = "aes-gcm"
+            ))]
+            Some(AeadBackend::RustCrypto) => (
+                Some("aes-256-gcm/rust-crypto"),
+                Arc::new(aes_gcm::AesGcmCipher::new_256(key)),
+            ),
+            _ => (None, unavailable_encryptor("aes-256-gcm")),
+        };
+    let backend = if cfg!(all(target_os = "wasi", feature = "wasi-crypto-offload")) {
+        Some("aes-256-gcm/wasi-host")
+    } else {
+        backend
     };
-    maybe_offload_aead(EncryptionAlgorithm::Aes256Gcm, &key, fallback)
+    let cipher = maybe_offload_aead(EncryptionAlgorithm::Aes256Gcm, &key, cipher);
+    match (backend, cipher) {
+        (Some(backend), cipher) => decrypt_logged(backend, cipher),
+        (None, cipher) => cipher,
+    }
 }
 
 #[allow(unreachable_patterns)]
 fn create_chacha20(key: [u8; 32]) -> Arc<dyn Encryptor> {
-    let fallback = match preferred_aead_backend(EncryptionAlgorithm::ChaCha20) {
-        #[cfg(feature = "openssl-crypto")]
-        Some(AeadBackend::OpenSsl) => Arc::new(openssl::OpenSslCipher::new_chacha20(key)),
-        #[cfg(all(not(feature = "openssl-crypto"), feature = "ring-crypto"))]
-        Some(AeadBackend::Ring) => Arc::new(ring::RingCipher::new_chacha20(key)),
-        #[cfg(all(
-            not(feature = "openssl-crypto"),
-            not(feature = "ring-crypto"),
-            feature = "chacha20"
-        ))]
-        Some(AeadBackend::RustCrypto) => Arc::new(chacha20::ChaCha20Cipher::new(key)),
-        _ => unavailable_encryptor("chacha20"),
+    let (backend, cipher): (Option<&'static str>, Arc<dyn Encryptor>) =
+        match preferred_aead_backend(EncryptionAlgorithm::ChaCha20) {
+            #[cfg(feature = "openssl-crypto")]
+            Some(AeadBackend::OpenSsl) => (
+                Some("chacha20/openssl"),
+                Arc::new(openssl::OpenSslCipher::new_chacha20(key)),
+            ),
+            #[cfg(all(not(feature = "openssl-crypto"), feature = "ring-crypto"))]
+            Some(AeadBackend::Ring) => (
+                Some("chacha20/ring"),
+                Arc::new(ring::RingCipher::new_chacha20(key)),
+            ),
+            #[cfg(all(
+                not(feature = "openssl-crypto"),
+                not(feature = "ring-crypto"),
+                feature = "chacha20"
+            ))]
+            Some(AeadBackend::RustCrypto) => (
+                Some("chacha20/rust-crypto"),
+                Arc::new(chacha20::ChaCha20Cipher::new(key)),
+            ),
+            _ => (None, unavailable_encryptor("chacha20")),
+        };
+    let backend = if cfg!(all(target_os = "wasi", feature = "wasi-crypto-offload")) {
+        Some("chacha20/wasi-host")
+    } else {
+        backend
     };
-    maybe_offload_aead(EncryptionAlgorithm::ChaCha20, &key, fallback)
+    let cipher = maybe_offload_aead(EncryptionAlgorithm::ChaCha20, &key, cipher);
+    match (backend, cipher) {
+        (Some(backend), cipher) => decrypt_logged(backend, cipher),
+        (None, cipher) => cipher,
+    }
 }
 
 #[cfg(all(target_os = "wasi", feature = "wasi-crypto-offload"))]

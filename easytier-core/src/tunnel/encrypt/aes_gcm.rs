@@ -55,6 +55,9 @@ impl Encryptor for AesGcmCipher {
         let tag = aes_tail.tag.into();
         let aad = aad.as_ref().map(|b| &b[..]).unwrap_or(&[]);
 
+        // The factory wraps this backend with the shared decrypt-failure
+        // debug log (see `DecryptLoggingCipher`); backends only return
+        // errors so no path can log twice.
         let rs = match &self.cipher {
             AesGcmEnum::AES128GCM(aes_gcm) => aes_gcm.decrypt_in_place_detached(
                 &nonce,
@@ -70,12 +73,7 @@ impl Encryptor for AesGcmCipher {
             ),
         };
 
-        if let Err(e) = rs {
-            // Corrupted ciphertext is attacker-controllable; keep this at debug
-            // level so it cannot be used to flood the log.
-            tracing::debug!(?e, "aes-gcm decrypt failed");
-            return Err(Error::DecryptionFailed);
-        }
+        rs.map_err(|_| Error::DecryptionFailed)?;
 
         let pm_header = zc_packet.mut_peer_manager_header().unwrap();
         pm_header.set_encrypted(false);
