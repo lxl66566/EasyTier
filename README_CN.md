@@ -294,6 +294,17 @@ sudo easytier-core -p 'quic://server.example.com:11010#fingerprint=sha256:<64位
 
 对于尚未升级到 TLS 传输的对端，旧的仅校验和（明文）会话保留为显式开关：在节点 URL 后附加 `#plain=1` 以明文拨号，或在监听 URL 后附加（`-l 'quic://0.0.0.0:11010#plain=1'`）以接收明文客户端。`#plain=1` 监听器只接收旧版客户端——TLS 与明文无法共用同一端口——且任何 TLS 到明文的回退都不会自动发生。明文模式不提供加密与认证，并会打印警告；此类链路请保持 `enable_encryption`（默认）或 secure mode 开启。
 
+内部 `wg://` 隧道的 WireGuard 静态密钥改用 argon2id（内存困难型，19 MiB / 2 轮）从网络名称与网络密钥派生，捕获一次握手不再能对弱网络密钥做高速离线爆破；并且连接两端派生不同密钥（dialer 半与 listener 半），节点间不再共享同一把静态密钥。这是一个破坏性变更：仍使用旧快速哈希派生的节点无法连接，接受侧会检测到不匹配并打印日志。请将两端都升级，或对单条链路显式选用旧密钥 `#legacy-keys=1`：
+
+```bash
+# 拨号一个尚未升级的对端
+sudo easytier-core -p 'wg://old-node.example.com:11013#legacy-keys=1'
+# 或用专用监听器接收旧版节点
+sudo easytier-core -l 'wg://0.0.0.0:11013#legacy-keys=1'
+```
+
+`#legacy-keys=1` 监听器只接收旧版节点，旧派生属于安全性降级并会打印警告，且任何自动回退都不会发生。
+
 `wss://` 隧道虽然使用 TLS，但默认情况下客户端接受任意服务器证书，主动中间人仍可冒充服务器。可在节点 URL 的 fragment 中固定服务器证书指纹来防范：
 
 ```bash

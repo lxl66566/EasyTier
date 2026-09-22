@@ -295,6 +295,17 @@ The fingerprint of a node's quic listener certificate is logged when the listene
 
 For peers that have not upgraded to the TLS transport yet, the old checksum-only (plaintext) session is available as an explicit opt-in: append `#plain=1` to the peer URL to dial plaintext, or to the listener URL (`-l 'quic://0.0.0.0:11010#plain=1'`) to serve plaintext clients. A `#plain=1` listener accepts legacy clients only — TLS and plaintext cannot share one port — and no TLS-to-plaintext fallback ever happens automatically. Plaintext mode provides no encryption or authentication and logs a warning; keep `enable_encryption` (default) or secure mode enabled for such links.
 
+The internal `wg://` tunnel derives its WireGuard static keys from the network name and secret with argon2id (memory-hard, 19 MiB / 2 passes), so a captured handshake no longer allows high-rate offline guessing of weak network secrets. The two ends of a connection also derive different keys (dialer and listener halves), so nodes no longer share one static key. This is a breaking change: a node running the old fast-hash derivation cannot connect, and the mismatch is detected and logged on the accepting side. Upgrade both nodes, or opt a single link back into the old keys with `#legacy-keys=1`:
+
+```bash
+# Dial a peer that has not upgraded yet
+sudo easytier-core -p 'wg://old-node.example.com:11013#legacy-keys=1'
+# Or serve legacy peers on a dedicated listener
+sudo easytier-core -l 'wg://0.0.0.0:11013#legacy-keys=1'
+```
+
+A `#legacy-keys=1` listener serves legacy peers only, the legacy derivation is a security downgrade and logs a warning, and no automatic fallback ever happens.
+
 `wss://` tunnels do run TLS, but by default the client accepts any server certificate, so an active man-in-the-middle can still impersonate the server. To prevent that, pin the server certificate fingerprint in the peer URL fragment:
 
 ```bash
