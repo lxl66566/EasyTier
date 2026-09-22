@@ -1,4 +1,5 @@
 use super::FromUrl;
+use super::cert::{PersistentServerCert, ServerCertSpec, load_process_cert};
 use super::tls_verification::{init_crypto_provider, pinned_fingerprint};
 use crate::tunnel::common::bind;
 use crate::{proto::common::TunnelInfo, socket::tcp::RuntimeTcpSocket};
@@ -7,14 +8,10 @@ use cidr::IpCidr;
 use easytier_core::{
     packet::{ZCPacket, ZCPacketType},
     socket::tcp::VirtualTcpSocket,
-    tunnel::{
-        IpVersion, Tunnel, TunnelError, fingerprint::format_sha256_fingerprint,
-        wrapper::TunnelWrapper,
-    },
+    tunnel::{IpVersion, Tunnel, TunnelError, wrapper::TunnelWrapper},
 };
 use forwarded_header_value::ForwardedHeaderValue;
 use futures::{Sink, StreamExt};
-use sha2::{Digest, Sha256};
 use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
@@ -154,43 +151,29 @@ fn get_tls_client_config(pinned: Option<[u8; 32]>) -> rustls::ClientConfig {
 
 /// Self-signed certificate served by wss listeners.
 ///
-/// Generated once per process so the fingerprint stays stable across accepted
-/// connections and restarts of the tunnel; clients can pin it via
-/// `#fingerprint=sha256:<hex>`. The fingerprint is logged when the certificate
-/// is first generated. Persisting the key across process restarts is future
-/// work; until then every restart changes the fingerprint and pinned peers
-/// fail closed until re-pinned.
-static SERVER_TLS_CERT: LazyLock<ServerTlsCert> = LazyLock::new(ServerTlsCert::generate);
+/// The key pair is persisted in the per-user state directory by the shared
+/// certificate module ([`super::cert`], same mechanism as the quic listener),
+/// so the fingerprint stays stable across restarts and clients can pin it
+/// via `#fingerprint=sha256:<hex>`. The fingerprint is logged once per
+/// process when the certificate is first loaded.
+static SERVER_TLS_CERT: LazyLock<Result<PersistentServerCert, String>> =
+    LazyLock::new(|| load_process_cert(&WSS_CERT_SPEC).map_err(|error| format!("{error:#}")));
 
-struct ServerTlsCert {
-    acceptor: TlsAcceptor,
-    // Exposed for tests that pin the in-process listener certificate; the
-    // log line in `generate` is the production surface.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fingerprint: [u8; 32],
-}
+const WSS_CERT_SPEC: ServerCertSpec = ServerCertSpec {
+    file_name: "wss-server-key.pem",
+    label: "wss",
+    alpn: None,
+    // Keep TLS 1.2 so browser-era websocket clients still interoperate.
+    tls13_only: false,
+};
 
-impl ServerTlsCert {
-    fn generate() -> Self {
-        init_crypto_provider();
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let cert_der = cert.serialize_der().unwrap();
-        let fingerprint = Sha256::digest(&cert_der).into();
-        let private_key = cert.serialize_private_key_der();
-        let private_key = rustls::pki_types::PrivatePkcs8KeyDer::from(private_key);
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der.into()], private_key.into())
-            .expect("self-signed wss certificate should be loadable");
-        tracing::info!(
-            fingerprint = %format_sha256_fingerprint(&fingerprint),
-            "generated wss server certificate; clients can pin it via '#fingerprint=sha256:<hex>'"
-        );
-        Self {
-            acceptor: TlsAcceptor::from(Arc::new(config)),
-            fingerprint,
-        }
-    }
+/// The process-wide wss server certificate. A broken certificate file is a
+/// sticky error: failing loudly beats silently rotating the server identity
+/// and breaking every pinned peer.
+fn wss_server_cert() -> Result<&'static PersistentServerCert, TunnelError> {
+    SERVER_TLS_CERT
+        .as_ref()
+        .map_err(|error| TunnelError::InternalError(format!("wss server certificate: {error}")))
 }
 
 pub(crate) async fn upgrade_accepted<S>(
@@ -203,7 +186,8 @@ where
     let peer_addr = stream.peer_addr()?;
     let mut remote_url = socket_url(local_url.scheme(), peer_addr);
     let stream = if is_wss(&local_url)? {
-        Either::Left(SERVER_TLS_CERT.acceptor.accept(stream).await?)
+        let acceptor = TlsAcceptor::from(wss_server_cert()?.tls_config());
+        Either::Left(acceptor.accept(stream).await?)
     } else {
         Either::Right(stream)
     };
@@ -398,7 +382,9 @@ where
 pub mod tests {
     use super::*;
     use easytier_core::socket::SocketListener;
+    use easytier_core::tunnel::fingerprint::format_sha256_fingerprint;
     use futures::{SinkExt, StreamExt};
+    use sha2::{Digest, Sha256};
     use std::io;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -613,7 +599,7 @@ pub mod tests {
             }
         });
 
-        let pinned = SERVER_TLS_CERT.fingerprint;
+        let pinned = wss_server_cert().unwrap().fingerprint();
         let pin_value = format_sha256_fingerprint(&pinned);
 
         // matching pin: handshake succeeds and data flows
