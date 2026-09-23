@@ -98,15 +98,32 @@ fn argon2_hash(secret: &str, salt: &[u8], out: &mut [u8]) {
 /// length. The cache key is (salt, out_len, secret), so repeated calls pay the
 /// argon2id cost once per secret per domain. The data-plane 48-byte
 /// derivation's salt domain is unchanged (see [`ARGON2_SALT`]).
+///
+/// The cache lock is only held for map reads and inserts; argon2id runs
+/// outside it, so one domain's cold derivation never stalls another
+/// domain's cache hit.
 pub fn derive_domain_key_argon2id(secret: &str, salt: &'static [u8], out_len: usize) -> Vec<u8> {
     let cache = DOMAIN_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    // Fast path: short lock, return on hit.
+    {
+        let domains = cache.lock().unwrap();
+        if let Some(keys) = domains.get(&(salt, out_len)).and_then(|d| d.get(secret)) {
+            return keys.to_vec();
+        }
+    }
+
+    // Derive without the lock. Concurrent cold derivations of the same
+    // (domain, secret) duplicate work but are deterministic, so the second
+    // lock double-checks and keeps one canonical entry.
+    let mut out = vec![0u8; out_len];
+    argon2_hash(secret, salt, &mut out);
+
     let mut domains = cache.lock().unwrap();
     let domain = domains.entry((salt, out_len)).or_default();
     if let Some(keys) = domain.get(secret) {
         return keys.to_vec();
     }
-    let mut out = vec![0u8; out_len];
-    argon2_hash(secret, salt, &mut out);
     if domain.len() >= KEY_CACHE_CAP {
         domain.clear();
     }
@@ -295,6 +312,48 @@ mod tests {
         assert!(
             warm < cold,
             "cache hit ({warm:?}) must be faster than the argon2id run ({cold:?})"
+        );
+    }
+
+    #[test]
+    fn cold_derivation_does_not_block_cache_hits() {
+        // Two cold argon2id runs in flight must not delay another secret's
+        // warm hit: derivation happens outside the cache lock. With a
+        // lock-held derivation the hit below waited for a full argon2id run.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const SALT: &[u8] = b"easytier-test-cache-lock";
+        let warm = derive_domain_key_argon2id("warm-secret", SALT, 64);
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let cold: Vec<_> = (0..2)
+            .map(|i| {
+                let started = started.clone();
+                std::thread::spawn(move || {
+                    started.fetch_add(1, Ordering::Relaxed);
+                    derive_domain_key_argon2id(&format!("cold-secret-{i}"), SALT, 64)
+                })
+            })
+            .collect();
+
+        while started.load(Ordering::Relaxed) < 2 {
+            std::thread::yield_now();
+        }
+
+        let begin = std::time::Instant::now();
+        let hit = derive_domain_key_argon2id("warm-secret", SALT, 64);
+        let elapsed = begin.elapsed();
+
+        for thread in cold {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(hit, warm);
+        // A hit is a mutex plus a hashmap lookup, microseconds; 50 ms is far
+        // above that yet below the in-flight argon2id runs it used to wait on.
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "warm cache hit took {elapsed:?}, blocked by in-flight cold derivations"
         );
     }
 
