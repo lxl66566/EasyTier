@@ -10,7 +10,7 @@
   - easytier-core/src/tunnel/stats.rs
 - 具体改动：把 `Throughput` 的四个 `UnsafeCell<u64>` 字段换成 `AtomicU64`，`record_tx_bytes`/`record_rx_bytes` 用 `fetch_add`（Relaxed），读取用 `load`（Relaxed），`Clone` 实现按当前值构造。公开 API 签名不变，调用方（peer_conn_ping.rs、filter.rs、peer_conn.rs）无需改动。可参照 foundation/stats.rs 中 `UnsafeCounter` 的既有改法。
 - 验证方式：`cargo test -p easytier-core --lib`；在 stats.rs 内新增并发冒烟测试（多线程同时 record 与读取，断言计数单调不减）。
-- 状态：未开始（提交：）
+- 状态：已完成（提交：45b66855）
 
 ### IMP-02 消除 ACL 规则统计的裸指针改写（数据竞争，UB）
 
@@ -20,7 +20,7 @@
   - easytier-core/src/peers/acl/processor.rs
 - 具体改动：在 processor.rs 内新增内部类型 `AclRuleStat { packet_count: AtomicU64, byte_count: AtomicU64 }`，`FastLookupRule.rule_stats` 与 `AclCacheEntry.rule_stats_vec` 改存 `Arc<AclRuleStat>`；`inc_cache_entry_stats` 改为 `fetch_add` 并删除裸指针代码；`get_rules_stats` 在导出时把原子值装配成 proto 的 `StatItem`。构造点在 processor.rs 第 254、851 行附近。
 - 验证方式：`cargo test -p easytier-core --lib`（acl 模块已有大量测试覆盖统计导出）；新增双线程并发 `process_packet` 断言计数和等于发包数的测试。
-- 状态：未开始（提交：）
+- 状态：已完成（提交：47d597b4）
 
 ### IMP-03 让 strict_crypto 可以经管理面（web/RPC）下发
 
@@ -33,7 +33,7 @@
   - easytier-core/src/management/full/config_patch.rs
 - 具体改动：在 `NetworkConfig` 的 flags/设置中加 `strict_crypto` 布尔字段；`gen_config` 调用 `cfg.set_strict_crypto`，`new_from_config` 回读；config_patch.rs 若维护网络级开关区段则同步纳入。保持默认 false 不变，避免改变现有托管实例行为。
 - 验证方式：重新生成 proto 后 `cargo test -p easytier-core --lib`（新增 NetworkConfig 与 toml 的往返测试：设置 true 经 gen_config/new_from_config 不丢失）；`cargo check -p easytier-web`。
-- 状态：未开始（提交：）
+- 状态：已完成（提交：2636db4f）
 
 ### IMP-04 数据面逐包日志限频，防远程日志洪水
 
@@ -53,7 +53,7 @@
   - easytier-core/src/tunnel/encrypt/kdf.rs
 - 具体改动：先查缓存命中则直接返回；未命中时释放锁计算 argon2id，再重新加锁做 double-check 插入（并发同 secret 派生两次无害，结果确定）。KEY_CACHE_CAP 淘汰逻辑保持在第二次加锁内。
 - 验证方式：`cargo test -p easytier-core --lib`（已有 `domain_key_cache_hit_skips_argon2` 等测试继续通过）；新增测试断言两个线程对不同 secret 冷派生期间第三个线程的缓存命中不被阻塞（用短超时断言）。
-- 状态：未开始（提交：）
+- 状态：已完成（提交：a9dd443a）
 
 ### IMP-06 IPv4 广播/组播 fanout 并发发送
 
