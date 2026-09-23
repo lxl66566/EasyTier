@@ -422,16 +422,20 @@ struct QuicPacketSender {
 impl QuicPacketSender {
     #[instrument]
     pub async fn run(mut self) {
-        while let Some(packet) = self.rx.recv().await {
+        'packet: while let Some(packet) = self.rx.recv().await {
             let Ok(addr) = QuicAddr::try_from(packet.addr) else {
                 error!("invalid quic packet addr: {:?}", packet.addr);
                 continue;
             };
 
             let mut payload = packet.payload;
-            let segment = packet
-                .segment
-                .expect("segment size must be set for outgoing quic packet");
+            let segment = match packet.segment {
+                Some(segment) => segment,
+                None => {
+                    error!("segment size missing for outgoing quic packet");
+                    continue;
+                }
+            };
 
             while !payload.is_empty() {
                 let len = min(payload.len(), segment);
@@ -443,7 +447,8 @@ impl QuicPacketSender {
                     PacketType::QuicDst => WrappedTransportRole::Destination,
                     packet_type => {
                         error!(?packet_type, "invalid QUIC proxy output packet type");
-                        continue;
+                        // skip the whole packet, not just this segment
+                        continue 'packet;
                     }
                 };
                 if self
@@ -682,9 +687,9 @@ impl QuicProxy {
             endpoint_config(),
             Some(server_config()?),
             Arc::new(socket),
-            default_runtime().unwrap(),
+            default_runtime().context("no async runtime for quinn endpoint")?,
         )
-        .unwrap(); // TODO: maybe a different transport config
+        .context("failed to create quic proxy endpoint")?; // TODO: maybe a different transport config
         endpoint.set_default_client_config(client_config());
         self.endpoint = Some(endpoint.clone());
 
@@ -1327,6 +1332,63 @@ mod tests {
         let chunk3_start = actual_segment_size * 2 + margins.header;
         let chunk3_data = &payload[chunk3_start..chunk3_start + segment_size];
         assert_eq!(chunk3_data[0], 3u8, "Chunk 3 corrupted");
+    }
+
+    #[tokio::test]
+    async fn sender_skips_packet_without_segment_size() {
+        // A packet without a segment size must be dropped instead of panicking,
+        // and later valid packets must still be forwarded.
+        let (header, zc_packet_type) = {
+            let header = ZCPacket::new_with_payload(&[]);
+            let zc_packet_type = header.packet_type();
+            let payload_offset = header.payload_offset();
+            (
+                header.inner().split_to(payload_offset).freeze(),
+                zc_packet_type,
+            )
+        };
+        let margins: PacketMargins = (header.len(), TAIL_RESERVED_SIZE).into();
+
+        let (tx, rx) = channel::<QuicPacket>(4);
+        let (datagrams_tx, mut datagrams_rx) = channel::<WrappedTransportDatagram>(4);
+        tokio::spawn(
+            QuicPacketSender {
+                datagrams: datagrams_tx,
+                rx,
+                header,
+                zc_packet_type,
+                margins,
+            }
+            .run(),
+        );
+
+        let addr: SocketAddr = QuicAddr::new(0x0a00_0001, PacketType::QuicSrc).into();
+        tx.send(QuicPacket::new(
+            addr,
+            BytesMut::from(&b"junk"[..]),
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let data = b"hello";
+        let segment = data.len() + margins.len();
+        let mut payload = BytesMut::zeroed(segment);
+        payload[margins.header..margins.header + data.len()].copy_from_slice(data);
+        tx.send(QuicPacket::new(addr, payload, Some(segment), None))
+            .await
+            .unwrap();
+
+        let datagram = timeout(Duration::from_secs(5), datagrams_rx.recv())
+            .await
+            .expect("sender stopped after packet without segment size")
+            .unwrap();
+        assert_eq!(datagram.transport, WrappedTransportKind::Quic);
+        assert_eq!(datagram.role, WrappedTransportRole::Source);
+        assert_eq!(datagram.peer_id, 0x0a00_0001);
+        // the packet without segment size must not produce any datagram
+        assert!(datagrams_rx.try_recv().is_err());
     }
 
     async fn assert_stream_roundtrip(connection: &Connection) -> anyhow::Result<()> {
