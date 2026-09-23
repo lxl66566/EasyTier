@@ -118,6 +118,7 @@ pub fn network_config_from_toml(config: &TomlConfig) -> NetworkConfig {
     }
 
     result.secure_mode = config.get_secure_mode();
+    result.strict_crypto = Some(config.get_strict_crypto());
     result.credential_file = config
         .get_credential_file()
         .map(|path| path.to_string_lossy().into_owned());

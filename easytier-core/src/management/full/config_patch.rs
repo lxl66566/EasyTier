@@ -278,6 +278,10 @@ where
             tx.candidate.set_flags(flags);
             tx.mark_dirty();
         }
+        if let Some(strict_crypto) = patch.strict_crypto {
+            tx.candidate.set_strict_crypto(strict_crypto);
+            tx.mark_dirty();
+        }
         if let Some(enabled) = patch.ipv6_public_addr_provider {
             tx.candidate.set_ipv6_public_addr_provider(enabled);
             tx.mark_dirty();

@@ -106,6 +106,8 @@ message NetworkConfig {
   optional VpnPortalConfig vpn_portal_config = 69;
   repeated ManagedCredentialConfig managed_credentials = 71;
   optional bool prefer_peer_relay = 72;
+  // Reject legacy handshakes that did not negotiate the full crypto suite.
+  optional bool strict_crypto = 73;
 }
 
 message ManagedCredentialConfig {
