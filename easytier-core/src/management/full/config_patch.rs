@@ -470,7 +470,6 @@ where
     Ok(())
 }
 
-
 fn patch_without_managed_credentials(patch: &InstanceConfigPatch) -> InstanceConfigPatch {
     let mut patch = patch.clone();
     patch.managed_credentials = None;
