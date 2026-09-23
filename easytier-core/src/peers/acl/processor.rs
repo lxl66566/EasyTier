@@ -2,10 +2,11 @@ use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     str::FromStr as _,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use atomic_shim::AtomicU64;
 use quanta::Instant;
 
 use crate::foundation::token_bucket::TokenBucket;
@@ -59,6 +60,43 @@ impl RuleId {
     }
 }
 
+// Per-rule statistics with atomic counters, shared between rule vectors and
+// cache entries via Arc. process_packet runs concurrently on multiple tasks,
+// so counters must be atomic (the previous raw-pointer mutation of the proto
+// StatItem was a data race). The proto RuleStats is assembled on export.
+#[derive(Debug)]
+pub struct AclRuleStat {
+    rule: Option<Rule>,
+    packet_count: AtomicU64,
+    byte_count: AtomicU64,
+}
+
+impl AclRuleStat {
+    fn new(rule: Option<Rule>) -> Self {
+        Self {
+            rule,
+            packet_count: AtomicU64::new(0),
+            byte_count: AtomicU64::new(0),
+        }
+    }
+
+    fn inc(&self, packet_count: u64, byte_count: u64) {
+        self.packet_count.fetch_add(packet_count, Ordering::Relaxed);
+        self.byte_count.fetch_add(byte_count, Ordering::Relaxed);
+    }
+
+    /// Assemble the exported proto RuleStats from current counter values.
+    fn snapshot(&self) -> RuleStats {
+        RuleStats {
+            rule: self.rule.clone(),
+            stat: Some(StatItem {
+                packet_count: self.packet_count.load(Ordering::Relaxed),
+                byte_count: self.byte_count.load(Ordering::Relaxed),
+            }),
+        }
+    }
+}
+
 // Fast lookup structures for performance optimization
 #[derive(Debug, Clone)]
 pub struct FastLookupRule {
@@ -75,7 +113,7 @@ pub struct FastLookupRule {
     pub stateful: bool,
     pub rate_limit: u32,
     pub burst_limit: u32,
-    pub rule_stats: Arc<RuleStats>,
+    pub rule_stats: Arc<AclRuleStat>,
 }
 
 // Cache key combining packet info and chain type
@@ -115,7 +153,7 @@ pub(crate) struct AclCacheEntry {
     pub conn_track_key: Option<String>,
     pub rate_limit_keys: Vec<RateLimitKey>,
     pub acl_result: Option<AclResult>,
-    pub rule_stats_vec: Vec<Arc<RuleStats>>,
+    pub rule_stats_vec: Vec<Arc<AclRuleStat>>,
 }
 
 // Packet info extracted for ACL processing
@@ -203,7 +241,7 @@ pub struct AclProcessor {
     default_outbound_action: Action,
     default_forward_action: Action,
 
-    default_rule_stats: Arc<RuleStats>,
+    default_rule_stats: Arc<AclRuleStat>,
 
     // Connection tracking table - shared across different processor instances if needed
     conn_track: Arc<DashMap<String, ConnTrackEntry>>,
@@ -251,13 +289,7 @@ impl AclProcessor {
             default_outbound_action,
             default_forward_action,
 
-            default_rule_stats: Arc::new(RuleStats {
-                rule: None,
-                stat: Some(StatItem {
-                    packet_count: 0,
-                    byte_count: 0,
-                }),
-            }),
+            default_rule_stats: Arc::new(AclRuleStat::new(None)),
             conn_track: conn_track.unwrap_or_else(|| Arc::new(DashMap::new())),
             rate_limiters: rate_limiters.unwrap_or_else(|| Arc::new(DashMap::new())),
             rule_cache: Arc::new(DashMap::new()), // Always start with fresh cache
@@ -453,25 +485,20 @@ impl AclProcessor {
 
     fn inc_cache_entry_stats(&self, cache_entry: &AclCacheEntry, packet_info: &PacketInfo) {
         for rule_stats in cache_entry.rule_stats_vec.iter() {
-            // Use unsafe code to mutate the contents behind the Arc
-            let stat_ptr = rule_stats.stat.as_ref().unwrap() as *const StatItem as *mut StatItem;
-            unsafe {
-                (*stat_ptr).packet_count += 1;
-                (*stat_ptr).byte_count += packet_info.packet_size as u64;
-            }
+            rule_stats.inc(1, packet_info.packet_size as u64);
         }
     }
 
     pub fn get_rules_stats(&self) -> Vec<RuleStats> {
         let mut stats: Vec<RuleStats> = Vec::new();
         for rule in self.inbound_rules.iter() {
-            stats.push((*rule.rule_stats).clone());
+            stats.push(rule.rule_stats.snapshot());
         }
         for rule in self.outbound_rules.iter() {
-            stats.push((*rule.rule_stats).clone());
+            stats.push(rule.rule_stats.snapshot());
         }
         for rule in self.forward_rules.iter() {
-            stats.push((*rule.rule_stats).clone());
+            stats.push(rule.rule_stats.snapshot());
         }
         stats
     }
@@ -848,13 +875,7 @@ impl AclProcessor {
             stateful: rule.stateful,
             rate_limit: rule.rate_limit,
             burst_limit: rule.burst_limit,
-            rule_stats: Arc::new(RuleStats {
-                rule: Some(rule.clone()),
-                stat: Some(StatItem {
-                    packet_count: 0,
-                    byte_count: 0,
-                }),
-            }),
+            rule_stats: Arc::new(AclRuleStat::new(Some(rule.clone()))),
         }
     }
 
@@ -1279,6 +1300,39 @@ mod tests {
         let stats = processor.get_stats();
         assert_eq!(stats.get(&AclStatKey::CacheHits.as_str()).unwrap_or(&0), &1);
         assert!(processor.get_cache_hit_rate() > 0.0);
+    }
+
+    // Concurrent process_packet (cache miss and hit paths) must count every
+    // packet exactly once in the exported rule stats.
+    #[tokio::test]
+    async fn test_concurrent_rule_stats_counting() {
+        let processor = Arc::new(AclProcessor::new(create_test_acl_config()));
+        let packet_info = create_test_packet_info();
+        let rounds_per_thread = 1000;
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let processor = processor.clone();
+            let packet_info = packet_info.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..rounds_per_thread {
+                    let result = processor.process_packet(&packet_info, ChainType::Inbound);
+                    assert_eq!(result.action, Action::Allow);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let rules_stats = processor.get_rules_stats();
+        assert_eq!(rules_stats.len(), 1);
+        let stat = rules_stats[0].stat.as_ref().unwrap();
+        assert_eq!(stat.packet_count, 2 * rounds_per_thread);
+        assert_eq!(
+            stat.byte_count,
+            packet_info.packet_size as u64 * 2 * rounds_per_thread
+        );
     }
 
     #[tokio::test]
