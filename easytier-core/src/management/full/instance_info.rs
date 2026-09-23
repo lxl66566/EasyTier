@@ -16,16 +16,12 @@ pub async fn network_instance_running_info<H>(
 where
     H: CoreInstanceHost,
 {
-    let running = !matches!(
-        instance.state(),
-        CoreInstanceState::Created | CoreInstanceState::Stopped
-    );
+    let running = instance_running(instance);
     if !instance.is_ready() {
-        return Ok(NetworkInstanceRunningInfo {
+        return Ok(degraded_network_instance_info(
             running,
-            error_msg: instance.latest_error(),
-            ..Default::default()
-        });
+            instance.latest_error(),
+        ));
     }
 
     let peers = instance
@@ -77,4 +73,43 @@ where
         error_msg: instance.latest_error(),
         foreign_network_summary: Some(instance.foreign_network_route_summary().await),
     })
+}
+
+/// Never-failing variant for list collectors: a failing instance yields a
+/// degraded entry instead of aborting the whole list.
+pub async fn network_instance_running_info_lossy<H>(
+    instance: &CoreInstance<H>,
+) -> NetworkInstanceRunningInfo
+where
+    H: CoreInstanceHost,
+{
+    match network_instance_running_info(instance).await {
+        Ok(info) => info,
+        Err(error) => {
+            let instance_id = instance.instance_id();
+            tracing::warn!(%instance_id, %error, "failed to collect network instance info");
+            degraded_network_instance_info(instance_running(instance), Some(format!("{error:#}")))
+        }
+    }
+}
+
+fn instance_running<H>(instance: &CoreInstance<H>) -> bool
+where
+    H: CoreInstanceHost,
+{
+    !matches!(
+        instance.state(),
+        CoreInstanceState::Created | CoreInstanceState::Stopped
+    )
+}
+
+fn degraded_network_instance_info(
+    running: bool,
+    error_msg: Option<String>,
+) -> NetworkInstanceRunningInfo {
+    NetworkInstanceRunningInfo {
+        running,
+        error_msg,
+        ..Default::default()
+    }
 }

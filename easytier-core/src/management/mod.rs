@@ -37,7 +37,7 @@ pub use full::{
     ConfigFileStorage, ConfigPatchPersistence, ConfigServerEndpoint, InstanceMutationHooks,
     InstanceMutationResult, ProcessManagement, ProcessManagementRpc, UnsupportedConfigFileStorage,
     WebClient, WebClientConfig, apply_config_patch, config_source_from_rpc, config_source_to_rpc,
-    network_instance_running_info,
+    network_instance_running_info, network_instance_running_info_lossy,
 };
 #[cfg(feature = "management")]
 pub use full::{

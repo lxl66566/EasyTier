@@ -28,7 +28,7 @@ use crate::{
 
 use super::{
     ConfigFileControl, ConfigFilePermission, InstanceManager, config_source_from_rpc,
-    config_source_to_rpc, network_instance_running_info,
+    config_source_to_rpc, network_instance_running_info_lossy,
 };
 
 #[async_trait::async_trait]
@@ -651,7 +651,7 @@ where
                 };
                 map.insert(
                     instance_id.to_string(),
-                    network_instance_running_info(instance.as_ref()).await?,
+                    network_instance_running_info_lossy(instance.as_ref()).await,
                 );
             }
             map

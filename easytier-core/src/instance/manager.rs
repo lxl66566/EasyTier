@@ -20,7 +20,7 @@ use crate::process_runtime::CoreProcessRuntime;
 #[cfg(feature = "web-client")]
 use crate::{
     config::toml::{ConfigLoader as _, ConfigSource},
-    management::network_instance_running_info,
+    management::{network_instance_running_info, network_instance_running_info_lossy},
 };
 #[cfg(feature = "web-client")]
 use easytier_proto::api::manage::NetworkInstanceRunningInfo;
@@ -526,7 +526,7 @@ where
         for instance in self.list() {
             result.insert(
                 instance.instance_id(),
-                network_instance_running_info(instance.as_ref()).await?,
+                network_instance_running_info_lossy(instance.as_ref()).await,
             );
         }
         Ok(result)

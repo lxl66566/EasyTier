@@ -2182,6 +2182,66 @@ virtual_ip = "10.82.0.2/24"
         );
     }
 
+    #[cfg(feature = "web-client")]
+    #[tokio::test]
+    async fn collect_network_infos_keeps_healthy_instance_when_one_is_not_ready() {
+        use crate::{
+            config::toml::TomlConfig,
+            instance::{CoreInstanceState, manager::InstanceFactory},
+            management::InstanceManager,
+        };
+
+        struct CollectTestFactory(Arc<CoreProcessRuntime>);
+
+        impl InstanceFactory for CollectTestFactory {
+            type Instance = CoreInstance<TestHost>;
+            type CreateContext = ();
+            type Error = anyhow::Error;
+
+            fn create(
+                &self,
+                config: TomlConfig,
+                (): Self::CreateContext,
+            ) -> Result<Arc<Self::Instance>, Self::Error> {
+                let (packet_sink, _packet_receiver) = tokio::sync::mpsc::channel(16);
+                CoreInstance::from_toml(
+                    config,
+                    adapters_with_process_runtime(None, Arc::new(packet_sink), self.0.clone()),
+                )
+            }
+        }
+
+        let instances = InstanceManager::new(
+            CollectTestFactory(CoreProcessRuntime::new()),
+            Some(tokio::runtime::Handle::current()),
+        );
+        // a not-ready instance (e.g. still starting or just crashed) must not
+        // hide the healthy instance from the collected list
+        let not_ready_id = uuid::Uuid::new_v4();
+        let running_id = uuid::Uuid::new_v4();
+        let states = [
+            (not_ready_id, CoreInstanceState::Created),
+            (running_id, CoreInstanceState::Running),
+        ];
+        for (instance_id, state) in states {
+            let config = TomlConfig::default();
+            config.set_id(instance_id);
+            config.set_listeners(Vec::new());
+            instances.create(config, ()).unwrap().set_state(state);
+        }
+
+        let infos = instances.collect_network_infos().await.unwrap();
+        assert_eq!(infos.len(), 2);
+
+        let not_ready = &infos[&not_ready_id];
+        assert!(!not_ready.running);
+        assert!(not_ready.my_node_info.is_none());
+
+        let running = &infos[&running_id];
+        assert!(running.running);
+        assert!(running.my_node_info.is_some());
+    }
+
     #[cfg(feature = "management")]
     #[tokio::test]
     async fn owned_selection_and_cleanup_share_the_canonical_transaction() {
