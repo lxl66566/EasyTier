@@ -48,8 +48,10 @@ pub async fn decompress_packet(
     content: &[u8],
 ) -> Result<Vec<u8>, Error> {
     let algo = CompressorAlgo::try_from(compression_algo).map_err(anyhow::Error::from)?;
+    // No expected decompressed length is known here; passing 0 makes the
+    // decompressor fall back to length guessing.
     crate::packet::compressor::DefaultCompressor::new()
-        .decompress_raw(content, algo)
+        .decompress_raw(content, 0, algo)
         .await
         .map_err(Error::from)
 }

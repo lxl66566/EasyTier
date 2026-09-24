@@ -43,10 +43,11 @@ impl DefaultCompressor {
     pub async fn decompress_raw(
         &self,
         data: &[u8],
+        expected_len: usize,
         compress_algo: CompressorAlgo,
     ) -> Result<Vec<u8>, Error> {
         match compress_algo {
-            CompressorAlgo::ZstdDefault => zstd::decompress(data, compress_algo),
+            CompressorAlgo::ZstdDefault => zstd::decompress(data, expected_len, compress_algo),
             CompressorAlgo::None => Ok(data.to_vec()),
         }
     }
@@ -67,14 +68,40 @@ impl Compressor for DefaultCompressor {
         if pm_header.is_compressed() {
             return Ok(());
         }
+        let orig_len = pm_header.len.get() as usize;
 
+        compress_algo.ensure_available()?;
+
+        let payload_offset = zc_packet.payload_offset();
+        let payload_len = zc_packet.payload().len();
+
+        // Reserve the worst-case compressed size at the buffer tail and
+        // compress the payload directly into it: no intermediate Vec and no
+        // reallocation after compression. compress_bound guarantees the
+        // reserved region always fits the compressed output.
         let tail = CompressorTail::new(compress_algo);
-        let buf = self
-            .compress_raw(zc_packet.payload(), compress_algo)
-            .await?;
+        let bound = zstd::compress_bound(payload_len);
+        zc_packet.mut_inner().resize(
+            payload_offset + payload_len + bound + COMPRESSOR_TAIL_SIZE,
+            0,
+        );
 
-        if buf.len() + COMPRESSOR_TAIL_SIZE > pm_header.len.get() as usize {
+        let compress_result = {
+            let region = &mut zc_packet.mut_inner()[payload_offset..];
+            let (payload, dst) = region.split_at_mut(payload_len);
+            zstd::compress_into(payload, dst, compress_algo)
+        };
+        let compressed_len = match compress_result {
+            Ok(compressed_len) => compressed_len,
+            Err(error) => {
+                zc_packet.mut_inner().truncate(payload_offset + payload_len);
+                return Err(error);
+            }
+        };
+
+        if compressed_len + COMPRESSOR_TAIL_SIZE > orig_len {
             // Compressed data is larger than original data, don't compress
+            zc_packet.mut_inner().truncate(payload_offset + payload_len);
             return Ok(());
         }
 
@@ -83,10 +110,15 @@ impl Compressor for DefaultCompressor {
             .unwrap()
             .set_compressed(true);
 
-        let payload_offset = zc_packet.payload_offset();
-        zc_packet.mut_inner().truncate(payload_offset);
-        zc_packet.mut_inner().extend_from_slice(&buf);
-        zc_packet.mut_inner().extend_from_slice(tail.as_bytes());
+        // Move the compressed bytes from the tail region to the payload
+        // position, then drop the leftover scratch space.
+        let inner = zc_packet.mut_inner();
+        inner.copy_within(
+            payload_offset + payload_len..payload_offset + payload_len + compressed_len,
+            payload_offset,
+        );
+        inner.truncate(payload_offset + compressed_len);
+        inner.extend_from_slice(tail.as_bytes());
 
         Ok(())
     }
@@ -96,6 +128,7 @@ impl Compressor for DefaultCompressor {
         if !pm_header.is_compressed() {
             return Ok(());
         }
+        let expected_len = pm_header.len.get() as usize;
 
         let payload_len = zc_packet.payload().len();
         if payload_len < COMPRESSOR_TAIL_SIZE {
@@ -112,8 +145,10 @@ impl Compressor for DefaultCompressor {
             .get_algo()
             .ok_or(anyhow::anyhow!("Unknown algo: {:?}", tail))?;
 
+        // The peer manager header advertises the exact decompressed length,
+        // so decompression can allocate once instead of guessing.
         let buf = self
-            .decompress_raw(&zc_packet.payload()[..text_len], algo)
+            .decompress_raw(&zc_packet.payload()[..text_len], expected_len, algo)
             .await?;
 
         if buf.len() != pm_header.len.get() as usize {
@@ -194,6 +229,76 @@ pub mod tests {
 
         compressor.decompress(&mut packet).await.unwrap();
         assert_eq!(packet.payload(), text);
+        assert!(!packet.peer_manager_header().unwrap().is_compressed());
+    }
+
+    #[cfg(feature = "zstd")]
+    #[tokio::test]
+    async fn test_high_ratio_compress_roundtrip() {
+        // Highly repetitive payload compresses far below the original size;
+        // with the old length guessing this needed every retry attempt.
+        let text = vec![0xab_u8; 64 * 1024];
+        let mut packet = ZCPacket::new_with_payload(&text);
+        packet.fill_peer_manager_hdr(0, 0, 0);
+
+        let compressor = DefaultCompressor {};
+        compressor
+            .compress(&mut packet, CompressorAlgo::ZstdDefault)
+            .await
+            .unwrap();
+        assert!(packet.peer_manager_header().unwrap().is_compressed());
+        assert!(packet.payload().len() < text.len());
+
+        // The advertised pm header length lets decompression succeed in a
+        // single exact-size attempt.
+        let expected_len = packet.peer_manager_header().unwrap().len.get() as usize;
+        let compressed = &packet.payload()[..packet.payload().len() - COMPRESSOR_TAIL_SIZE];
+        let decompressed =
+            zstd::decompress(compressed, expected_len, CompressorAlgo::ZstdDefault).unwrap();
+        assert_eq!(decompressed.len(), expected_len);
+        assert_eq!(decompressed, text);
+
+        compressor.decompress(&mut packet).await.unwrap();
+        assert_eq!(packet.payload(), &text[..]);
+        assert!(!packet.peer_manager_header().unwrap().is_compressed());
+    }
+
+    #[cfg(feature = "zstd")]
+    #[tokio::test]
+    async fn test_decompress_forged_pm_header_len() {
+        let text = vec![0x77_u8; 8 * 1024];
+        let mut packet = ZCPacket::new_with_payload(&text);
+        packet.fill_peer_manager_hdr(0, 0, 0);
+
+        let compressor = DefaultCompressor {};
+        compressor
+            .compress(&mut packet, CompressorAlgo::ZstdDefault)
+            .await
+            .unwrap();
+        assert!(packet.peer_manager_header().unwrap().is_compressed());
+
+        // A forged length that is too small makes the exact-size attempt fail
+        // on capacity and fall back to guessing; the mismatch check still
+        // rejects the packet without mutating it.
+        packet.mut_peer_manager_header().unwrap().len.set(1);
+        let err = compressor.decompress(&mut packet).await.unwrap_err();
+        assert!(err.to_string().contains("Decompressed length mismatch"));
+
+        // A forged oversized length must not attempt a huge allocation; it is
+        // ignored in favor of bounded guessing and rejected by the same
+        // mismatch check.
+        packet.mut_peer_manager_header().unwrap().len.set(u32::MAX);
+        let err = compressor.decompress(&mut packet).await.unwrap_err();
+        assert!(err.to_string().contains("Decompressed length mismatch"));
+
+        // Restoring the correct length recovers the original payload.
+        packet
+            .mut_peer_manager_header()
+            .unwrap()
+            .len
+            .set(text.len() as u32);
+        compressor.decompress(&mut packet).await.unwrap();
+        assert_eq!(packet.payload(), &text[..]);
         assert!(!packet.peer_manager_header().unwrap().is_compressed());
     }
 
