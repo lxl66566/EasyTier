@@ -43,7 +43,7 @@
   - easytier-core/src/peers/peer_manager.rs
 - 具体改动：复用 `reject_plaintext_packet` 的"计数器 + 第 1 次及每 N 次打印"模式：解密失败与无路由两处各加一个 AtomicU64 计数，首次 warn、之后每 64 次一条，并保留计数指标便于排查；"no peer id for ip" 同时把级别降到 warn/debug。
 - 验证方式：`cargo test -p easytier-core --lib`；新增单元测试断言 N 次触发只产生 1 条日志（用 tracing mock subscriber 计数）。
-- 状态：未开始（提交：）
+- 状态：已完成（提交：72b7acb6）
 
 ### IMP-05 argon2id 派生移出全局缓存锁
 
@@ -84,7 +84,7 @@
   - easytier/src/gateway/quic_proxy.rs
 - 具体改动：`prepare` 中两处 unwrap 改为 `?` 传播并带 context；`segment` 的 `expect` 改为 `error! + continue`（外层 packet 循环）；分段循环加标签，非法 packet_type 用 `continue 'packet` 跳过整个包。
 - 验证方式：`cargo check -p easytier`；`cargo test -p easytier --lib`（quic_proxy 测试模块已覆盖 sender/receiver 主体路径）。
-- 状态：未开始（提交：）
+- 状态：已完成（提交：85adf7aa）
 
 ### IMP-09 collect_network_infos 单实例失败不拖垮整体列表
 
@@ -95,7 +95,7 @@
   - easytier-core/src/management/full/process_rpc.rs
 - 具体改动：两处循环把 `?` 改为 match：失败时 `tracing::warn!` 记录实例 id 与错误并跳过（或插入带 error_msg 的降级条目），成功条目照常返回。函数签名不变。
 - 验证方式：`cargo test -p easytier-core --lib`；新增测试构造一个 is_ready 但内部报错的实例场景（或直接单测 process_rpc 分支），断言其余实例信息仍返回。
-- 状态：未开始（提交：）
+- 状态：已完成（提交：9ac70f05）
 
 ### IMP-10 UDP 会话包构建去掉 payload 区域零填充
 
@@ -116,7 +116,7 @@
   - easytier-core/src/peers/foreign_network/mod.rs
 - 具体改动：546 行的 unwrap 改为 `warn! + return None`（丢包优于 abort）；两处 `take().unwrap()` 改为 `if let Some(...) else { warn! + return }`。
 - 验证方式：`cargo test -p easytier-core --lib`；对 PeerRpcPacketProcessor 补一个"接收端已 drop 时送包不 panic"的单元测试。
-- 状态：未开始（提交：）
+- 状态：已完成（提交：6f84afbc）
 
 ### IMP-12 ReplayWindow256 补直接单元测试
 
