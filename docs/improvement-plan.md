@@ -74,7 +74,7 @@
   - easytier-core/src/packet/compressor/zstd.rs
 - 具体改动：`decompress_raw` 增加期望输出长度参数，首参即用 `pm_header.len`，猜长度循环仅作为长度字段被伪造时的兜底；`compress` 改为在包缓冲尾部预留空间直接写入（zstd bulk 支持输出到调用方切片），去掉中间 Vec 与一次拷贝；长度不匹配仍按现有逻辑报错。
 - 验证方式：`cargo test -p easytier-core --lib`（compressor 现有往返测试）；新增高压缩比用例（重复字节填充）断言一次解压成功且结果与原始一致。
-- 状态：未开始（提交：）
+- 状态：已完成（提交：026ab51b）
 
 ### IMP-08 quic_proxy 消除生产路径 unwrap/expect 与循环语义错误
 
