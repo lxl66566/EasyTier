@@ -545,8 +545,14 @@ impl ForeignNetworkEntry {
     }
 
     async fn start_packet_recv(&self) {
-        let packet_recv = self.packet_recv.lock().await.take().unwrap();
-        let pm_sender = self.pm_packet_sender.lock().await.take().unwrap();
+        let Some(packet_recv) = self.packet_recv.lock().await.take() else {
+            tracing::warn!("start_packet_recv called more than once, skip");
+            return;
+        };
+        let Some(pm_sender) = self.pm_packet_sender.lock().await.take() else {
+            tracing::warn!("start_packet_recv called more than once, skip");
+            return;
+        };
         let router = ForeignNetworkPacketRouter::new(
             self.my_peer_id,
             packet_recv,
@@ -2041,5 +2047,14 @@ mod tests {
                 .value,
             64
         );
+    }
+
+    #[tokio::test]
+    async fn start_packet_recv_called_twice_does_not_panic() {
+        let entry = new_test_foreign_entry("foreign");
+
+        entry.start_packet_recv().await;
+        entry.start_packet_recv().await;
+        entry.stop().await;
     }
 }
