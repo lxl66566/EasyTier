@@ -150,12 +150,28 @@ pub struct SendPunchPacketBothEasySymResponse {
     pub base_mapped_addr: Option<SocketAddr>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendPunchPacketBothHardSym {
+    pub udp_socket_count: u32,
+    pub public_ips: Vec<Ipv4Addr>,
+    pub transaction_id: u32,
+    pub wait_time_ms: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendPunchPacketBothHardSymResponse {
+    pub is_busy: bool,
+    pub public_ips: Vec<Ipv4Addr>,
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum UdpHolePunchSignalError {
     #[error("invalid service key")]
     InvalidServiceKey,
     #[error("timeout")]
     Timeout,
+    #[error("remote does not support this rpc")]
+    Unsupported,
     #[error("remote rejected: {0}")]
     RemoteRejected(String),
     #[error("transport: {0}")]
@@ -197,6 +213,12 @@ pub trait UdpHolePunchSignaling: Send + Sync {
         dst_peer_id: crate::config::PeerId,
         request: SendPunchPacketBothEasySym,
     ) -> Result<SendPunchPacketBothEasySymResponse, UdpHolePunchSignalError>;
+
+    async fn send_punch_packet_both_hard_sym(
+        &self,
+        dst_peer_id: crate::config::PeerId,
+        request: SendPunchPacketBothHardSym,
+    ) -> Result<SendPunchPacketBothHardSymResponse, UdpHolePunchSignalError>;
 }
 
 #[async_trait]
@@ -225,6 +247,11 @@ pub trait UdpHolePunchInbound: Send + Sync {
         &self,
         request: SendPunchPacketBothEasySym,
     ) -> Result<SendPunchPacketBothEasySymResponse, UdpHolePunchSignalError>;
+
+    async fn send_punch_packet_both_hard_sym(
+        &self,
+        request: SendPunchPacketBothHardSym,
+    ) -> Result<SendPunchPacketBothHardSymResponse, UdpHolePunchSignalError>;
 }
 
 #[async_trait]

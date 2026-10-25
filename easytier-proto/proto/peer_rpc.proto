@@ -262,6 +262,22 @@ message SendPunchPacketBothEasySymResponse {
   common.SocketAddr base_mapped_addr = 2;
 }
 
+message SendPunchPacketBothHardSymRequest {
+  // sockets the responder should spray from; mappings scale with this count
+  uint32 udp_socket_count = 1;
+  // initiator's public ips; the responder sprays random ports at them
+  repeated common.Ipv4Addr public_ips = 2;
+  uint32 transaction_id = 3;
+  uint32 wait_time_ms = 4;
+}
+
+message SendPunchPacketBothHardSymResponse {
+  // is doing punch with other peer
+  bool is_busy = 1;
+  // responder's public ips for the initiator to spray at
+  repeated common.Ipv4Addr public_ips = 2;
+}
+
 service UdpHolePunchRpc {
   rpc SelectPunchListener(SelectPunchListenerRequest)
       returns (SelectPunchListenerResponse);
@@ -278,6 +294,11 @@ service UdpHolePunchRpc {
   // nat4 to nat4 (both predictably)
   rpc SendPunchPacketBothEasySym(SendPunchPacketBothEasySymRequest)
       returns (SendPunchPacketBothEasySymResponse);
+
+  // nat4 to nat4 (both unpredictable): both peers spray random ports at each
+  // other; the punch only lands on a double mapping collision (birthday attack)
+  rpc SendPunchPacketBothHardSym(SendPunchPacketBothHardSymRequest)
+      returns (SendPunchPacketBothHardSymResponse);
 }
 
 message TcpHolePunchRequest { common.SocketAddr connector_mapped_addr = 1; }

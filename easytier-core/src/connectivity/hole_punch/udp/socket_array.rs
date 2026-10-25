@@ -1,6 +1,6 @@
 use std::{
     fmt::Debug,
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, Mutex},
 };
 
@@ -158,6 +158,39 @@ where
             for _ in 0..3 {
                 socket.send_to(data, addr).await?;
             }
+        }
+
+        Ok(())
+    }
+
+    /// Sends one packet from every socket to each `(ip, port)` pair of a
+    /// blind-spray chunk, pacing one millisecond per port.
+    ///
+    /// Unlike [`Self::send_with_all`], each mapping gets a single packet: the
+    /// peer only receives these packets on a lucky collision, so the sends
+    /// exist to open local NAT mappings, and redundancy adds no hit odds per
+    /// byte. Odds scale with distinct mappings, i.e. sockets x ports.
+    #[instrument(err, skip(ports))]
+    pub async fn send_blind_spray_chunk(
+        &self,
+        data: &[u8],
+        public_ips: &[Ipv4Addr],
+        ports: &[u16],
+    ) -> anyhow::Result<()> {
+        let sockets = self
+            .sockets
+            .iter()
+            .map(|s| s.value().clone())
+            .collect::<Vec<_>>();
+
+        for port in ports {
+            for ip in public_ips {
+                let addr = SocketAddr::V4(SocketAddrV4::new(*ip, *port));
+                for socket in sockets.iter() {
+                    socket.send_to(data, addr).await?;
+                }
+            }
+            crate::foundation::time::sleep(std::time::Duration::from_millis(1)).await;
         }
 
         Ok(())
@@ -350,6 +383,57 @@ mod tests {
             sent.iter()
                 .all(|(data, addr)| data == b"abc" && *addr == remote_addr)
         );
+    }
+
+    #[tokio::test]
+    async fn blind_spray_chunk_sends_one_packet_per_socket_and_ip_port_pair() {
+        let runtime = Arc::new(MockFactory::new());
+        let array = UdpSocketArray::new(0, runtime);
+        let sockets: Vec<_> = [20002u16, 20003]
+            .into_iter()
+            .map(|port| {
+                Arc::new(MockSocket::new(
+                    SocketAddr::from(([127, 0, 0, 1], port)),
+                    Vec::new(),
+                ))
+            })
+            .collect();
+
+        for socket in &sockets {
+            array.add_new_socket(socket.clone()).await.unwrap();
+        }
+        array
+            .send_blind_spray_chunk(
+                b"abc",
+                &[
+                    Ipv4Addr::new(198, 51, 100, 1),
+                    Ipv4Addr::new(198, 51, 100, 2),
+                ],
+                &[10, 11],
+            )
+            .await
+            .unwrap();
+
+        for socket in &sockets {
+            let sent = socket.sent.lock().await;
+            assert_eq!(sent.len(), 4);
+            let addrs = sent
+                .iter()
+                .map(|(_, addr)| *addr)
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(
+                addrs,
+                [
+                    SocketAddr::from(([198, 51, 100, 1], 10)),
+                    SocketAddr::from(([198, 51, 100, 1], 11)),
+                    SocketAddr::from(([198, 51, 100, 2], 10)),
+                    SocketAddr::from(([198, 51, 100, 2], 11)),
+                ]
+                .into_iter()
+                .collect()
+            );
+            assert!(sent.iter().all(|(data, _)| data == b"abc"));
+        }
     }
 
     #[tokio::test]

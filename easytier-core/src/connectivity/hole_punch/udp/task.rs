@@ -200,6 +200,35 @@ mod tests {
     }
 
     #[test]
+    fn both_hard_symmetric_pair_uses_lower_peer_id_as_initiator() {
+        let tasks = collect(
+            1,
+            NatType::Symmetric,
+            P2pPolicyFlags::default(),
+            vec![candidate(2, NatType::SymUdpFirewall)],
+        );
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].dst_peer_id, 2);
+
+        let tasks = collect(
+            2,
+            NatType::SymUdpFirewall,
+            P2pPolicyFlags::default(),
+            vec![candidate(1, NatType::Symmetric)],
+        );
+        assert!(tasks.is_empty());
+
+        // easy x hard still has no method to collect.
+        let tasks = collect(
+            1,
+            NatType::Symmetric,
+            P2pPolicyFlags::default(),
+            vec![candidate(2, NatType::SymmetricEasyInc)],
+        );
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
     fn disabling_symmetric_hole_punch_keeps_sym_to_cone_as_cone_method() {
         let tasks = collect(
             1,

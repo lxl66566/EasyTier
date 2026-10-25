@@ -24,17 +24,26 @@ use crate::{
 };
 
 use super::{
-    MAX_PUBLIC_UDP_HOLE_PUNCH_LISTENERS, ReusableUdpPunchListener, SelectPunchListener,
-    SelectPunchListenerResponse, SendPunchPacketBothEasySym, SendPunchPacketBothEasySymResponse,
-    SendPunchPacketCone, SendPunchPacketEasySym, SendPunchPacketHardSym,
-    SendPunchPacketHardSymResponse, UdpHolePunchInbound, UdpHolePunchRuntime,
-    UdpHolePunchSignalError, UdpHolePunchTransportSink, UdpPunchListener, UdpSocketArray,
-    UdpSymPunchLock, can_reuse_port_mapping_listener, can_reuse_public_listener,
-    select_reusable_port_mapping_listener_idx, select_reusable_public_listener_idx,
-    should_create_public_listener, should_retry_public_listener_selection,
+    BOTH_HARD_SYM_RANDOM_PORTS_PER_PASS, BOTH_HARD_SYM_RESPRAY_INTERVAL_MS,
+    BOTH_HARD_SYM_SPRAY_CHUNK_PORTS, MAX_PUBLIC_UDP_HOLE_PUNCH_LISTENERS, PunchedUdpSocket,
+    ReusableUdpPunchListener, SelectPunchListener, SelectPunchListenerResponse,
+    SendPunchPacketBothEasySym, SendPunchPacketBothEasySymResponse, SendPunchPacketBothHardSym,
+    SendPunchPacketBothHardSymResponse, SendPunchPacketCone, SendPunchPacketEasySym,
+    SendPunchPacketHardSym, SendPunchPacketHardSymResponse, UdpHolePunchInbound,
+    UdpHolePunchRuntime, UdpHolePunchSignalError, UdpHolePunchTransportSink, UdpPunchListener,
+    UdpSocketArray, UdpSymPunchLock, can_reuse_port_mapping_listener, can_reuse_public_listener,
+    random_port_set, select_reusable_port_mapping_listener_idx,
+    select_reusable_public_listener_idx, should_create_public_listener,
+    should_retry_public_listener_selection, stun_public_ipv4s,
 };
 
 const MAX_K1_FOR_RANDOM_HARD_SYM: u32 = 180;
+// Peer-controlled spray parameters are clamped: the spray reflects one packet
+// per (socket, ip, port), so these bound the reflected traffic volume.
+const MAX_BOTH_HARD_SYM_SPRAY_SOCKETS: usize = 16;
+const MAX_BOTH_HARD_SYM_WAIT_TIME_MS: u32 = 30_000;
+const BOTH_HARD_SYM_FETCH_POLL_MS: u64 = 200;
+const BOTH_HARD_SYM_KEEPALIVE_POLL_MS: u64 = 100;
 // Selection precedes local socket/STUN preparation. Match the listener's
 // selection lifetime so abandoned preparations expire without per-RPC tasks.
 const PREPARED_CONE_PUNCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -55,6 +64,7 @@ where
     sym_punch_lock: UdpSymPunchLock,
     common: Arc<UdpHolePunchServerCommon<R, T>>,
     both_easy_sym_server: UdpBothEasySymPunchServer<R, T>,
+    both_hard_sym_server: UdpBothHardSymPunchServer<R, T>,
     shuffled_port_vec: Arc<Vec<u16>>,
     admission: RwLock<()>,
     stopping: AtomicBool,
@@ -76,9 +86,15 @@ where
             stun.clone(),
             transport_sink.clone(),
         ));
-        let both_easy_sym_common =
-            Arc::new(UdpHolePunchServerCommon::new(runtime, stun, transport_sink));
+        let both_easy_sym_common = Arc::new(UdpHolePunchServerCommon::new(
+            runtime.clone(),
+            stun.clone(),
+            transport_sink.clone(),
+        ));
         let both_easy_sym_server = UdpBothEasySymPunchServer::new(both_easy_sym_common);
+        let both_hard_sym_common =
+            Arc::new(UdpHolePunchServerCommon::new(runtime, stun, transport_sink));
+        let both_hard_sym_server = UdpBothHardSymPunchServer::new(both_hard_sym_common);
         let mut shuffled_port_vec: Vec<u16> = (1..=65535).collect();
         shuffled_port_vec.shuffle(&mut rand::thread_rng());
 
@@ -86,6 +102,7 @@ where
             sym_punch_lock,
             common,
             both_easy_sym_server,
+            both_hard_sym_server,
             shuffled_port_vec: Arc::new(shuffled_port_vec),
             admission: RwLock::new(()),
             stopping: AtomicBool::new(true),
@@ -100,6 +117,7 @@ where
         self.stop_inner().await;
         self.common.start().await;
         self.both_easy_sym_server.common.start().await;
+        self.both_hard_sym_server.common.start().await;
         self.stopping.store(false, Ordering::Release);
     }
 
@@ -115,6 +133,8 @@ where
     }
 
     async fn stop_inner(&self) {
+        self.both_hard_sym_server.stop().await;
+        self.both_hard_sym_server.common.stop().await;
         self.both_easy_sym_server.stop().await;
         self.both_easy_sym_server.common.stop().await;
         self.common.stop().await;
@@ -336,6 +356,21 @@ where
             .map_err(|_| Self::busy_signal_error())?;
         self.both_easy_sym_server
             .send_punch_packet_both_easy_sym(request)
+            .await
+            .map_err(Self::anyhow_to_signal_error)
+    }
+
+    async fn send_punch_packet_both_hard_sym(
+        &self,
+        request: SendPunchPacketBothHardSym,
+    ) -> Result<SendPunchPacketBothHardSymResponse, UdpHolePunchSignalError> {
+        let _admission = self.admit().await?;
+        let _locked = self
+            .sym_punch_lock
+            .try_lock()
+            .map_err(|_| Self::busy_signal_error())?;
+        self.both_hard_sym_server
+            .send_punch_packet_both_hard_sym(request)
             .await
             .map_err(Self::anyhow_to_signal_error)
     }
@@ -1014,6 +1049,209 @@ where
     }
 }
 
+/// Rebinds a listener on the punched socket's local port and keeps feeding the
+/// peer punch packets from it, so the initiator's SYN can traverse the mapping
+/// the original socket opened. Mirrors the both-easy-sym promotion.
+async fn promote_both_hard_sym_punched_socket<R, T>(
+    common: &UdpHolePunchServerCommon<R, T>,
+    listeners: &mut Vec<Arc<UdpPunchListenerRecord<R::Socket>>>,
+    punched: &mut Vec<(Arc<R::Socket>, SocketAddr)>,
+    punched_socket: PunchedUdpSocket<R::Socket>,
+) where
+    R: UdpHolePunchRuntime,
+    T: UdpHolePunchTransportSink + 'static,
+{
+    tracing::info!(?punched_socket, "got punched socket in both hard sym");
+    assert!(Arc::strong_count(&punched_socket.socket) == 1);
+    let Some(port) = punched_socket
+        .socket
+        .local_addr()
+        .ok()
+        .map(|addr| addr.port())
+    else {
+        tracing::warn!("failed to get local addr from punched socket");
+        return;
+    };
+    let remote_addr = punched_socket.remote_addr;
+    drop(punched_socket);
+
+    match common.runtime.create_port_bound_listener(port).await {
+        Ok(listener) => {
+            let socket = listener.socket.clone();
+            let record = common.track_pending_listener(listener).await;
+            punched.push((socket, remote_addr));
+            listeners.push(record);
+        }
+        Err(e) => tracing::warn!(?e, "failed to create listener"),
+    }
+}
+
+pub struct UdpBothHardSymPunchServer<R, T>
+where
+    R: UdpHolePunchRuntime,
+    T: UdpHolePunchTransportSink + 'static,
+{
+    common: Arc<UdpHolePunchServerCommon<R, T>>,
+    task: Mutex<Option<AbortOnDropHandle<()>>>,
+}
+
+impl<R, T> UdpBothHardSymPunchServer<R, T>
+where
+    R: UdpHolePunchRuntime,
+    T: UdpHolePunchTransportSink + 'static,
+{
+    pub fn new(common: Arc<UdpHolePunchServerCommon<R, T>>) -> Self {
+        Self {
+            common,
+            task: Mutex::new(None),
+        }
+    }
+
+    pub async fn stop(&self) {
+        let mut task = self.task.lock().await;
+        if let Some(task) = task.as_mut() {
+            task.abort();
+            let _ = task.await;
+        }
+        task.take();
+    }
+
+    #[tracing::instrument(skip(self), ret, err)]
+    pub async fn send_punch_packet_both_hard_sym(
+        &self,
+        request: SendPunchPacketBothHardSym,
+    ) -> anyhow::Result<SendPunchPacketBothHardSymResponse> {
+        tracing::info!("send_punch_packet_both_hard_sym start");
+        let busy_resp = Ok(SendPunchPacketBothHardSymResponse {
+            is_busy: true,
+            public_ips: Vec::new(),
+        });
+        let Ok(mut locked_task) = self.task.try_lock() else {
+            return busy_resp;
+        };
+        if locked_task.as_ref().is_some_and(|task| !task.is_finished()) {
+            return busy_resp;
+        }
+
+        if request.public_ips.is_empty() {
+            anyhow::bail!("send_punch_packet_both_hard_sym got zero len public ip");
+        }
+        let my_public_ips = stun_public_ipv4s(&self.common.stun.get_stun_info());
+        if my_public_ips.is_empty() {
+            anyhow::bail!("failed to get local public ips for both hard sym");
+        }
+
+        let socket_count =
+            (request.udp_socket_count as usize).clamp(1, MAX_BOTH_HARD_SYM_SPRAY_SOCKETS);
+        let wait_time_ms = request.wait_time_ms.min(MAX_BOTH_HARD_SYM_WAIT_TIME_MS);
+        let transaction_id = request.transaction_id;
+
+        let udp_array = UdpSocketArray::new_with_context(
+            socket_count,
+            self.common.runtime.clone(),
+            self.common.runtime.socket_context(),
+        );
+        udp_array.start().await?;
+        udp_array.add_intreast_tid(transaction_id);
+
+        let punch_packet =
+            new_hole_punch_packet(transaction_id, HOLE_PUNCH_PACKET_BODY_LEN).into_bytes();
+        let ports = random_port_set(BOTH_HARD_SYM_RANDOM_PORTS_PER_PASS);
+        let public_ips = request.public_ips;
+        let common = self.common.clone();
+
+        let task = tokio::spawn(async move {
+            let mut listeners: Vec<Arc<UdpPunchListenerRecord<R::Socket>>> = Vec::new();
+            let mut punched: Vec<(Arc<R::Socket>, SocketAddr)> = Vec::new();
+            let start_time = Instant::now();
+            let mut last_spray_time: Option<Instant> = None;
+            while start_time.elapsed() < Duration::from_millis(wait_time_ms as u64)
+                && !listeners.iter().any(|listener| listener.conn_count() > 0)
+            {
+                if punched.is_empty() {
+                    let need_spray = last_spray_time
+                        .map(|last| {
+                            last.elapsed().as_millis() as u64 >= BOTH_HARD_SYM_RESPRAY_INTERVAL_MS
+                        })
+                        .unwrap_or(true);
+                    if need_spray {
+                        last_spray_time = Some(Instant::now());
+                        for chunk in ports.chunks(BOTH_HARD_SYM_SPRAY_CHUNK_PORTS) {
+                            if let Err(e) = udp_array
+                                .send_blind_spray_chunk(&punch_packet, &public_ips, chunk)
+                                .await
+                            {
+                                tracing::error!(?e, "failed to send blind spray packet");
+                                break;
+                            }
+                            if let Some(punched_socket) =
+                                udp_array.try_fetch_punched_socket(transaction_id)
+                            {
+                                promote_both_hard_sym_punched_socket(
+                                    common.as_ref(),
+                                    &mut listeners,
+                                    &mut punched,
+                                    punched_socket,
+                                )
+                                .await;
+                                break;
+                            }
+                        }
+                    } else {
+                        crate::foundation::time::sleep(Duration::from_millis(
+                            BOTH_HARD_SYM_FETCH_POLL_MS,
+                        ))
+                        .await;
+                        if let Some(punched_socket) =
+                            udp_array.try_fetch_punched_socket(transaction_id)
+                        {
+                            promote_both_hard_sym_punched_socket(
+                                common.as_ref(),
+                                &mut listeners,
+                                &mut punched,
+                                punched_socket,
+                            )
+                            .await;
+                        }
+                    }
+                } else {
+                    crate::foundation::time::sleep(Duration::from_millis(
+                        BOTH_HARD_SYM_KEEPALIVE_POLL_MS,
+                    ))
+                    .await;
+                }
+
+                // Re-send from the rebound listener so the fresh socket keeps
+                // (or re-claims) the mapping the initiator's SYN must traverse.
+                for (socket, remote_addr) in &punched {
+                    if let Err(e) = socket.send_to(&punch_packet, *remote_addr).await {
+                        tracing::debug!(
+                            ?e,
+                            ?remote_addr,
+                            "failed to send hole punch packet to punched remote"
+                        );
+                    }
+                }
+            }
+
+            for listener in listeners {
+                if listener.conn_count() > 0 {
+                    common.promote_pending_listener(listener).await;
+                } else {
+                    common.retire_pending_listener(listener).await;
+                }
+            }
+            drain_retiring_listeners(common.retiring.as_ref()).await;
+        });
+
+        *locked_task = Some(AbortOnDropHandle::new(task));
+        Ok(SendPunchPacketBothHardSymResponse {
+            is_busy: false,
+            public_ips: my_public_ips,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1097,13 +1335,27 @@ mod tests {
 
     struct MockRuntime {
         listeners: StdMutex<VecDeque<UdpPunchListener<MockSocket>>>,
+        bound_sockets: StdMutex<Vec<std::sync::Weak<MockSocket>>>,
+        next_port: AtomicUsize,
+        port_bound_listener_ports: StdMutex<Vec<u16>>,
     }
 
     impl MockRuntime {
         fn new(listeners: Vec<UdpPunchListener<MockSocket>>) -> Self {
             Self {
                 listeners: StdMutex::new(listeners.into()),
+                bound_sockets: StdMutex::new(Vec::new()),
+                next_port: AtomicUsize::new(20000),
+                port_bound_listener_ports: StdMutex::new(Vec::new()),
             }
+        }
+
+        fn track_socket(&self, socket: &Arc<MockSocket>) -> Arc<MockSocket> {
+            self.bound_sockets
+                .lock()
+                .unwrap()
+                .push(Arc::downgrade(socket));
+            socket.clone()
         }
     }
 
@@ -1112,13 +1364,15 @@ mod tests {
         type Socket = MockSocket;
 
         async fn bind_udp(&self, _options: UdpBindOptions) -> anyhow::Result<Arc<Self::Socket>> {
-            Ok(Arc::new(MockSocket {
-                local_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            let port = self.next_port.fetch_add(1, Ordering::Relaxed) as u16;
+            let socket = Arc::new(MockSocket {
+                local_addr: SocketAddr::from(([127, 0, 0, 1], port)),
                 sent: tokio::sync::Mutex::new(Vec::new()),
                 fail_next_send: AtomicUsize::new(0),
                 incoming: StdMutex::new(VecDeque::new()),
                 incoming_notify: tokio::sync::Notify::new(),
-            }))
+            });
+            Ok(self.track_socket(&socket))
         }
 
         async fn resolve_udp_public_addr(
@@ -1135,17 +1389,21 @@ mod tests {
             &self,
             _prefer_port_mapping: bool,
         ) -> anyhow::Result<UdpPunchListener<Self::Socket>> {
-            self.listeners
+            let listener = self
+                .listeners
                 .lock()
                 .unwrap()
                 .pop_front()
-                .ok_or_else(|| anyhow::anyhow!("no listener"))
+                .ok_or_else(|| anyhow::anyhow!("no listener"))?;
+            self.track_socket(&listener.socket);
+            Ok(listener)
         }
 
         async fn create_port_bound_listener(
             &self,
-            _port: u16,
+            port: u16,
         ) -> anyhow::Result<UdpPunchListener<Self::Socket>> {
+            self.port_bound_listener_ports.lock().unwrap().push(port);
             self.create_listener(false).await
         }
 
@@ -1165,7 +1423,10 @@ mod tests {
     #[async_trait]
     impl StunInfoProvider for MockStunInfoProvider {
         fn get_stun_info(&self) -> StunInfo {
-            StunInfo::default()
+            StunInfo {
+                public_ip: vec!["203.0.113.1".to_string()],
+                ..Default::default()
+            }
         }
 
         async fn get_udp_port_mapping(&self, _port: u16) -> anyhow::Result<SocketAddr> {
@@ -1240,6 +1501,14 @@ mod tests {
         assert!(!Arc::ptr_eq(
             &server.common,
             &server.both_easy_sym_server.common
+        ));
+        assert!(!Arc::ptr_eq(
+            &server.common,
+            &server.both_hard_sym_server.common
+        ));
+        assert!(!Arc::ptr_eq(
+            &server.both_easy_sym_server.common,
+            &server.both_hard_sym_server.common
         ));
     }
 
@@ -1728,5 +1997,161 @@ mod tests {
             .unwrap();
         assert!(busy_response.is_busy);
         assert!(busy_response.base_mapped_addr.is_none());
+    }
+
+    #[tokio::test]
+    async fn both_hard_sym_server_rejects_requests_without_public_ips() {
+        let runtime = Arc::new(MockRuntime::new(Vec::new()));
+        let sink = Arc::new(MockSink::default());
+        let common = Arc::new(UdpHolePunchServerCommon::new(runtime, mock_stun(), sink));
+        let server = UdpBothHardSymPunchServer::new(common);
+
+        let err = server
+            .send_punch_packet_both_hard_sym(SendPunchPacketBothHardSym {
+                udp_socket_count: 2,
+                public_ips: Vec::new(),
+                transaction_id: 9,
+                wait_time_ms: 100,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("zero len public ip"));
+    }
+
+    #[tokio::test]
+    async fn both_hard_sym_server_sprays_promotes_punched_socket_and_reports_busy() {
+        let runtime = Arc::new(MockRuntime::new(vec![listener(10010, Vec::new())]));
+        let sink = Arc::new(MockSink::default());
+        let common = Arc::new(UdpHolePunchServerCommon::new(
+            runtime.clone(),
+            mock_stun(),
+            sink,
+        ));
+        let server = UdpBothHardSymPunchServer::new(common);
+        let request = SendPunchPacketBothHardSym {
+            udp_socket_count: 2,
+            public_ips: vec![Ipv4Addr::new(198, 51, 100, 1)],
+            transaction_id: 9,
+            wait_time_ms: 1500,
+        };
+
+        let first_response = server
+            .send_punch_packet_both_hard_sym(request.clone())
+            .await
+            .unwrap();
+        assert!(!first_response.is_busy);
+        assert_eq!(
+            first_response.public_ips,
+            vec![Ipv4Addr::new(203, 0, 113, 1)]
+        );
+
+        let busy_response = server
+            .send_punch_packet_both_hard_sym(request)
+            .await
+            .unwrap();
+        assert!(busy_response.is_busy);
+        assert!(busy_response.public_ips.is_empty());
+
+        // the spray starts on the request's sockets with random target ports;
+        // the chunk sender paces one port per ms, so wait for two distinct
+        // ports instead of racing the very first packet
+        let spray_socket = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let sockets = runtime.bound_sockets.lock().unwrap().clone();
+                let mut sprayed = None;
+                for weak in sockets {
+                    let Some(socket) = weak.upgrade() else {
+                        continue;
+                    };
+                    let port_count = {
+                        let sent = socket.sent.lock().await;
+                        sent.iter()
+                            .filter_map(|(_, addr)| match addr {
+                                SocketAddr::V4(v4) => Some(v4.port()),
+                                _ => None,
+                            })
+                            .collect::<std::collections::HashSet<_>>()
+                            .len()
+                    };
+                    if port_count > 1 {
+                        sprayed = Some(socket);
+                        break;
+                    }
+                }
+                if let Some(socket) = sprayed {
+                    return socket;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        {
+            let sent = spray_socket.sent.lock().await;
+            assert!(!sent.is_empty());
+            assert!(sent.iter().all(|(_, addr)| {
+                let SocketAddr::V4(v4) = addr else {
+                    return false;
+                };
+                v4.ip() == &Ipv4Addr::new(198, 51, 100, 1)
+            }));
+            let ports = sent
+                .iter()
+                .filter_map(|(_, addr)| match addr {
+                    SocketAddr::V4(v4) => Some(v4.port()),
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<_>>();
+            assert!(ports.len() > 1, "spray should hit many random ports");
+            for (packet, _) in sent.iter() {
+                assert_eq!(
+                    crate::packet::hole_punch_packet_tid(packet, HOLE_PUNCH_PACKET_BODY_LEN),
+                    Some(9)
+                );
+            }
+        }
+
+        // a punched packet rebinds a listener on the socket's local port and
+        // keeps sending punch packets to the observed source; the test must
+        // release its own Arc first, promotion asserts the socket is uniquely
+        // owned so it can be rebound
+        let observed_source = SocketAddr::from(([198, 51, 100, 77], 35000));
+        spray_socket.incoming.lock().unwrap().push_back((
+            new_hole_punch_packet(9, HOLE_PUNCH_PACKET_BODY_LEN)
+                .into_bytes()
+                .to_vec(),
+            observed_source,
+        ));
+        spray_socket.incoming_notify.notify_one();
+        let punched_port = spray_socket.local_addr().unwrap().port();
+        drop(spray_socket);
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let promoted = runtime.port_bound_listener_ports.lock().unwrap().clone();
+                if !promoted.contains(&punched_port) {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                let sockets = runtime.bound_sockets.lock().unwrap().clone();
+                let mut keepalive_seen = false;
+                for weak in sockets {
+                    let Some(socket) = weak.upgrade() else {
+                        continue;
+                    };
+                    let sent = socket.sent.lock().await;
+                    if sent.iter().any(|(_, addr)| *addr == observed_source) {
+                        keepalive_seen = true;
+                        break;
+                    }
+                }
+                if keepalive_seen {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rebound listener should keep feeding the observed source");
     }
 }

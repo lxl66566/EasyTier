@@ -1,4 +1,8 @@
-use std::{fmt, net::SocketAddr, sync::Arc};
+use std::{
+    fmt,
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 
@@ -8,6 +12,8 @@ use crate::{
         SelectPunchListener, SelectPunchListenerResponse as CoreSelectPunchListenerResponse,
         SendPunchPacketBothEasySym,
         SendPunchPacketBothEasySymResponse as CoreSendPunchPacketBothEasySymResponse,
+        SendPunchPacketBothHardSym,
+        SendPunchPacketBothHardSymResponse as CoreSendPunchPacketBothHardSymResponse,
         SendPunchPacketCone, SendPunchPacketEasySym, SendPunchPacketHardSym,
         SendPunchPacketHardSymResponse as CoreSendPunchPacketHardSymResponse, UdpHolePunchInbound,
         UdpHolePunchRuntime, UdpHolePunchServer as CoreUdpHolePunchServer, UdpHolePunchSignalError,
@@ -19,6 +25,7 @@ use crate::{
         peer_rpc::{
             SelectPunchListenerRequest, SelectPunchListenerResponse,
             SendPunchPacketBothEasySymRequest, SendPunchPacketBothEasySymResponse,
+            SendPunchPacketBothHardSymRequest, SendPunchPacketBothHardSymResponse,
             SendPunchPacketConeRequest, SendPunchPacketEasySymRequest,
             SendPunchPacketHardSymRequest, SendPunchPacketHardSymResponse, UdpHolePunchRpc,
         },
@@ -29,6 +36,7 @@ use crate::{
 const CONE_RPC_TIMEOUT_MS: i32 = 4000;
 const SYMMETRIC_RPC_TIMEOUT_MS: i32 = 4000;
 const BOTH_EASY_SYMMETRIC_RPC_TIMEOUT_MS: i32 = 2000;
+const BOTH_HARD_SYMMETRIC_RPC_TIMEOUT_MS: i32 = 2000;
 
 fn cone_controller() -> BaseController {
     BaseController {
@@ -48,6 +56,13 @@ fn symmetric_controller() -> BaseController {
 fn both_easy_symmetric_controller() -> BaseController {
     BaseController {
         timeout_ms: BOTH_EASY_SYMMETRIC_RPC_TIMEOUT_MS,
+        ..Default::default()
+    }
+}
+
+fn both_hard_symmetric_controller() -> BaseController {
+    BaseController {
+        timeout_ms: BOTH_HARD_SYMMETRIC_RPC_TIMEOUT_MS,
         ..Default::default()
     }
 }
@@ -134,6 +149,17 @@ fn both_easy_symmetric_request_to_rpc(
     }
 }
 
+fn both_hard_symmetric_request_to_rpc(
+    request: SendPunchPacketBothHardSym,
+) -> SendPunchPacketBothHardSymRequest {
+    SendPunchPacketBothHardSymRequest {
+        udp_socket_count: request.udp_socket_count,
+        public_ips: request.public_ips.into_iter().map(Into::into).collect(),
+        transaction_id: request.transaction_id,
+        wait_time_ms: request.wait_time_ms,
+    }
+}
+
 fn hard_symmetric_response_from_rpc(
     response: SendPunchPacketHardSymResponse,
 ) -> CoreSendPunchPacketHardSymResponse {
@@ -165,6 +191,28 @@ fn both_easy_symmetric_response_to_rpc(
     SendPunchPacketBothEasySymResponse {
         is_busy: response.is_busy,
         base_mapped_addr: response.base_mapped_addr.map(Into::into),
+    }
+}
+
+fn both_hard_symmetric_response_from_rpc(
+    response: SendPunchPacketBothHardSymResponse,
+) -> CoreSendPunchPacketBothHardSymResponse {
+    CoreSendPunchPacketBothHardSymResponse {
+        is_busy: response.is_busy,
+        public_ips: response
+            .public_ips
+            .into_iter()
+            .map(Ipv4Addr::from)
+            .collect(),
+    }
+}
+
+fn both_hard_symmetric_response_to_rpc(
+    response: CoreSendPunchPacketBothHardSymResponse,
+) -> SendPunchPacketBothHardSymResponse {
+    SendPunchPacketBothHardSymResponse {
+        is_busy: response.is_busy,
+        public_ips: response.public_ips.into_iter().map(Into::into).collect(),
     }
 }
 
@@ -221,6 +269,10 @@ fn map_rpc_error(error: rpc_types::error::Error) -> UdpHolePunchSignalError {
         rpc_types::error::Error::InvalidServiceKey(_, _) => {
             UdpHolePunchSignalError::InvalidServiceKey
         }
+        // Older peers reject methods appended to the service after their build;
+        // retrying cannot succeed until they upgrade, so surface it as a
+        // distinct condition instead of a generic transport error.
+        rpc_types::error::Error::InvalidMethodIndex(_, _) => UdpHolePunchSignalError::Unsupported,
         rpc_types::error::Error::Timeout(_) => UdpHolePunchSignalError::Timeout,
         rpc_types::error::Error::ExecutionError(error) => {
             UdpHolePunchSignalError::RemoteRejected(error.to_string())
@@ -315,6 +367,23 @@ where
 
         Ok(both_easy_symmetric_response_from_rpc(response))
     }
+
+    async fn send_punch_packet_both_hard_sym(
+        &self,
+        dst_peer_id: PeerId,
+        request: SendPunchPacketBothHardSym,
+    ) -> Result<CoreSendPunchPacketBothHardSymResponse, UdpHolePunchSignalError> {
+        let response = self
+            .rpc_stub(dst_peer_id)
+            .send_punch_packet_both_hard_sym(
+                both_hard_symmetric_controller(),
+                both_hard_symmetric_request_to_rpc(request),
+            )
+            .await
+            .map_err(map_rpc_error)?;
+
+        Ok(both_hard_symmetric_response_from_rpc(response))
+    }
 }
 
 pub(super) struct UdpHolePunchRpcEndpoint<R, T>
@@ -359,7 +428,9 @@ fn signal_error_to_rpc_error(error: UdpHolePunchSignalError) -> rpc_types::error
             "UdpHolePunchRpc".to_owned(),
             "UdpHolePunchRpc".to_owned(),
         ),
-        UdpHolePunchSignalError::Timeout => anyhow::anyhow!("timeout").into(),
+        UdpHolePunchSignalError::Timeout | UdpHolePunchSignalError::Unsupported => {
+            anyhow::anyhow!(error.to_string()).into()
+        }
         UdpHolePunchSignalError::RemoteRejected(message)
         | UdpHolePunchSignalError::Transport(message) => anyhow::anyhow!(message).into(),
     }
@@ -430,6 +501,17 @@ fn both_easy_symmetric_request_from_rpc(
     })
 }
 
+fn both_hard_symmetric_request_from_rpc(
+    input: SendPunchPacketBothHardSymRequest,
+) -> rpc_types::error::Result<SendPunchPacketBothHardSym> {
+    Ok(SendPunchPacketBothHardSym {
+        udp_socket_count: input.udp_socket_count,
+        public_ips: input.public_ips.into_iter().map(Ipv4Addr::from).collect(),
+        transaction_id: input.transaction_id,
+        wait_time_ms: input.wait_time_ms,
+    })
+}
+
 #[async_trait]
 impl<R, T> UdpHolePunchInbound for UdpHolePunchRpcEndpoint<R, T>
 where
@@ -469,6 +551,13 @@ where
         request: SendPunchPacketBothEasySym,
     ) -> Result<CoreSendPunchPacketBothEasySymResponse, UdpHolePunchSignalError> {
         self.inner.send_punch_packet_both_easy_sym(request).await
+    }
+
+    async fn send_punch_packet_both_hard_sym(
+        &self,
+        request: SendPunchPacketBothHardSym,
+    ) -> Result<CoreSendPunchPacketBothHardSymResponse, UdpHolePunchSignalError> {
+        self.inner.send_punch_packet_both_hard_sym(request).await
     }
 }
 
@@ -551,6 +640,21 @@ where
 
         Ok(both_easy_symmetric_response_to_rpc(response))
     }
+
+    async fn send_punch_packet_both_hard_sym(
+        &self,
+        _controller: Self::Controller,
+        input: SendPunchPacketBothHardSymRequest,
+    ) -> rpc_types::error::Result<SendPunchPacketBothHardSymResponse> {
+        let response = UdpHolePunchInbound::send_punch_packet_both_hard_sym(
+            self,
+            both_hard_symmetric_request_from_rpc(input)?,
+        )
+        .await
+        .map_err(signal_error_to_rpc_error)?;
+
+        Ok(both_hard_symmetric_response_to_rpc(response))
+    }
 }
 
 #[cfg(test)]
@@ -619,6 +723,7 @@ mod tests {
         assert_eq!(symmetric_controller().timeout_ms, 4000);
         assert_eq!(symmetric_controller().trace_id, 0);
         assert_eq!(both_easy_symmetric_controller().timeout_ms, 2000);
+        assert_eq!(both_hard_symmetric_controller().timeout_ms, 2000);
     }
 
     #[test]
@@ -768,6 +873,38 @@ mod tests {
     }
 
     #[test]
+    fn both_hard_symmetric_dto_round_trip_preserves_all_fields() {
+        let request = SendPunchPacketBothHardSym {
+            udp_socket_count: 8,
+            public_ips: vec![Ipv4Addr::new(203, 0, 113, 6), Ipv4Addr::new(203, 0, 113, 7)],
+            transaction_id: 17,
+            wait_time_ms: 25000,
+        };
+
+        let rpc = both_hard_symmetric_request_to_rpc(request.clone());
+        assert_eq!(rpc.udp_socket_count, 8);
+        assert_eq!(
+            rpc.public_ips
+                .iter()
+                .cloned()
+                .map(Ipv4Addr::from)
+                .collect::<Vec<_>>(),
+            request.public_ips
+        );
+        assert_eq!(rpc.transaction_id, 17);
+        assert_eq!(rpc.wait_time_ms, 25000);
+        assert_eq!(both_hard_symmetric_request_from_rpc(rpc).unwrap(), request);
+
+        let response = CoreSendPunchPacketBothHardSymResponse {
+            is_busy: false,
+            public_ips: vec![Ipv4Addr::new(198, 51, 100, 9)],
+        };
+        let rpc = both_hard_symmetric_response_to_rpc(response.clone());
+        assert!(!rpc.is_busy);
+        assert_eq!(both_hard_symmetric_response_from_rpc(rpc), response);
+    }
+
+    #[test]
     fn rpc_response_dtos_preserve_all_fields() {
         let hard_response = CoreSendPunchPacketHardSymResponse {
             next_port_index: 41,
@@ -841,6 +978,13 @@ mod tests {
                 "proto".to_owned()
             )),
             UdpHolePunchSignalError::InvalidServiceKey
+        );
+        assert_eq!(
+            map_rpc_error(rpc_types::error::Error::InvalidMethodIndex(
+                6,
+                "UdpHolePunchRpc".to_owned()
+            )),
+            UdpHolePunchSignalError::Unsupported
         );
         assert_eq!(
             map_rpc_error(rpc_types::error::Error::ExecutionError(anyhow::anyhow!(

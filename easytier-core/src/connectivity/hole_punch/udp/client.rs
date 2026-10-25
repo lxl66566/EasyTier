@@ -20,9 +20,12 @@ use crate::{
 };
 
 use super::{
-    SelectPunchListener, SendPunchPacketBothEasySym, SendPunchPacketCone, SendPunchPacketEasySym,
-    SendPunchPacketHardSym, UdpHolePunchRuntime, UdpHolePunchSignalError, UdpHolePunchSignaling,
-    UdpNatType, UdpPunchSocket, UdpSocketArray,
+    BOTH_HARD_SYM_RANDOM_PORTS_PER_PASS, BOTH_HARD_SYM_RESPRAY_INTERVAL_MS,
+    BOTH_HARD_SYM_SPRAY_CHUNK_PORTS, BOTH_HARD_SYM_WAIT_TIME_MS, SelectPunchListener,
+    SendPunchPacketBothEasySym, SendPunchPacketBothHardSym, SendPunchPacketCone,
+    SendPunchPacketEasySym, SendPunchPacketHardSym, UDP_ARRAY_SIZE_FOR_BOTH_HARD_SYM,
+    UdpHolePunchRuntime, UdpHolePunchSignalError, UdpHolePunchSignaling, UdpNatType,
+    UdpPunchSocket, UdpSocketArray, stun_public_ipv4s,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +42,14 @@ const UDP_ARRAY_SIZE_FOR_HARD_SYM: usize = 84;
 const UDP_ARRAY_SIZE_FOR_BOTH_EASY_SYM: usize = 25;
 const DST_PORT_OFFSET: u16 = 20;
 const REMOTE_WAIT_TIME_MS: u64 = 5000;
+const BOTH_HARD_SYM_TAIL_MARGIN_MS: u64 = 2_000;
+const BOTH_HARD_SYM_FETCH_POLL_MS: u64 = 200;
+
+pub fn random_port_set(count: usize) -> Vec<u16> {
+    // sample() draws distinct indices from 0..65535; +1 maps them to 1..=65535
+    let indexes = rand::seq::index::sample(&mut rand::thread_rng(), u16::MAX as usize, count);
+    indexes.into_iter().map(|idx| idx as u16 + 1).collect()
+}
 
 pub fn apply_peer_easy_sym_port_offset(base_port: u16, peer_is_incremental: bool) -> u16 {
     let port = if peer_is_incremental {
@@ -592,6 +603,178 @@ where
     }
 }
 
+pub struct UdpBothHardSymPunchClient<R, S>
+where
+    R: UdpHolePunchRuntime,
+    S: UdpHolePunchSignaling + 'static,
+{
+    runtime: Arc<R>,
+    signaling: Arc<S>,
+    stun: Arc<dyn StunInfoProvider>,
+}
+
+impl<R, S> UdpBothHardSymPunchClient<R, S>
+where
+    R: UdpHolePunchRuntime,
+    S: UdpHolePunchSignaling + 'static,
+{
+    pub fn new(runtime: Arc<R>, signaling: Arc<S>, stun: Arc<dyn StunInfoProvider>) -> Self {
+        Self {
+            runtime,
+            signaling,
+            stun,
+        }
+    }
+
+    /// One paced pass over the port set; aborts as soon as a socket is punched.
+    async fn spray_one_pass(
+        &self,
+        udp_array: &UdpSocketArray<R>,
+        packet: &[u8],
+        tid: u32,
+        ports: &[u16],
+        remote_public_ips: &[Ipv4Addr],
+    ) -> anyhow::Result<Option<UdpPunchSocket>> {
+        for chunk in ports.chunks(BOTH_HARD_SYM_SPRAY_CHUNK_PORTS) {
+            udp_array
+                .send_blind_spray_chunk(packet, remote_public_ips, chunk)
+                .await?;
+            if let Some(socket) = self.try_connect_punched(udp_array, tid).await? {
+                return Ok(Some(socket));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Fetches a socket that received the peer's punch packet and connects it
+    /// to the observed source address — the only remote endpoint this
+    /// socket's mapping accepts traffic from.
+    async fn try_connect_punched(
+        &self,
+        udp_array: &UdpSocketArray<R>,
+        tid: u32,
+    ) -> anyhow::Result<Option<UdpPunchSocket>> {
+        let Some(punched) = udp_array.try_fetch_punched_socket(tid) else {
+            return Ok(None);
+        };
+
+        tracing::info!(?punched, "got punched socket in both hard sym");
+        match self
+            .connect_punched_socket(punched.socket.clone(), punched.remote_addr)
+            .await?
+        {
+            Some(socket) => Ok(Some(socket)),
+            None => {
+                udp_array.add_new_socket(punched.socket).await?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn connect_punched_socket(
+        &self,
+        socket: Arc<R::Socket>,
+        remote_addr: SocketAddr,
+    ) -> anyhow::Result<Option<UdpPunchSocket>> {
+        for _ in 0..2 {
+            match self
+                .runtime
+                .connect_with_socket(socket.clone(), remote_addr)
+                .await
+            {
+                Ok(socket) => return Ok(Some(socket)),
+                Err(e) => tracing::error!(?e, "failed to connect with socket"),
+            }
+        }
+        Ok(None)
+    }
+
+    #[tracing::instrument(ret, skip(self))]
+    pub async fn do_hole_punching(
+        &self,
+        dst_peer_id: PeerId,
+        is_busy: &mut bool,
+    ) -> UdpHolePunchClientResult<Option<UdpPunchSocket>> {
+        *is_busy = false;
+
+        let my_public_ips = stun_public_ipv4s(&self.stun.get_stun_info());
+        if my_public_ips.is_empty() {
+            return Err(anyhow::anyhow!("failed to get public ips").into());
+        }
+
+        let udp_array = UdpSocketArray::new_with_context(
+            UDP_ARRAY_SIZE_FOR_BOTH_HARD_SYM,
+            self.runtime.clone(),
+            self.runtime.socket_context(),
+        );
+        udp_array.start().await?;
+
+        let tid = rand::random();
+        udp_array.add_intreast_tid(tid);
+        defer! { udp_array.remove_intreast_tid(tid); }
+
+        let remote_resp = self
+            .signaling
+            .send_punch_packet_both_hard_sym(
+                dst_peer_id,
+                SendPunchPacketBothHardSym {
+                    udp_socket_count: UDP_ARRAY_SIZE_FOR_BOTH_HARD_SYM as u32,
+                    public_ips: my_public_ips,
+                    transaction_id: tid,
+                    wait_time_ms: BOTH_HARD_SYM_WAIT_TIME_MS as u32,
+                },
+            )
+            .await?;
+
+        if remote_resp.is_busy {
+            *is_busy = true;
+            return Err(anyhow::anyhow!("remote is busy").into());
+        }
+
+        let remote_public_ips = remote_resp.public_ips;
+        if remote_public_ips.is_empty() {
+            return Err(anyhow::anyhow!("remote has no public ips").into());
+        }
+
+        let packet = new_hole_punch_packet(tid, HOLE_PUNCH_PACKET_BODY_LEN).into_bytes();
+        let ports = random_port_set(BOTH_HARD_SYM_RANDOM_PORTS_PER_PASS);
+        tracing::debug!(
+            ?remote_public_ips,
+            sockets = UDP_ARRAY_SIZE_FOR_BOTH_HARD_SYM,
+            ports = ports.len(),
+            "start blind spray for both hard sym"
+        );
+
+        let start_time = Instant::now();
+        let window_ms = BOTH_HARD_SYM_WAIT_TIME_MS + BOTH_HARD_SYM_TAIL_MARGIN_MS;
+        let mut last_spray_time: Option<Instant> = None;
+        while start_time.elapsed().as_millis() < window_ms.into() {
+            let need_spray = last_spray_time
+                .map(|last| last.elapsed().as_millis() as u64 >= BOTH_HARD_SYM_RESPRAY_INTERVAL_MS)
+                .unwrap_or(true);
+            if need_spray {
+                last_spray_time = Some(Instant::now());
+                if let Some(socket) = self
+                    .spray_one_pass(&udp_array, &packet, tid, &ports, &remote_public_ips)
+                    .await?
+                {
+                    return Ok(Some(socket));
+                }
+            } else {
+                crate::foundation::time::sleep(std::time::Duration::from_millis(
+                    BOTH_HARD_SYM_FETCH_POLL_MS,
+                ))
+                .await;
+                if let Some(socket) = self.try_connect_punched(&udp_array, tid).await? {
+                    return Ok(Some(socket));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -811,6 +994,15 @@ mod tests {
         {
             unimplemented!("not used by cone client tests")
         }
+
+        async fn send_punch_packet_both_hard_sym(
+            &self,
+            _dst_peer_id: PeerId,
+            _request: super::super::SendPunchPacketBothHardSym,
+        ) -> Result<super::super::SendPunchPacketBothHardSymResponse, UdpHolePunchSignalError>
+        {
+            unimplemented!("not used by cone client tests")
+        }
     }
 
     #[tokio::test]
@@ -851,6 +1043,8 @@ mod tests {
         hard_requests: tokio::sync::Mutex<Vec<SendPunchPacketHardSym>>,
         both_requests: tokio::sync::Mutex<Vec<SendPunchPacketBothEasySym>>,
         both_response: super::super::SendPunchPacketBothEasySymResponse,
+        both_hard_requests: tokio::sync::Mutex<Vec<SendPunchPacketBothHardSym>>,
+        both_hard_response: super::super::SendPunchPacketBothHardSymResponse,
         next_port_index: u32,
     }
 
@@ -955,6 +1149,11 @@ mod tests {
                     is_busy: false,
                     base_mapped_addr: Some(SocketAddr::from(([127, 0, 0, 1], 40144))),
                 },
+                both_hard_requests: tokio::sync::Mutex::new(Vec::new()),
+                both_hard_response: super::super::SendPunchPacketBothHardSymResponse {
+                    is_busy: false,
+                    public_ips: vec![Ipv4Addr::new(127, 0, 0, 1)],
+                },
                 next_port_index,
             }
         }
@@ -964,6 +1163,14 @@ mod tests {
             both_response: super::super::SendPunchPacketBothEasySymResponse,
         ) -> Self {
             self.both_response = both_response;
+            self
+        }
+
+        fn with_both_hard_response(
+            mut self,
+            both_hard_response: super::super::SendPunchPacketBothHardSymResponse,
+        ) -> Self {
+            self.both_hard_response = both_hard_response;
             self
         }
     }
@@ -1022,6 +1229,16 @@ mod tests {
         {
             self.both_requests.lock().await.push(request);
             Ok(self.both_response.clone())
+        }
+
+        async fn send_punch_packet_both_hard_sym(
+            &self,
+            _dst_peer_id: PeerId,
+            request: SendPunchPacketBothHardSym,
+        ) -> Result<super::super::SendPunchPacketBothHardSymResponse, UdpHolePunchSignalError>
+        {
+            self.both_hard_requests.lock().await.push(request);
+            Ok(self.both_hard_response.clone())
         }
     }
 
@@ -1138,5 +1355,173 @@ mod tests {
             UDP_ARRAY_SIZE_FOR_BOTH_EASY_SYM as u32
         );
         assert_eq!(req.wait_time_ms, REMOTE_WAIT_TIME_MS as u32);
+    }
+
+    #[test]
+    fn random_port_set_draws_distinct_ports_in_range() {
+        let ports = random_port_set(4096);
+
+        assert_eq!(ports.len(), 4096);
+        let unique = ports.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), ports.len());
+        assert!(ports.iter().all(|port| (1..=u16::MAX).contains(port)));
+    }
+
+    fn both_hard_sym_client(
+        signaling: Arc<RecordingSignaling>,
+    ) -> (
+        Arc<MockRuntime>,
+        UdpBothHardSymPunchClient<MockRuntime, RecordingSignaling>,
+    ) {
+        let runtime = Arc::new(MockRuntime::new());
+        let client = UdpBothHardSymPunchClient::new(
+            runtime.clone(),
+            signaling,
+            Arc::new(MockStunInfoProvider::default()),
+        );
+        (runtime, client)
+    }
+
+    #[tokio::test]
+    async fn both_hard_sym_reports_remote_busy_with_request_params() {
+        let signaling = Arc::new(RecordingSignaling::new(0).with_both_hard_response(
+            super::super::SendPunchPacketBothHardSymResponse {
+                is_busy: true,
+                public_ips: Vec::new(),
+            },
+        ));
+        let (runtime, client) = both_hard_sym_client(signaling.clone());
+
+        let mut is_busy = false;
+        let err = client.do_hole_punching(2, &mut is_busy).await.unwrap_err();
+
+        assert!(is_busy);
+        assert!(err.to_string().contains("remote is busy"));
+        assert_eq!(
+            runtime.bind_count.load(Ordering::Relaxed),
+            UDP_ARRAY_SIZE_FOR_BOTH_HARD_SYM
+        );
+
+        let requests = signaling.both_hard_requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+        assert_eq!(req.public_ips, vec![Ipv4Addr::new(127, 0, 0, 1)]);
+        assert_eq!(
+            req.udp_socket_count,
+            UDP_ARRAY_SIZE_FOR_BOTH_HARD_SYM as u32
+        );
+        assert_eq!(req.wait_time_ms, BOTH_HARD_SYM_WAIT_TIME_MS as u32);
+    }
+
+    #[tokio::test]
+    async fn both_hard_sym_requires_remote_public_ips() {
+        let signaling = Arc::new(RecordingSignaling::new(0).with_both_hard_response(
+            super::super::SendPunchPacketBothHardSymResponse {
+                is_busy: false,
+                public_ips: Vec::new(),
+            },
+        ));
+        let (_runtime, client) = both_hard_sym_client(signaling);
+
+        let mut is_busy = false;
+        let err = client.do_hole_punching(2, &mut is_busy).await.unwrap_err();
+
+        assert!(!is_busy);
+        assert!(err.to_string().contains("remote has no public ips"));
+    }
+
+    #[tokio::test]
+    async fn both_hard_sym_spray_pass_covers_each_socket_port_pair_once() {
+        let signaling = Arc::new(RecordingSignaling::new(0));
+        let (runtime, client) = both_hard_sym_client(signaling);
+        let udp_array = Arc::new(UdpSocketArray::new_with_context(
+            UDP_ARRAY_SIZE_FOR_BOTH_HARD_SYM,
+            runtime.clone(),
+            runtime.socket_context(),
+        ));
+        udp_array.start().await.unwrap();
+
+        let ports: Vec<u16> = (5000..5080).collect();
+        let packet =
+            crate::packet::new_hole_punch_packet(9, HOLE_PUNCH_PACKET_BODY_LEN).into_bytes();
+        let ret = client
+            .spray_one_pass(
+                &udp_array,
+                &packet,
+                9,
+                &ports,
+                &[Ipv4Addr::new(203, 0, 113, 1)],
+            )
+            .await
+            .unwrap();
+        assert!(ret.is_none());
+
+        let sockets = runtime.sockets.lock().unwrap();
+        assert_eq!(sockets.len(), UDP_ARRAY_SIZE_FOR_BOTH_HARD_SYM);
+        let expected_ports = ports
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        for socket in sockets.iter().filter_map(|weak| weak.upgrade()) {
+            let sent = socket.sent.lock().unwrap();
+            assert_eq!(sent.len(), ports.len());
+            assert!(
+                sent.iter()
+                    .filter_map(|(_, addr)| match addr {
+                        SocketAddr::V4(v4) => Some(v4.port()),
+                        _ => None,
+                    })
+                    .all(|port| expected_ports.contains(&port)),
+                "spray should only target the given port set"
+            );
+            assert!(
+                sent.iter()
+                    .all(|(_, addr)| addr.ip() == IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn both_hard_sym_connects_punched_socket_to_observed_source() {
+        let signaling = Arc::new(RecordingSignaling::new(0));
+        let (runtime, client) = both_hard_sym_client(signaling);
+        let udp_array = Arc::new(UdpSocketArray::new_with_context(
+            UDP_ARRAY_SIZE_FOR_BOTH_HARD_SYM,
+            runtime.clone(),
+            runtime.socket_context(),
+        ));
+        udp_array.start().await.unwrap();
+
+        let tid = 77;
+        udp_array.add_intreast_tid(tid);
+        let observed_source = SocketAddr::from(([198, 51, 100, 7], 41000));
+        let socket = runtime.sockets.lock().unwrap()[0]
+            .upgrade()
+            .expect("array socket should be alive");
+        socket.incoming.lock().unwrap().push_back((
+            crate::packet::new_hole_punch_packet(tid, HOLE_PUNCH_PACKET_BODY_LEN)
+                .into_bytes()
+                .to_vec(),
+            observed_source,
+        ));
+        socket.incoming_notify.notify_one();
+
+        let connected = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(socket) = client.try_connect_punched(&udp_array, tid).await.unwrap() {
+                    return socket;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let sent = socket.sent.lock().unwrap();
+        assert!(sent.iter().any(|(packet, addr)| {
+            *addr == observed_source && packet[4] == crate::packet::UdpPacketType::Syn as u8
+        }));
+        drop(sent);
+        drop(connected);
     }
 }

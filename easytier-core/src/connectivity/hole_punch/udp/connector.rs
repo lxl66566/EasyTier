@@ -21,10 +21,11 @@ use crate::{
 use crate::connectivity::hole_punch::policy::BackOff;
 
 use super::{
-    BLACKLIST_TIMEOUT_SEC, UdpBothEasySymPunchClient, UdpHolePunchClientError,
-    UdpHolePunchPeerSource, UdpHolePunchRuntime, UdpHolePunchSignaling, UdpHolePunchTransportSink,
-    UdpNatType, UdpPunchClientMethod, UdpPunchSocket, UdpPunchTaskInfo, UdpSymToConePunchClient,
-    collect_udp_punch_tasks, punch_cone_to_cone, should_blacklist_signal_error,
+    BLACKLIST_TIMEOUT_SEC, UdpBothEasySymPunchClient, UdpBothHardSymPunchClient,
+    UdpHolePunchClientError, UdpHolePunchPeerSource, UdpHolePunchRuntime, UdpHolePunchSignalError,
+    UdpHolePunchSignaling, UdpHolePunchTransportSink, UdpNatType, UdpPunchClientMethod,
+    UdpPunchSocket, UdpPunchTaskInfo, UdpSymToConePunchClient, collect_udp_punch_tasks,
+    punch_cone_to_cone, should_blacklist_signal_error,
 };
 
 #[derive(Clone, Default)]
@@ -108,9 +109,14 @@ where
     stun: Arc<dyn StunInfoProvider>,
     sym_punch_lock: UdpSymPunchLock,
     blacklist: UdpHolePunchBlacklist,
+    // Peers whose RPC endpoint rejected the both-hard-sym method index; they
+    // cannot serve it until upgraded, so stop asking instead of erroring each
+    // round. Expired like the blacklist to survive remote upgrades.
+    unsupported_both_hard_sym: UdpHolePunchBlacklist,
     try_cone_before_sym: Arc<AtomicBool>,
     pub sym_to_cone_client: UdpSymToConePunchClient<R, S>,
     pub both_easy_sym_client: UdpBothEasySymPunchClient<R, S>,
+    pub both_hard_sym_client: UdpBothHardSymPunchClient<R, S>,
 }
 
 impl<P, S, T, R> UdpHolePunchConnectorData<P, S, T, R>
@@ -129,6 +135,7 @@ where
             stun: parts.stun.clone(),
             sym_punch_lock: parts.sym_punch_lock.clone(),
             blacklist: UdpHolePunchBlacklist::new(),
+            unsupported_both_hard_sym: UdpHolePunchBlacklist::new(),
             try_cone_before_sym: Arc::new(AtomicBool::new(
                 parts.try_cone_before_sym.load(Ordering::Relaxed),
             )),
@@ -142,6 +149,11 @@ where
                 parts.signaling.clone(),
                 parts.stun.clone(),
             ),
+            both_hard_sym_client: UdpBothHardSymPunchClient::new(
+                parts.runtime.clone(),
+                parts.signaling.clone(),
+                parts.stun.clone(),
+            ),
         })
     }
 
@@ -150,6 +162,18 @@ where
             tracing::debug!(
                 dst_peer_id = peer_id,
                 "peer is blacklisted, skipping hole punching"
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    fn should_skip_unsupported_both_hard_sym(&self, peer_id: PeerId) -> bool {
+        if self.unsupported_both_hard_sym.contains(peer_id) {
+            tracing::debug!(
+                dst_peer_id = peer_id,
+                "peer lacks the both-hard-sym punch rpc, skipping hole punching"
             );
             true
         } else {
@@ -363,6 +387,75 @@ where
 
         Ok(())
     }
+
+    #[tracing::instrument(skip(self))]
+    async fn both_hard_sym(self: Arc<Self>, task_info: UdpPunchTaskInfo) -> Result<(), Error> {
+        let mut backoff =
+            BackOff::new(vec![1000, 1000, 2000, 4000, 4000, 8000, 8000, 16000, 64000]);
+
+        loop {
+            backoff.sleep_for_next_backoff().await;
+
+            if self.should_skip_blacklisted(task_info.dst_peer_id)
+                || self.should_skip_unsupported_both_hard_sym(task_info.dst_peer_id)
+            {
+                break;
+            }
+
+            if self.try_cone_before_sym.load(Ordering::Relaxed) {
+                let ret = punch_cone_to_cone(
+                    self.runtime.clone(),
+                    self.signaling.clone(),
+                    task_info.dst_peer_id,
+                )
+                .await;
+                let ret = self.map_client_result(task_info.dst_peer_id, ret);
+                if self.handle_punch_result(ret, None, None).await {
+                    break;
+                }
+                if self.should_skip_blacklisted(task_info.dst_peer_id) {
+                    break;
+                }
+            }
+
+            let mut is_busy = false;
+            let ret = {
+                let _lock = self.sym_punch_lock.lock().await;
+                self.both_hard_sym_client
+                    .do_hole_punching(task_info.dst_peer_id, &mut is_busy)
+                    .await
+            };
+
+            // The remote RPC endpoint predates this method; it cannot succeed
+            // until the peer upgrades, so remember and stop asking.
+            if matches!(
+                ret,
+                Err(UdpHolePunchClientError::Signaling(
+                    UdpHolePunchSignalError::Unsupported
+                ))
+            ) {
+                tracing::info!(
+                    dst_peer_id = task_info.dst_peer_id,
+                    "remote does not support both hard sym hole punching"
+                );
+                self.unsupported_both_hard_sym.insert(task_info.dst_peer_id);
+                break;
+            }
+
+            let ret = self.map_client_result(task_info.dst_peer_id, ret);
+
+            if is_busy {
+                backoff.rollback();
+            } else if self
+                .handle_punch_result(ret, Some(&mut backoff), None)
+                .await
+            {
+                break;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 struct UdpHolePunchPeerTaskLauncher<P, S, T, R>(Arc<UdpHolePunchConnectorData<P, S, T, R>>)
@@ -410,13 +503,14 @@ where
         }
 
         data.blacklist.cleanup();
+        data.unsupported_both_hard_sym.cleanup();
 
         let my_peer_id = data.peer_source.local_peer_id();
         let policy = data.peer_source.p2p_policy_flags();
         let candidates = data.peer_source.candidates().await;
         let peers_to_connect =
             collect_udp_punch_tasks(my_peer_id, my_nat_type, policy, candidates, |peer_id| {
-                data.blacklist.contains(peer_id)
+                data.blacklist.contains(peer_id) || data.unsupported_both_hard_sym.contains(peer_id)
             });
         for task in &peers_to_connect {
             tracing::info!(
@@ -446,6 +540,7 @@ where
             UdpPunchClientMethod::ConeToCone => tokio::spawn(data.cone_to_cone(item)),
             UdpPunchClientMethod::SymToCone => tokio::spawn(data.sym_to_cone(item)),
             UdpPunchClientMethod::EasySymToEasySym => tokio::spawn(data.both_easy_sym(item)),
+            UdpPunchClientMethod::BothHardSym => tokio::spawn(data.both_hard_sym(item)),
             _ => unreachable!(),
         }
     }
