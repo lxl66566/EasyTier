@@ -123,6 +123,7 @@ message SyncRouteInfoRequest {
 enum SyncRouteInfoError {
   DuplicatePeerId = 0;
   Stopped = 1;
+  MalformatConnBitmap = 2;
 }
 
 message SyncRouteInfoResponse {

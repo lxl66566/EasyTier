@@ -1339,10 +1339,15 @@ impl SyncedRouteInfo {
             if info.peer_route_id != my_peer_route_id
                 && info.version > self.get_peer_info_version_with_default(info.peer_id)
             {
-                // if dst peer send to us with higher version info of my peer, our peer id is duplicated
-                // TODO: handle this better. restart peer manager?
-                panic!("my peer id is duplicated");
-                // return Err(Error::DuplicatePeerId);
+                // if dst peer send to us with higher version info of my peer, our peer id is duplicated.
+                // any peer can fabricate such an info, so reject the sync instead of aborting.
+                tracing::error!(
+                    ?my_peer_id,
+                    peer_route_id = info.peer_route_id,
+                    version = info.version,
+                    "my peer id is duplicated with remote peer"
+                );
+                return Err(Error::DuplicatePeerId);
             }
         } else if info.peer_id == dst_peer_id {
             let Some(dst_peer_route_id) = dst_peer_route_id else {
@@ -1368,26 +1373,30 @@ impl SyncedRouteInfo {
         peer_infos: &[RoutePeerInfo],
         raw_peer_infos: &[RawRoutePeerInfo],
     ) -> Result<(), Error> {
-        let mut need_inc_version = false;
-        for (idx, route_info) in peer_infos.iter().enumerate() {
-            let mut route_info = route_info.clone();
-            let raw_route_info = &raw_peer_infos[idx];
+        // validate the whole batch
+        let dst_peer_route_id = self
+            .peer_infos
+            .read()
+            .get(&dst_peer_id)
+            .map(|x| x.peer_route_id);
+        for route_info in peer_infos.iter() {
             self.check_duplicate_peer_id(
                 my_peer_id,
                 my_peer_route_id,
                 dst_peer_id,
                 if route_info.peer_id == dst_peer_id {
-                    self.peer_infos
-                        .read()
-                        .get(&dst_peer_id)
-                        .map(|x| x.peer_route_id)
+                    dst_peer_route_id
                 } else {
                     None
                 },
-                &route_info,
+                route_info,
             )?;
+        }
 
-            let mut guard = self.peer_infos.write();
+        let mut need_inc_version = false;
+        let mut guard = self.peer_infos.write();
+        for (idx, route_info) in peer_infos.iter().enumerate() {
+            let mut route_info = route_info.clone();
             // time between peers may not be synchronized, so update last_update to local now.
             // note only last_update with larger version will be updated to local saved peer info.
             route_info.last_update = Some(Timestamp::now());
@@ -1396,11 +1405,12 @@ impl SyncedRouteInfo {
                 .is_none_or(|old| route_info.version > old.version)
             {
                 self.raw_peer_infos
-                    .insert(route_info.peer_id, raw_route_info.clone());
+                    .insert(route_info.peer_id, raw_peer_infos[idx].clone());
                 guard.insert(route_info.peer_id, route_info);
                 need_inc_version = true;
             }
         }
+        drop(guard);
         if need_inc_version {
             self.version.inc();
         }
@@ -1431,7 +1441,19 @@ impl SyncedRouteInfo {
         false
     }
 
-    fn update_conn_info_with_bitmap(&self, conn_bitmap: &RouteConnBitmap) {
+    fn update_conn_info_with_bitmap(&self, conn_bitmap: &RouteConnBitmap) -> Result<(), Error> {
+        if !conn_bitmap.is_valid() {
+            // report instead of silently dropping: an acknowledged-but-discarded
+            // bitmap makes the sender suppress retransmission of these conn
+            // versions, leaving us with stale topology forever.
+            tracing::warn!(
+                bitmap_len = conn_bitmap.bitmap.len(),
+                expected_len = ?RouteConnBitmap::required_bitmap_len(conn_bitmap.peer_ids.len()),
+                "reject malformed conn bitmap"
+            );
+            return Err(Error::MalformatConnBitmap);
+        }
+
         self.fill_empty_peer_info(&conn_bitmap.peer_ids.iter().map(|x| x.peer_id).collect());
 
         let mut need_inc_version = false;
@@ -1444,6 +1466,7 @@ impl SyncedRouteInfo {
         if need_inc_version {
             self.version.inc();
         }
+        Ok(())
     }
 
     fn update_conn_info_with_list(&self, conn_peer_list: &RouteConnPeerList) {
@@ -1464,13 +1487,12 @@ impl SyncedRouteInfo {
         }
     }
 
-    fn update_conn_info(&self, conn_info: &ConnInfo) {
+    fn update_conn_info(&self, conn_info: &ConnInfo) -> Result<(), Error> {
         match conn_info {
-            ConnInfo::ConnBitmap(conn_bitmap) => {
-                self.update_conn_info_with_bitmap(conn_bitmap);
-            }
+            ConnInfo::ConnBitmap(conn_bitmap) => self.update_conn_info_with_bitmap(conn_bitmap),
             ConnInfo::ConnPeerList(conn_peer_list) => {
                 self.update_conn_info_with_list(conn_peer_list);
+                Ok(())
             }
         }
     }
@@ -2180,13 +2202,17 @@ impl SyncRouteSession {
         dst_peer_id: PeerId,
     ) {
         for item in foreign_network.infos.iter() {
-            if item.key.as_ref().unwrap().peer_id == dst_peer_id {
+            let (Some(key), Some(value)) = (&item.key, &item.value) else {
+                continue;
+            };
+            if key.peer_id == dst_peer_id {
                 continue;
             }
+
             self.dst_saved_foreign_network_versions
-                .entry(item.key.clone().unwrap())
+                .entry(key.clone())
                 .or_default()
-                .set_if_larger(item.value.as_ref().unwrap().version);
+                .set_if_larger(value.version);
         }
     }
 
@@ -2531,8 +2557,11 @@ impl PeerRouteServiceImpl {
     }
 
     pub fn mark_interface_peers_dirty(&self) {
+        // Release: pair with the Acquire loads in interface_peer_snapshot /
+        // update_my_conn_info, so a reader observing the new generation also
+        // observes the interface changes that preceded this call.
         self.interface_peers_generation
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(1, Ordering::Release);
     }
 
     async fn interface_peer_snapshot_uncached(&self) -> InterfacePeerSnapshot {
@@ -2930,8 +2959,17 @@ impl PeerRouteServiceImpl {
             }
         }
 
+        // overflow needs 2^16 reachable peers on 32-bit / 2^32 on 64-bit;
+        // skip the refresh instead of allocating a wrapped (empty) bitmap.
+        let Some(bitmap_len) = RouteConnBitmap::required_bitmap_len(all_peer_ids.len()) else {
+            tracing::warn!(
+                peer_count = all_peer_ids.len(),
+                "conn bitmap size overflows"
+            );
+            return;
+        };
         let mut conn_bitmap = RouteConnBitmap {
-            bitmap: vec![0; (all_peer_ids.len() * all_peer_ids.len()).div_ceil(8)],
+            bitmap: vec![0; bitmap_len],
             peer_ids: all_peer_ids
                 .iter()
                 .map(|x| PeerIdVersion {
@@ -3592,9 +3630,16 @@ impl PeerRouteServiceImpl {
                             "stale non-initiator route sync rejected"
                         );
                     } else if err == Error::DuplicatePeerId as i32 {
-                        if !self.context.feature_flags().is_public_server {
-                            panic!("duplicate peer id");
-                        }
+                        // any peer can fabricate this error code to abort us,
+                        // so treat it as a normal sync failure instead.
+                        tracing::error!(
+                            ?my_peer_id,
+                            ?dst_peer_id,
+                            "sync_route_info failed: reported as duplicate peer id"
+                        );
+                        session
+                            .need_sync_initiator_info
+                            .store(true, Ordering::Relaxed);
                     } else {
                         tracing::error!(?ret, ?my_peer_id, ?dst_peer_id, "sync_route_info failed");
                         session
@@ -4161,14 +4206,21 @@ impl RouteSessionManager {
         }
 
         // Step 9b: credential peers' conn_info depends on allow_relay flag
+        let mut sync_error = None;
         if let Some(conn_info) = &conn_info {
             let accept_conn_info =
                 !from_is_credential || credential_info.map(|tc| tc.allow_relay).unwrap_or(false);
             if accept_conn_info {
-                service_impl.synced_route_info.update_conn_info(conn_info);
-                session.update_dst_saved_conn_info_version(conn_info, from_peer_id);
-                accepted_conn_info = Some(conn_info);
-                need_update_route_table = true;
+                match service_impl.synced_route_info.update_conn_info(conn_info) {
+                    Ok(()) => {
+                        accepted_conn_info = Some(conn_info);
+                        session.update_dst_saved_conn_info_version(conn_info, from_peer_id);
+                        need_update_route_table = true;
+                    }
+                    // keep processing the rest of the request, but never
+                    // acknowledge a discarded conn bitmap as applied.
+                    Err(e) => sync_error = Some(e),
+                }
             }
         }
 
@@ -4228,6 +4280,10 @@ impl RouteSessionManager {
         // there was nothing new to propagate.
         if need_update_route_table || foreign_network_changed {
             self.sync_now("sync_route_info");
+        }
+
+        if let Some(err) = sync_error {
+            return Err(err);
         }
 
         Ok(SyncRouteInfoResponse {
@@ -5617,7 +5673,8 @@ mod tests {
         install_conn_row(&bitmap_receiver, 1, [2]);
         bitmap_receiver
             .synced_route_info
-            .update_conn_info_with_bitmap(&bitmap);
+            .update_conn_info_with_bitmap(&bitmap)
+            .expect("well-formed bitmap should apply");
         assert!(
             bitmap_receiver
                 .synced_route_info
@@ -5625,6 +5682,214 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn malformed_conn_bitmap_is_rejected() {
+        let service_impl = test_service_impl(2);
+        let conn_bitmap = RouteConnBitmap {
+            bitmap: vec![],
+            peer_ids: vec![PeerIdVersion {
+                peer_id: 1,
+                version: 1,
+            }],
+        };
+
+        let ret = service_impl
+            .synced_route_info
+            .update_conn_info_with_bitmap(&conn_bitmap);
+
+        assert_eq!(ret.unwrap_err(), Error::MalformatConnBitmap);
+        assert_eq!(service_impl.synced_route_info.version.get(), 0);
+        assert!(
+            service_impl
+                .synced_route_info
+                .get_connected_peers::<BTreeSet<_>>(1)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn short_conn_bitmap_is_rejected_without_acknowledgement() {
+        // a too-short bitmap must fail the sync rpc instead of being
+        // silently acknowledged.
+        let (route, _peer_rpc) =
+            test_route_with_admin_peer(Arc::new(NoopPeerContext::default())).await;
+        route
+            .session_mgr
+            .do_sync_route_info(2, 22, true, None, None, None, None)
+            .await
+            .expect("initiator sync should succeed");
+
+        let conn_bitmap = RouteConnBitmap {
+            // 1 byte is too short for the 3x3 adjacency matrix (needs 2)
+            bitmap: vec![0; 1],
+            peer_ids: vec![
+                PeerIdVersion {
+                    peer_id: 3,
+                    version: 5,
+                },
+                PeerIdVersion {
+                    peer_id: 4,
+                    version: 5,
+                },
+                PeerIdVersion {
+                    peer_id: 5,
+                    version: 5,
+                },
+            ],
+        };
+
+        let ret = route
+            .session_mgr
+            .do_sync_route_info(
+                2,
+                22,
+                true,
+                None,
+                None,
+                Some(ConnInfo::ConnBitmap(conn_bitmap)),
+                None,
+            )
+            .await;
+
+        assert_eq!(ret.unwrap_err(), Error::MalformatConnBitmap);
+
+        let session = route.service_impl.get_session(2).unwrap();
+        for peer_id in [3, 4, 5] {
+            assert!(
+                session.dst_saved_conn_info_version.get(&peer_id).is_none(),
+                "discarded bitmap must not be acknowledged for peer {peer_id}"
+            );
+        }
+        assert!(
+            route
+                .service_impl
+                .synced_route_info
+                .conn_map
+                .read()
+                .get(&3)
+                .is_none()
+        );
+
+        route.stop().await;
+    }
+
+    #[test]
+    fn update_dst_saved_foreign_network_version_skips_absent_fields() {
+        let session = SyncRouteSession::new(1, 2);
+        let key = ForeignNetworkRouteInfoKey {
+            peer_id: 3,
+            network_name: "net".to_string(),
+        };
+        let foreign_network = RouteForeignNetworkInfos {
+            infos: vec![
+                route_foreign_network_infos::Info::default(),
+                route_foreign_network_infos::Info {
+                    key: Some(key.clone()),
+                    value: None,
+                },
+                route_foreign_network_infos::Info {
+                    key: None,
+                    value: Some(ForeignNetworkRouteInfoEntry {
+                        version: 3,
+                        ..Default::default()
+                    }),
+                },
+                route_foreign_network_infos::Info {
+                    key: Some(ForeignNetworkRouteInfoKey {
+                        peer_id: 2,
+                        network_name: "net".to_string(),
+                    }),
+                    value: Some(ForeignNetworkRouteInfoEntry {
+                        version: 5,
+                        ..Default::default()
+                    }),
+                },
+                route_foreign_network_infos::Info {
+                    key: Some(key.clone()),
+                    value: Some(ForeignNetworkRouteInfoEntry {
+                        version: 7,
+                        ..Default::default()
+                    }),
+                },
+            ],
+        };
+
+        session.update_dst_saved_foreign_network_version(&foreign_network, 2);
+
+        assert_eq!(
+            session
+                .dst_saved_foreign_network_versions
+                .get(&key)
+                .unwrap()
+                .get(),
+            7
+        );
+        assert_eq!(session.dst_saved_foreign_network_versions.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_my_peer_id_in_peer_infos_is_rejected() {
+        let service_impl = test_service_impl(1);
+        // a remote peer claims a higher version of our own peer id with a
+        // different route id; this must be rejected instead of panicking.
+        let info = RoutePeerInfo {
+            peer_id: 1,
+            version: 100,
+            peer_route_id: service_impl.my_peer_route_id + 1,
+            ..Default::default()
+        };
+
+        let ret = service_impl.synced_route_info.update_peer_infos(
+            1,
+            service_impl.my_peer_route_id,
+            2,
+            std::slice::from_ref(&info),
+            &[raw_route_peer_info(&info)],
+        );
+
+        assert_eq!(ret.unwrap_err(), Error::DuplicatePeerId);
+    }
+
+    #[test]
+    fn duplicate_peer_id_rejects_whole_batch_atomically() {
+        let service_impl = test_service_impl(1);
+        let version_before = service_impl.synced_route_info.version.get();
+        // a valid info followed by a fabricated duplicate of our own peer id:
+        // nothing from the batch may be applied.
+        let valid_info = RoutePeerInfo {
+            peer_id: 3,
+            version: 1,
+            peer_route_id: 30,
+            ..Default::default()
+        };
+        let duplicate_info = RoutePeerInfo {
+            peer_id: 1,
+            version: 100,
+            peer_route_id: service_impl.my_peer_route_id + 1,
+            ..Default::default()
+        };
+        let infos = vec![valid_info.clone(), duplicate_info.clone()];
+
+        let ret = service_impl.synced_route_info.update_peer_infos(
+            1,
+            service_impl.my_peer_route_id,
+            2,
+            &infos,
+            &infos.iter().map(raw_route_peer_info).collect::<Vec<_>>(),
+        );
+
+        assert_eq!(ret.unwrap_err(), Error::DuplicatePeerId);
+        assert!(
+            !service_impl
+                .synced_route_info
+                .peer_infos
+                .read()
+                .contains_key(&3)
+        );
+        assert!(service_impl.synced_route_info.raw_peer_infos.is_empty());
+        assert_eq!(service_impl.synced_route_info.version.get(), version_before);
     }
 
     #[tokio::test]
@@ -5921,7 +6186,10 @@ mod tests {
             }],
         }
         .into();
-        service.synced_route_info.update_conn_info(&conn_info);
+        service
+            .synced_route_info
+            .update_conn_info(&conn_info)
+            .expect("well-formed connection list should apply");
         assert_eq!(
             service.collect_missing_peer_ids(&session, Some(&conn_info), false, &[4]),
             (vec![2, 3], vec![3])
@@ -5957,7 +6225,10 @@ mod tests {
             }],
         }
         .into();
-        service.synced_route_info.update_conn_info(&conn_info);
+        service
+            .synced_route_info
+            .update_conn_info(&conn_info)
+            .expect("well-formed connection list should apply");
         service.update_route_table();
         let session = SyncRouteSession::new(1, 2);
         let (missing_peer_ids, missing_conn_peer_ids) =
