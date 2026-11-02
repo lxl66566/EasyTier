@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -2527,6 +2527,7 @@ pub(crate) struct PeerOutboundPacketRouter {
     acl_filter: Arc<AclFilter>,
     is_secure_mode_enabled: bool,
     counters: PeerOutboundPacketRouterCounters,
+    no_route_log: PacketLogLimiter,
 }
 
 impl PeerOutboundPacketRouter {
@@ -2574,6 +2575,7 @@ impl PeerOutboundPacketRouter {
                 compress_tx_bytes_before,
                 compress_tx_bytes_after,
             },
+            no_route_log: PacketLogLimiter::new(),
         }
     }
 
@@ -2902,7 +2904,9 @@ impl PeerOutboundPacketRouter {
         };
 
         if dst_peers.is_empty() {
-            tracing::info!("no peer id for ip: {}", ip_addr);
+            if let Some(count) = self.no_route_log.hit() {
+                tracing::warn!(count, %ip_addr, "no peer id for ip");
+            }
             return Ok(());
         }
 
@@ -3021,6 +3025,8 @@ pub(crate) struct PeerPacketRouter {
     traffic_metrics: Arc<TrafficMetricRecorder>,
     stats_mgr: Arc<StatsManager>,
     counters: PeerPacketRouterCounters,
+    decrypt_fail_log: PacketLogLimiter,
+    forward_fail_log: PacketLogLimiter,
 }
 
 impl PeerPacketRouter {
@@ -3090,6 +3096,8 @@ impl PeerPacketRouter {
                 compress_rx_bytes_after: stats_mgr
                     .get_counter(MetricName::CompressionBytesRxAfter, label_set),
             },
+            decrypt_fail_log: PacketLogLimiter::new(),
+            forward_fail_log: PacketLogLimiter::new(),
         }
     }
 
@@ -3236,8 +3244,16 @@ impl PeerPacketRouter {
                 to_peer_id,
             )
             .await;
-            if ret.is_err() {
-                tracing::error!(?ret, ?to_peer_id, ?from_peer_id, "forward packet error");
+            if let Err(e) = ret
+                && let Some(count) = self.forward_fail_log.hit()
+            {
+                tracing::warn!(
+                    count,
+                    ?e,
+                    ?to_peer_id,
+                    ?from_peer_id,
+                    "forward packet error"
+                );
             }
         } else {
             if packet_type == PacketType::RelayHandshake as u8
@@ -3248,7 +3264,9 @@ impl PeerPacketRouter {
             }
             if !self.secure_mode_enabled {
                 if let Err(e) = self.encryptor.decrypt(&mut ret) {
-                    tracing::error!(?e, "decrypt failed");
+                    if let Some(count) = self.decrypt_fail_log.hit() {
+                        tracing::warn!(count, ?e, "decrypt failed");
+                    }
                     return;
                 }
             } else if is_encrypted {
@@ -3360,6 +3378,32 @@ fn should_drop_relay_data(
         .peer_manager_header()
         .is_some_and(|header| header.to_peer_id.get() != my_peer_id);
     is_forwarded && !ingress.is_attached() && !destination_is_attached
+}
+
+/// Interval shared by per-packet rate-limited logs: emit the 1st and every
+/// Nth occurrence so attacker-triggered or missing-route events cannot
+/// flood the log.
+pub(crate) const PACKET_LOG_INTERVAL: u64 = 64;
+
+/// Per-packet log rate limiter: emits the 1st and every
+/// [`PACKET_LOG_INTERVAL`]-th occurrence of an event.
+pub(crate) struct PacketLogLimiter {
+    count: AtomicU64,
+}
+
+impl PacketLogLimiter {
+    pub(crate) const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+        }
+    }
+
+    /// Records one occurrence and returns the cumulative occurrence count
+    /// when this occurrence should be logged.
+    pub(crate) fn hit(&self) -> Option<u64> {
+        let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        (count == 1 || count.is_multiple_of(PACKET_LOG_INTERVAL)).then_some(count)
+    }
 }
 
 pub(crate) async fn try_handle_foreign_network_packet(
@@ -3626,6 +3670,7 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use dashmap::DashMap;
     use quanta::Instant;
+    use tracing_subscriber::prelude::*;
     use x25519_dalek::{PublicKey, StaticSecret};
 
     use super::*;
@@ -4970,5 +5015,176 @@ mod tests {
         core.start_peer_recv().await;
         core.start_peer_recv().await;
         core.stop().await;
+    }
+
+    #[test]
+    fn packet_log_limiter_emits_first_and_every_interval() {
+        let limiter = PacketLogLimiter::new();
+        for i in 1..=(PACKET_LOG_INTERVAL * 2) {
+            let expected = (i == 1 || i.is_multiple_of(PACKET_LOG_INTERVAL)).then_some(i);
+            assert_eq!(limiter.hit(), expected, "unexpected decision at {i}");
+        }
+    }
+
+    /// Counts events whose message contains `needle`, for asserting
+    /// per-packet log rate limiting.
+    #[derive(Clone)]
+    struct LogCounter {
+        needle: &'static str,
+        count: Arc<AtomicUsize>,
+    }
+
+    impl LogCounter {
+        fn new(needle: &'static str) -> Self {
+            Self {
+                needle,
+                count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn count(&self) -> usize {
+            self.count.load(Ordering::Relaxed)
+        }
+    }
+
+    struct LogCounterLayer(LogCounter);
+
+    impl<S> tracing_subscriber::Layer<S> for LogCounterLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct MessageVisitor<'a>(&'a mut String);
+
+            impl tracing::field::Visit for MessageVisitor<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0.push_str(&format!("{value:?}"));
+                    }
+                }
+            }
+
+            let mut message = String::new();
+            event.record(&mut MessageVisitor(&mut message));
+            if message.contains(self.0.needle) {
+                self.0.count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Installs a thread-local subscriber that counts events whose message
+    /// contains `needle`, for asserting per-packet log rate limiting.
+    fn log_counter(needle: &'static str) -> (LogCounter, tracing::subscriber::DefaultGuard) {
+        let counter = LogCounter::new(needle);
+        let subscriber = tracing_subscriber::registry().with(LogCounterLayer(counter.clone()));
+        let guard = subscriber.set_default();
+        (counter, guard)
+    }
+
+    #[tokio::test]
+    async fn no_route_per_packet_log_is_rate_limited() {
+        let core = build_portable_for_test(portable_runtime_config("portable-net")).unwrap();
+        let (counter, _guard) = log_counter("no peer id for ip");
+
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+        for _ in 0..(PACKET_LOG_INTERVAL * 3) {
+            core.send_msg_by_ip(ZCPacket::new_with_payload(b"x"), ip, false)
+                .await
+                .unwrap();
+        }
+
+        // 1st + every 64th occurrence: 64, 128, 192.
+        assert_eq!(counter.count(), 4);
+    }
+
+    struct FailingDecryptor;
+
+    impl Encryptor for FailingDecryptor {
+        fn decrypt(&self, _zc_packet: &mut ZCPacket) -> Result<(), crate::tunnel::encrypt::Error> {
+            Err(crate::tunnel::encrypt::Error::DecryptionFailed)
+        }
+
+        fn encrypt(&self, _zc_packet: &mut ZCPacket) -> Result<(), crate::tunnel::encrypt::Error> {
+            Ok(())
+        }
+    }
+
+    fn build_packet_router_for_test(
+        core: &PeerManagerCore,
+        encryptor: Arc<dyn Encryptor>,
+    ) -> PeerPacketRouter {
+        let (_, packet_recv) = crate::peers::create_packet_recv_chan();
+        PeerPacketRouter::new(
+            packet_recv,
+            core.my_peer_id,
+            core.peers.clone(),
+            core.peer_packet_process_pipeline.clone(),
+            core.foreign_network_client.clone(),
+            core.relay_peer_map.clone(),
+            core.foreign_network_manager.clone(),
+            encryptor,
+            core.data_compress_algo,
+            core.acl_filter.clone(),
+            core.context.clone(),
+            core.is_secure_mode_enabled,
+            core.route.clone(),
+            false,
+            core.traffic_metrics.clone(),
+            core.context.stats_manager(),
+            core.network_name.clone(),
+            core.counters.self_tx_packets.clone(),
+            core.counters.self_tx_bytes.clone(),
+            core.counters.compress_tx_bytes_before.clone(),
+            core.counters.compress_tx_bytes_after.clone(),
+        )
+    }
+
+    #[tokio::test]
+    async fn decrypt_failure_per_packet_log_is_rate_limited() {
+        let core = build_portable_for_test(portable_runtime_config("portable-net")).unwrap();
+        let router = build_packet_router_for_test(&core, Arc::new(FailingDecryptor));
+        let (counter, _guard) = log_counter("decrypt failed");
+
+        for _ in 0..(PACKET_LOG_INTERVAL * 2) {
+            router
+                .handle_packet(
+                    data_packet(core.my_peer_id, core.my_peer_id),
+                    false,
+                    PeerPacketIngress::Local,
+                )
+                .await;
+        }
+
+        // 1st + every 64th occurrence: 64, 128.
+        assert_eq!(counter.count(), 3);
+    }
+
+    #[tokio::test]
+    async fn forward_failure_per_packet_log_is_rate_limited() {
+        let core = build_portable_for_test(portable_runtime_config("portable-net")).unwrap();
+        let router = build_packet_router_for_test(&core, core.encryptor.clone());
+        let (counter, _guard) = log_counter("forward packet error");
+
+        let unknown_peer_id = core.my_peer_id + 1;
+        for _ in 0..(PACKET_LOG_INTERVAL * 2) {
+            router
+                .handle_packet(
+                    data_packet(core.my_peer_id, unknown_peer_id),
+                    false,
+                    PeerPacketIngress::Local,
+                )
+                .await;
+        }
+
+        // 1st + every 64th occurrence: 64, 128.
+        assert_eq!(counter.count(), 3);
     }
 }

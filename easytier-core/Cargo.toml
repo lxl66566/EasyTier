@@ -179,6 +179,7 @@ prost-reflect = "0.16.4"
 
 [target.'cfg(not(target_os = "wasi"))'.dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+tracing-subscriber = { workspace = true, features = ["registry"] }
 
 [package.metadata.cargo-machete]
 ignored = [
