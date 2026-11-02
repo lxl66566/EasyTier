@@ -304,7 +304,7 @@ Despite the name, EasyTier's `quic://` tunnels are **not encrypted by the transp
 sudo easytier-core -p 'wss://server.example.com:11010#fingerprint=sha256:<64-hex-chars>'
 ```
 
-The fingerprint of a node's `wss://` listener certificate is logged when the listener starts. A pinned connection whose fingerprint does not match is rejected. Note that the certificate is currently regenerated on every process restart, which changes the fingerprint; pinned peers then fail closed until re-pinned.
+The fingerprint of a node's `wss://` listener certificate is logged when the listener starts. A pinned connection whose fingerprint does not match is rejected. The certificate key is persisted in the per-user EasyTier state directory, so the fingerprint stays stable across restarts.
 
 About the data-plane `encryption_algorithm` option: `aes-gcm` (default), `aes-256-gcm`, and `chacha20` provide authenticated encryption, while `xor` is obfuscation only — it offers no integrity or replay protection, so traffic can be tampered with undetected. It exists for legacy interoperability; a warning is logged whenever it is selected, and you should avoid it unless an old peer requires it.
 
