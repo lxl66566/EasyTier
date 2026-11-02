@@ -61,6 +61,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 smoltcp = { workspace = true, optional = true }
+# already in the graph via snow/curve25519-dalek; direct use for constant-time comparisons
+subtle = "2.6"
 # All core Noise handshakes use 25519_ChaChaPoly_SHA256. Snow's std feature
 # also enables unused ring and BLAKE2 dependencies, so use its alloc support.
 snow = { version = "0.10.0", default-features = false, features = [

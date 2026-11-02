@@ -1,7 +1,8 @@
 use super::FromUrl;
+use super::cert::{PersistentServerCert, ServerCertSpec, load_process_cert};
+use super::tls_verification::{init_crypto_provider, pinned_fingerprint};
 use crate::tunnel::common::bind;
 use crate::{proto::common::TunnelInfo, socket::tcp::RuntimeTcpSocket};
-use anyhow::Context as _;
 use bytes::BytesMut;
 use cidr::IpCidr;
 use easytier_core::{
@@ -128,84 +129,51 @@ async fn map_from_ws_message(
     )))
 }
 
-#[derive(Debug)]
-struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
-
-impl SkipServerVerification {
-    fn new(provider: Arc<rustls::crypto::CryptoProvider>) -> Arc<Self> {
-        Arc::new(Self(provider))
-    }
+/// Warn once per process that unpinned wss tunnels trust any server
+/// certificate, which an active man-in-the-middle can exploit.
+fn warn_no_pin() {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    WARNED.get_or_init(|| {
+        tracing::warn!(
+            "wss server certificate is not verified: no fingerprint pinned in the \
+             peer url, so an active man-in-the-middle can impersonate the server. \
+             Append '#fingerprint=sha256:<hash>' to the peer url to pin it."
+        );
+    });
 }
 
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
+fn get_tls_client_config(pinned: Option<[u8; 32]>) -> rustls::ClientConfig {
+    if pinned.is_none() {
+        warn_no_pin();
     }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
+    super::tls_verification::tls_client_config(pinned)
 }
 
-fn get_insecure_tls_client_config() -> rustls::ClientConfig {
-    // Library callers may not have initialized a process-wide provider.
-    // Use the same explicit backend for TLS and signature verification.
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .expect("ring supports the default TLS protocol versions")
-        .dangerous()
-        .with_custom_certificate_verifier(SkipServerVerification::new(provider))
-        .with_no_client_auth();
-    config.enable_sni = true;
-    config.enable_early_data = false;
-    config
-}
+/// Self-signed certificate served by wss listeners.
+///
+/// The key pair is persisted in the per-user state directory by the shared
+/// certificate module ([`super::cert`], same mechanism as the quic listener),
+/// so the fingerprint stays stable across restarts and clients can pin it
+/// via `#fingerprint=sha256:<hex>`. The fingerprint is logged once per
+/// process when the certificate is first loaded.
+static SERVER_TLS_CERT: LazyLock<Result<PersistentServerCert, String>> =
+    LazyLock::new(|| load_process_cert(&WSS_CERT_SPEC).map_err(|error| format!("{error:#}")));
 
-fn get_insecure_tls_cert<'a>() -> (
-    Vec<rustls::pki_types::CertificateDer<'a>>,
-    rustls::pki_types::PrivateKeyDer<'a>,
-) {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let cert_der = cert.cert.der().clone();
-    let private_key = cert.signing_key.serialize_der();
-    let private_key = rustls::pki_types::PrivatePkcs8KeyDer::from(private_key);
-    (vec![cert_der], private_key.into())
+const WSS_CERT_SPEC: ServerCertSpec = ServerCertSpec {
+    file_name: "wss-server-key.pem",
+    label: "wss",
+    alpn: None,
+    // Keep TLS 1.2 so browser-era websocket clients still interoperate.
+    tls13_only: false,
+};
+
+/// The process-wide wss server certificate. A broken certificate file is a
+/// sticky error: failing loudly beats silently rotating the server identity
+/// and breaking every pinned peer.
+fn wss_server_cert() -> Result<&'static PersistentServerCert, TunnelError> {
+    SERVER_TLS_CERT
+        .as_ref()
+        .map_err(|error| TunnelError::InternalError(format!("wss server certificate: {error}")))
 }
 
 pub(crate) async fn upgrade_accepted<S>(
@@ -218,17 +186,8 @@ where
     let peer_addr = stream.peer_addr()?;
     let mut remote_url = socket_url(local_url.scheme(), peer_addr);
     let stream = if is_wss(&local_url)? {
-        let (certificates, private_key) = get_insecure_tls_cert();
-        // Do not rely on another tunnel initializing the global provider.
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .with_context(|| "Failed to select TLS protocol versions")?
-        .with_no_client_auth()
-        .with_single_cert(certificates, private_key)
-        .with_context(|| "Failed to create server config")?;
-        Either::Left(TlsAcceptor::from(Arc::new(config)).accept(stream).await?)
+        let acceptor = TlsAcceptor::from(wss_server_cert()?.tls_config());
+        Either::Left(acceptor.accept(stream).await?)
     } else {
         Either::Right(stream)
     };
@@ -366,12 +325,20 @@ impl easytier_core::socket::SocketListener for WsTunnelListener {
 
 pub(crate) async fn upgrade_connected<S>(
     stream: S,
-    remote_url: url::Url,
+    mut remote_url: url::Url,
 ) -> Result<Box<dyn Tunnel>, TunnelError>
 where
     S: VirtualTcpSocket,
 {
     let is_wss = is_wss(&remote_url)?;
+    // The fragment carries connection options (certificate pins), never part
+    // of the HTTP request; http::Uri rejects it outright, so strip it first.
+    let pinned = if is_wss {
+        pinned_fingerprint(&remote_url)?
+    } else {
+        None
+    };
+    remote_url.set_fragment(None);
     let local_addr = stream.local_addr()?;
     let resolved_remote_addr = stream.peer_addr()?;
     let info = TunnelInfo {
@@ -392,7 +359,8 @@ where
     let client = ClientBuilder::from_uri(http::Uri::try_from(remote_url.to_string()).unwrap())
         .max_headers(128);
     let stream: MaybeTlsStream<S> = if is_wss {
-        let tls = tokio_rustls::TlsConnector::from(Arc::new(get_insecure_tls_client_config()));
+        init_crypto_provider();
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(get_tls_client_config(pinned)));
         let sni = remote_url.domain().unwrap_or("localhost").to_owned();
         let server_name = rustls::pki_types::ServerName::try_from(sni)
             .map_err(|_| TunnelError::InvalidProtocol("Invalid SNI".to_owned()))?;
@@ -414,7 +382,9 @@ where
 pub mod tests {
     use super::*;
     use easytier_core::socket::SocketListener;
-    use futures::SinkExt;
+    use easytier_core::tunnel::fingerprint::format_sha256_fingerprint;
+    use futures::{SinkExt, StreamExt};
+    use sha2::{Digest, Sha256};
     use std::io;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -527,5 +497,183 @@ pub mod tests {
         assert!(response.contains("101 Switching Protocols"));
 
         let _tunnel = server_task.await.unwrap();
+    }
+
+    fn wss_url_with_fragment(addr: std::net::SocketAddr, fragment: &str) -> url::Url {
+        format!("wss://{addr}{fragment}").parse().unwrap()
+    }
+
+    fn self_signed_cert() -> rustls::pki_types::CertificateDer<'static> {
+        init_crypto_provider();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        rustls::pki_types::CertificateDer::from(cert.cert.der().clone())
+    }
+
+    fn pinned_verifier(expected: [u8; 32]) -> Arc<dyn rustls::client::danger::ServerCertVerifier> {
+        use crate::tunnel::tls_verification::PinnedServerVerification;
+        PinnedServerVerification::new(crate::tunnel::tls_verification::ring_provider(), expected)
+    }
+
+    #[test]
+    fn pinned_fingerprint_fragment_parses_only_well_formed_pins() {
+        // absent fragment / unrelated pairs mean no pin
+        assert_eq!(
+            pinned_fingerprint(&"wss://h:1".parse::<url::Url>().unwrap()).unwrap(),
+            None
+        );
+        assert_eq!(
+            pinned_fingerprint(&"wss://h:1#other=1".parse::<url::Url>().unwrap()).unwrap(),
+            None
+        );
+
+        let digest = [0xabu8; 32];
+        let value = format_sha256_fingerprint(&digest);
+        assert_eq!(
+            pinned_fingerprint(&wss_url_with_fragment(
+                "127.0.0.1:1".parse().unwrap(),
+                &format!("#noise=1&fingerprint={value}")
+            ))
+            .unwrap(),
+            Some(digest)
+        );
+
+        // malformed pins fail closed instead of silently disabling the pin
+        let bad = wss_url_with_fragment(
+            "127.0.0.1:1".parse().unwrap(),
+            "#fingerprint=sha256:not-hex",
+        );
+        assert!(matches!(
+            pinned_fingerprint(&bad),
+            Err(TunnelError::InvalidProtocol(_))
+        ));
+    }
+
+    #[test]
+    fn pinned_verifier_checks_end_entity_digest() {
+        let cert = self_signed_cert();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+
+        // wrong pin rejects the certificate
+        let err = pinned_verifier([0x11u8; 32])
+            .verify_server_cert(
+                &cert,
+                &[],
+                &server_name,
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("fingerprint mismatch"), "{err}");
+
+        // matching pin accepts it
+        let real_digest: [u8; 32] = Sha256::digest(cert.as_ref()).into();
+        pinned_verifier(real_digest)
+            .verify_server_cert(
+                &cert,
+                &[],
+                &server_name,
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn wss_tunnel_enforces_pinned_certificate_fingerprint() {
+        let mut listener = WsTunnelListener::new("wss://127.0.0.1:0".parse().unwrap());
+        listener.listen().await.unwrap();
+        let local_url = listener.local_url();
+        let addr: std::net::SocketAddr = format!(
+            "{}:{}",
+            local_url.host_str().unwrap(),
+            local_url.port().unwrap()
+        )
+        .parse()
+        .unwrap();
+
+        // two sequential connections: one accepted, one aborted during TLS
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let tunnel = listener.accept().await.unwrap();
+                crate::tunnel::common::tests::_tunnel_echo_server(tunnel, true).await;
+            }
+        });
+
+        let pinned = wss_server_cert().unwrap().fingerprint();
+        let pin_value = format_sha256_fingerprint(&pinned);
+
+        // matching pin: handshake succeeds and data flows
+        let url = wss_url_with_fragment(addr, &format!("#fingerprint={pin_value}"));
+        let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let tunnel = upgrade_connected(RuntimeTcpSocket::new(socket), url)
+            .await
+            .unwrap();
+        let (mut recv, mut send) = tunnel.split();
+        send.send(ZCPacket::new_with_payload(b"pinned wss"))
+            .await
+            .unwrap();
+        let packet = tokio::time::timeout(Duration::from_secs(5), recv.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(packet.payload(), b"pinned wss".as_slice());
+        let _ = send.close().await;
+
+        // mismatching pin: fail closed at the TLS handshake
+        let mut wrong = pinned;
+        wrong[0] ^= 0xff;
+        let url = wss_url_with_fragment(
+            addr,
+            &format!("#fingerprint={}", format_sha256_fingerprint(&wrong)),
+        );
+        let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let err = upgrade_connected(RuntimeTcpSocket::new(socket), url)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("fingerprint mismatch"), "{err}");
+
+        // The listener keeps accepting after a failed TLS handshake (it only
+        // fails on tcp accept errors), so the server task never finishes on
+        // its own after the aborted second connection; tear it down.
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn wss_tunnel_without_pin_keeps_legacy_skip_verification() {
+        let mut listener = WsTunnelListener::new("wss://127.0.0.1:0".parse().unwrap());
+        listener.listen().await.unwrap();
+        let local_url = listener.local_url();
+        let addr: std::net::SocketAddr = format!(
+            "{}:{}",
+            local_url.host_str().unwrap(),
+            local_url.port().unwrap()
+        )
+        .parse()
+        .unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let tunnel = listener.accept().await.unwrap();
+            crate::tunnel::common::tests::_tunnel_echo_server(tunnel, true).await;
+        });
+
+        // no pin configured: connect as before (warns once per process)
+        let url = wss_url_with_fragment(addr, "");
+        let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let tunnel = upgrade_connected(RuntimeTcpSocket::new(socket), url)
+            .await
+            .unwrap();
+        let (mut recv, mut send) = tunnel.split();
+        send.send(ZCPacket::new_with_payload(b"unpinned wss"))
+            .await
+            .unwrap();
+        let packet = tokio::time::timeout(Duration::from_secs(5), recv.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(packet.payload(), b"unpinned wss".as_slice());
+        let _ = send.close().await;
+        server_task.await.unwrap();
     }
 }

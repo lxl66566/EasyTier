@@ -89,7 +89,7 @@ fn default_linux_machine_id_state_dir(
     PathBuf::from("/var/lib/easytier")
 }
 
-fn default_machine_id_state_dir() -> anyhow::Result<PathBuf> {
+pub(crate) fn default_machine_id_state_dir() -> anyhow::Result<PathBuf> {
     cfg_select! {
         target_os = "linux" => Ok(default_linux_machine_id_state_dir(
             env::var_os("XDG_DATA_HOME"),

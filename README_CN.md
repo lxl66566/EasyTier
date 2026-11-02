@@ -291,6 +291,18 @@ sudo easytier-core --network-name mysharednode --network-secret mysharednode
 
 网络设置成功后，您可以轻松配置它以在系统启动时自动启动。请参阅 [一键注册服务指南](https://easytier.cn/en/guide/network/oneclick-install-as-service.html) 了解如何将 EasyTier 注册为系统服务。
 
+#### 传输层安全
+
+`wss://` 隧道虽然使用 TLS，但默认情况下客户端接受任意服务器证书，主动中间人仍可冒充服务器。可在节点 URL 的 fragment 中固定服务器证书指纹来防范：
+
+```bash
+sudo easytier-core -p 'wss://server.example.com:11010#fingerprint=sha256:<64位十六进制>'
+```
+
+节点 `wss://` 监听器启动时会在日志中打印其证书指纹。固定了指纹的连接一旦不匹配即被拒绝。注意：当前证书在每次进程重启时会重新生成，指纹随之变化，已固定的对端会拒绝连接（fail-closed），需要重新固定。
+
+关于数据面加密算法选项 `encryption_algorithm`：`aes-gcm`（默认）、`aes-256-gcm`、`chacha20` 均为带认证的加密；而 `xor` 仅为混淆手段——没有完整性与防重放保护，报文可被被动篡改而不被发现。该选项仅为兼容旧版本节点而保留，选中时会打印警告，除非确有旧对端需要，否则应避免使用。
+
 ## 相关项目
 
 - [ZeroTier](https://www.zerotier.com/)：用于连接设备的全球虚拟网络。

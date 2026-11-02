@@ -18,6 +18,7 @@ pub use crate::socket::IpVersion;
 pub mod buf;
 pub(crate) mod encrypt;
 pub mod filter;
+pub mod fingerprint;
 pub mod framed;
 pub mod host_tunnel;
 pub mod mpsc;

@@ -193,7 +193,9 @@ mod tests {
             .unwrap();
         assert!(packet.peer_manager_header().unwrap().is_compressed());
         let encryptor = crate::tunnel::encrypt::create_encryptor("aes-gcm", [1; 16], [2; 32]);
-        encryptor.encrypt(&mut packet).unwrap();
+        encryptor
+            .encrypt(&mut packet, crate::tunnel::encrypt::AeadBinding::None)
+            .unwrap();
         assert_eq!(packet.flow_key, key);
         let mut packet = packet.convert_type(ZCPacketType::UDP);
         encryptor.decrypt(&mut packet).unwrap();
