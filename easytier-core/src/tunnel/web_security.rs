@@ -95,31 +95,27 @@ impl TunnelFilter for SecureDatagramTunnelFilter {
     }
 
     fn after_received(&self, data: StreamItem) -> Option<StreamItem> {
-        let packet = match data {
+        let mut packet = match data {
             Ok(v) => v,
             Err(e) => return Some(Err(e)),
         };
 
-        let payload = match checked_payload(&packet, "secure packet") {
-            Ok(v) => v,
-            Err(e) => return Some(Err(e)),
-        };
-        let mut cipher = ZCPacket::new_with_payload(payload);
-        cipher.fill_peer_manager_hdr(0, 0, PacketType::Data as u8);
-        cipher
-            .mut_peer_manager_header()
-            .unwrap()
-            .set_encrypted(true);
+        if let Err(e) = checked_payload(&packet, "secure packet") {
+            return Some(Err(e));
+        }
+        // Decrypt in place on the received packet: the session binds the
+        // canonical header into the AAD, so the marker and header bytes the
+        // sender sealed with must survive to the receiver.
         if let Err(e) = self
             .session
-            .decrypt_payload(self.role.recv_dir(), &mut cipher)
+            .decrypt_payload(self.role.recv_dir(), &mut packet)
         {
             return Some(Err(TunnelError::InvalidPacket(format!(
                 "secure datagram decrypt failed: {e}"
             ))));
         }
 
-        let packet = ZCPacket::new_from_buf(cipher.payload_bytes(), ZCPacketType::DummyTunnel);
+        let packet = ZCPacket::new_from_buf(packet.payload_bytes(), ZCPacketType::DummyTunnel);
         if packet.peer_manager_header().is_none() {
             return Some(Err(TunnelError::InvalidPacket(
                 "decrypted secure packet too short".to_string(),

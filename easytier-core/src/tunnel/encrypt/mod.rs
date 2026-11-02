@@ -1,4 +1,7 @@
-use crate::{config::EncryptionAlgorithm, packet::ZCPacket};
+use crate::{
+    config::EncryptionAlgorithm,
+    packet::{PEER_MANAGER_HEADER_SIZE, ZCPacket},
+};
 use std::{collections::hash_map::DefaultHasher, hash::Hasher, sync::Arc};
 
 #[cfg(feature = "aes-gcm")]
@@ -43,15 +46,63 @@ pub enum Error {
     ReplayDetected,
 }
 
+/// Sender-side choice of AEAD additional-data binding.
+///
+/// AEAD backends honor this when sealing; unauthenticated backends (xor, null)
+/// ignore it. [`AeadBinding::Header`] marks the packet (reserved byte) so the
+/// receiver's `decrypt` picks the same binding; tampering with the marker only
+/// makes decryption fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AeadBinding {
+    /// Empty AAD, interoperable with peers predating header authentication.
+    #[default]
+    None,
+    /// Bind the canonicalized [`crate::packet::PeerManagerHeader`] into the
+    /// AAD, authenticating from/to peer ids, packet type, stable flags and
+    /// payload length. Requires the final header to be complete at seal time.
+    Header,
+}
+
+/// AAD bytes for sealing: marks the packet per `binding` first so the wire
+/// marker and the authenticated bytes cannot disagree.
+pub(super) fn seal_aad(
+    zc_packet: &mut ZCPacket,
+    binding: AeadBinding,
+) -> Result<Option<[u8; PEER_MANAGER_HEADER_SIZE]>, Error> {
+    let header = zc_packet
+        .mut_peer_manager_header()
+        .ok_or(Error::EncryptionFailed)?;
+    match binding {
+        AeadBinding::None => {
+            header.set_header_aad(false);
+            Ok(None)
+        }
+        AeadBinding::Header => {
+            header.set_header_aad(true);
+            Ok(Some(header.aad_bytes()))
+        }
+    }
+}
+
+/// AAD bytes for opening, selected by the packet's wire marker.
+pub(super) fn open_aad(zc_packet: &ZCPacket) -> Option<[u8; PEER_MANAGER_HEADER_SIZE]> {
+    let header = zc_packet.peer_manager_header()?;
+    header.is_header_aad().then(|| header.aad_bytes())
+}
+
 pub trait Encryptor: Send + Sync + 'static {
+    /// Decrypts in place. AEAD backends select the AAD from the packet's
+    /// header marker (see [`crate::packet::HEADER_AAD_MARKER`]), so no
+    /// binding parameter is needed here.
     fn decrypt(&self, zc_packet: &mut ZCPacket) -> Result<(), Error>;
-    fn encrypt(&self, zc_packet: &mut ZCPacket) -> Result<(), Error>;
+    fn encrypt(&self, zc_packet: &mut ZCPacket, binding: AeadBinding) -> Result<(), Error>;
     fn encrypt_with_nonce(
         &self,
         zc_packet: &mut ZCPacket,
         _nonce: Option<&[u8]>,
+        binding: AeadBinding,
     ) -> Result<(), Error> {
-        self.encrypt(zc_packet)
+        self.encrypt(zc_packet, binding)
     }
 }
 
@@ -98,7 +149,8 @@ impl Encryptor for NullCipher {
         }
     }
 
-    fn encrypt(&self, _zc_packet: &mut ZCPacket) -> Result<(), Error> {
+    // No authentication to bind; the AAD binding is meaningless without a tag.
+    fn encrypt(&self, _zc_packet: &mut ZCPacket, _binding: AeadBinding) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -118,7 +170,7 @@ impl Encryptor for UnsupportedCipher {
         Err(self.error())
     }
 
-    fn encrypt(&self, _zc_packet: &mut ZCPacket) -> Result<(), Error> {
+    fn encrypt(&self, _zc_packet: &mut ZCPacket, _binding: AeadBinding) -> Result<(), Error> {
         Err(self.error())
     }
 }
@@ -345,25 +397,34 @@ mod tests {
     use super::*;
     use crate::packet::{StandardAeadTail, ZCPacket};
 
+    // Callers are combinations of feature-gated backends; keep it linked
+    // whenever any pair could be compiled.
+    #[allow(dead_code)]
     fn assert_interoperable(left: &dyn Encryptor, right: &dyn Encryptor) {
-        let plaintext = b"cross-backend compatibility";
-        let nonce = [9; StandardAeadTail::NONCE_SIZE];
-        let mut left_packet = ZCPacket::new_with_payload(plaintext);
-        left_packet.fill_peer_manager_hdr(1, 2, 1);
-        let mut right_packet = ZCPacket::new_with_payload(plaintext);
-        right_packet.fill_peer_manager_hdr(1, 2, 1);
+        // Both binding modes must interoperate across backends: `None` keeps
+        // the legacy wire format, `Header` must produce identical ciphertext
+        // (same AAD, same nonce) on every backend.
+        for binding in [AeadBinding::None, AeadBinding::Header] {
+            let plaintext = b"cross-backend compatibility";
+            let nonce = [9; StandardAeadTail::NONCE_SIZE];
+            let mut left_packet = ZCPacket::new_with_payload(plaintext);
+            left_packet.fill_peer_manager_hdr(1, 2, 1);
+            let mut right_packet = ZCPacket::new_with_payload(plaintext);
+            right_packet.fill_peer_manager_hdr(1, 2, 1);
 
-        left.encrypt_with_nonce(&mut left_packet, Some(&nonce))
-            .unwrap();
-        right
-            .encrypt_with_nonce(&mut right_packet, Some(&nonce))
-            .unwrap();
-        assert_eq!(left_packet.payload(), right_packet.payload());
+            left.encrypt_with_nonce(&mut left_packet, Some(&nonce), binding)
+                .unwrap();
+            right
+                .encrypt_with_nonce(&mut right_packet, Some(&nonce), binding)
+                .unwrap();
+            assert_eq!(left_packet.payload(), right_packet.payload());
 
-        left.decrypt(&mut right_packet).unwrap();
-        right.decrypt(&mut left_packet).unwrap();
-        assert_eq!(left_packet.payload(), plaintext);
-        assert_eq!(right_packet.payload(), plaintext);
+            left.decrypt(&mut right_packet).unwrap();
+            right.decrypt(&mut left_packet).unwrap();
+            assert_eq!(left_packet.payload(), plaintext);
+            assert_eq!(right_packet.payload(), plaintext);
+            assert!(!left_packet.peer_manager_header().unwrap().is_header_aad());
+        }
     }
 
     #[test]
@@ -532,5 +593,146 @@ mod tests {
             validate_algorithm("rot13").unwrap_err().to_string(),
             "invalid encryption algorithm: rot13"
         );
+    }
+
+    #[cfg(any(
+        feature = "aes-gcm",
+        feature = "openssl-crypto",
+        feature = "ring-crypto"
+    ))]
+    mod header_aad {
+        use super::*;
+        use crate::packet::PacketType;
+
+        fn aead_encryptor() -> Arc<dyn Encryptor> {
+            create_encryptor("aes-gcm", [1; 16], [2; 32])
+        }
+
+        fn encrypted_packet(binding: AeadBinding) -> ZCPacket {
+            let cipher = aead_encryptor();
+            let mut packet = ZCPacket::new_with_payload(b"authenticated payload");
+            packet.fill_peer_manager_hdr(11, 22, PacketType::Data as u8);
+            cipher.encrypt(&mut packet, binding).unwrap();
+            packet
+        }
+
+        #[test]
+        fn header_binding_round_trips() {
+            let cipher = aead_encryptor();
+            let mut packet = encrypted_packet(AeadBinding::Header);
+            assert!(packet.peer_manager_header().unwrap().is_header_aad());
+            cipher.decrypt(&mut packet).unwrap();
+            assert_eq!(packet.payload(), b"authenticated payload");
+            assert!(!packet.peer_manager_header().unwrap().is_encrypted());
+            assert!(!packet.peer_manager_header().unwrap().is_header_aad());
+        }
+
+        #[test]
+        fn tampering_any_authenticated_header_field_fails() {
+            let cipher = aead_encryptor();
+            let tamper_from = |p: &mut ZCPacket| {
+                p.mut_peer_manager_header().unwrap().from_peer_id.set(33);
+            };
+            let tamper_to =
+                |p: &mut ZCPacket| p.mut_peer_manager_header().unwrap().to_peer_id.set(44);
+            let tamper_type = |p: &mut ZCPacket| {
+                p.mut_peer_manager_header().unwrap().packet_type = PacketType::RoutePacket as u8;
+            };
+            let tamper_flags = |p: &mut ZCPacket| {
+                p.mut_peer_manager_header().unwrap().set_no_proxy(true);
+            };
+            let tamper_len = |p: &mut ZCPacket| {
+                let hdr = p.mut_peer_manager_header().unwrap();
+                hdr.len.set(hdr.len.get() + 1);
+            };
+
+            for tamper in [
+                tamper_from,
+                tamper_to,
+                tamper_type,
+                tamper_flags,
+                tamper_len,
+            ] {
+                let mut packet = encrypted_packet(AeadBinding::Header);
+                tamper(&mut packet);
+                assert!(
+                    cipher.decrypt(&mut packet).is_err(),
+                    "tampered header must not decrypt"
+                );
+            }
+        }
+
+        #[test]
+        fn relay_legal_header_mutations_still_decrypt() {
+            // Intermediate hops bump forward_counter and may clear
+            // LATENCY_FIRST while forwarding an encrypted packet; both are
+            // excluded from the canonical AAD.
+            let cipher = aead_encryptor();
+            let mut packet = encrypted_packet(AeadBinding::Header);
+            {
+                let hdr = packet.mut_peer_manager_header().unwrap();
+                hdr.set_latency_first(true);
+                hdr.forward_counter += 1;
+            }
+            cipher.decrypt(&mut packet).unwrap();
+            assert_eq!(packet.payload(), b"authenticated payload");
+        }
+
+        #[test]
+        fn marker_tampering_fails_closed() {
+            let cipher = aead_encryptor();
+
+            // Stripping the marker downgrades to the empty AAD and must fail.
+            let mut packet = encrypted_packet(AeadBinding::Header);
+            packet
+                .mut_peer_manager_header()
+                .unwrap()
+                .set_header_aad(false);
+            assert!(cipher.decrypt(&mut packet).is_err());
+
+            // Forging the marker on a legacy-format packet must fail too.
+            let mut legacy = encrypted_packet(AeadBinding::None);
+            assert!(!legacy.peer_manager_header().unwrap().is_header_aad());
+            legacy
+                .mut_peer_manager_header()
+                .unwrap()
+                .set_header_aad(true);
+            assert!(cipher.decrypt(&mut legacy).is_err());
+        }
+
+        #[test]
+        fn none_binding_interoperates_with_legacy_decrypt() {
+            // `None` produces exactly the legacy wire format: an old peer
+            // (empty AAD, marker ignored) can still open the packet.
+            let cipher = aead_encryptor();
+            let mut packet = encrypted_packet(AeadBinding::None);
+            assert!(!packet.peer_manager_header().unwrap().is_header_aad());
+            cipher.decrypt(&mut packet).unwrap();
+            assert_eq!(packet.payload(), b"authenticated payload");
+        }
+
+        #[test]
+        fn seal_aad_and_open_aad_agree() {
+            let cipher = aead_encryptor();
+            let mut packet = ZCPacket::new_with_payload(b"payload");
+            packet.fill_peer_manager_hdr(5, 6, PacketType::RpcReq as u8);
+            let sealed = seal_aad(&mut packet, AeadBinding::Header).unwrap();
+            assert_eq!(
+                sealed.as_ref().map(|b| &b[..]),
+                open_aad(&packet).as_ref().map(|b| &b[..])
+            );
+            assert_eq!(
+                seal_aad(&mut packet, AeadBinding::None).unwrap(),
+                None,
+                "None must clear a stale marker so both sides agree"
+            );
+            assert_eq!(open_aad(&packet), None);
+
+            cipher.encrypt(&mut packet, AeadBinding::Header).unwrap();
+            assert_eq!(
+                open_aad(&packet).as_ref().map(|b| &b[..]),
+                sealed.as_ref().map(|b| &b[..])
+            );
+        }
     }
 }

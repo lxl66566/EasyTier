@@ -65,6 +65,20 @@ pub type PeerConnId = uuid::Uuid;
 const MAGIC: u32 = 0xd1e1a5e1;
 const VERSION: u32 = 1;
 
+/// Handshake feature: this node binds the canonicalized PeerManagerHeader of
+/// encrypted packets into the AEAD AAD. A peer that declared it can open
+/// header-bound packets; peers that did not must only receive legacy
+/// (empty-AAD) packets on their direct connections.
+pub const HEADER_AAD_FEATURE: &str = "header-aad-v1";
+
+/// Features declared in every handshake message of this build.
+fn handshake_features() -> Vec<String> {
+    vec![
+        LIVENESS_ECHO_FEATURE.to_owned(),
+        HEADER_AAD_FEATURE.to_owned(),
+    ]
+}
+
 /// The proof of client secret.
 #[derive(Debug)]
 struct SecretProof {
@@ -544,7 +558,7 @@ impl PeerConn {
             magic: MAGIC,
             my_peer_id: self.my_peer_id,
             version: VERSION,
-            features: vec![LIVENESS_ECHO_FEATURE.to_owned()],
+            features: handshake_features(),
             network_name: network.network_name.clone(),
             ..Default::default()
         };
@@ -815,7 +829,7 @@ impl PeerConn {
             a_session_generation,
             a_conn_id: Some(a_conn_id.into()),
             client_encryption_algorithm: self.my_encrypt_algo.clone(),
-            features: vec![LIVENESS_ECHO_FEATURE.to_owned()],
+            features: handshake_features(),
         };
 
         let mut hs = builder
@@ -1088,7 +1102,7 @@ impl PeerConn {
             a_conn_id_echo: msg1_pb.a_conn_id,
             secret_proof_32,
             server_encryption_algorithm: algo,
-            features: vec![LIVENESS_ECHO_FEATURE.to_owned()],
+            features: handshake_features(),
         };
         self.send_noise_msg(
             msg2_pb,
@@ -1473,6 +1487,14 @@ impl PeerConn {
     #[cfg(test)]
     pub(super) fn record_latency_for_test(&self, latency_us: u32) {
         self.latency_stats.record_latency(latency_us);
+    }
+
+    /// True when the remote's handshake declared [`HEADER_AAD_FEATURE`], i.e.
+    /// it can decrypt packets whose header is bound into the AEAD AAD.
+    pub fn supports_header_aad(&self) -> bool {
+        self.info
+            .as_ref()
+            .is_some_and(|info| info.features.iter().any(|f| f == HEADER_AAD_FEATURE))
     }
 
     pub fn get_stats(&self) -> PeerConnStats {

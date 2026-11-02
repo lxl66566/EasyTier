@@ -4,7 +4,7 @@ use zerocopy::{AsBytes as _, FromBytes as _, FromZeroes as _};
 
 use crate::packet::{StandardAeadTail, ZCPacket};
 
-use super::{Encryptor, Error};
+use super::{AeadBinding, Encryptor, Error, open_aad, seal_aad};
 
 #[derive(Clone)]
 pub struct RingCipher {
@@ -81,6 +81,7 @@ impl Encryptor for RingCipher {
         if !header.is_encrypted() {
             return Ok(());
         }
+        let aad = open_aad(packet);
 
         let payload_len = packet.payload().len();
         if payload_len < StandardAeadTail::SIZE {
@@ -90,20 +91,19 @@ impl Encryptor for RingCipher {
         let text_and_tag_len = payload_len - StandardAeadTail::SIZE + StandardAeadTail::TAG_SIZE;
         let tail = StandardAeadTail::ref_from_suffix(packet.payload()).unwrap();
         let nonce = aead::Nonce::assume_unique_for_key(tail.nonce);
+        let aad = match &aad {
+            Some(bytes) => aead::Aad::from(&bytes[..]),
+            None => aead::Aad::from(&[][..]),
+        };
 
         self.cipher
             .key()
-            .open_in_place(
-                nonce,
-                aead::Aad::empty(),
-                &mut packet.mut_payload()[..text_and_tag_len],
-            )
+            .open_in_place(nonce, aad, &mut packet.mut_payload()[..text_and_tag_len])
             .map_err(|_| Error::DecryptionFailed)?;
 
-        packet
-            .mut_peer_manager_header()
-            .unwrap()
-            .set_encrypted(false);
+        let header = packet.mut_peer_manager_header().unwrap();
+        header.set_encrypted(false);
+        header.set_header_aad(false);
         let old_len = packet.buf_len();
         packet
             .mut_inner()
@@ -111,16 +111,22 @@ impl Encryptor for RingCipher {
         Ok(())
     }
 
-    fn encrypt(&self, packet: &mut ZCPacket) -> Result<(), Error> {
-        self.encrypt_with_nonce(packet, None)
+    fn encrypt(&self, packet: &mut ZCPacket, binding: AeadBinding) -> Result<(), Error> {
+        self.encrypt_with_nonce(packet, None, binding)
     }
 
-    fn encrypt_with_nonce(&self, packet: &mut ZCPacket, nonce: Option<&[u8]>) -> Result<(), Error> {
+    fn encrypt_with_nonce(
+        &self,
+        packet: &mut ZCPacket,
+        nonce: Option<&[u8]>,
+        binding: AeadBinding,
+    ) -> Result<(), Error> {
         let header = packet.peer_manager_header().unwrap();
         if header.is_encrypted() {
             tracing::warn!(?packet, "packet is already encrypted");
             return Ok(());
         }
+        let aad = seal_aad(packet, binding)?;
 
         let mut tail = StandardAeadTail::new_zeroed();
         match nonce {
@@ -131,10 +137,14 @@ impl Encryptor for RingCipher {
         }
 
         let nonce = aead::Nonce::assume_unique_for_key(tail.nonce);
+        let aad = match &aad {
+            Some(bytes) => aead::Aad::from(&bytes[..]),
+            None => aead::Aad::from(&[][..]),
+        };
         let tag = self
             .cipher
             .key()
-            .seal_in_place_separate_tag(nonce, aead::Aad::empty(), packet.mut_payload())
+            .seal_in_place_separate_tag(nonce, aad, packet.mut_payload())
             .map_err(|_| Error::EncryptionFailed)?;
         tail.tag.copy_from_slice(tag.as_ref());
 
@@ -157,7 +167,11 @@ mod tests {
         packet.fill_peer_manager_hdr(1, 2, 1);
 
         cipher
-            .encrypt_with_nonce(&mut packet, Some(&[3; StandardAeadTail::NONCE_SIZE]))
+            .encrypt_with_nonce(
+                &mut packet,
+                Some(&[3; StandardAeadTail::NONCE_SIZE]),
+                AeadBinding::None,
+            )
             .unwrap();
         assert!(packet.peer_manager_header().unwrap().is_encrypted());
 
@@ -179,7 +193,7 @@ mod tests {
         let mut packet = ZCPacket::new_with_payload(&[0; 16]);
         packet.fill_peer_manager_hdr(0, 0, 0);
         cipher
-            .encrypt_with_nonce(&mut packet, Some(&[0; 12]))
+            .encrypt_with_nonce(&mut packet, Some(&[0; 12]), AeadBinding::None)
             .unwrap();
 
         assert_eq!(

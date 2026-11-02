@@ -4,7 +4,7 @@ use zerocopy::{AsBytes as _, FromBytes as _, FromZeroes as _};
 
 use crate::packet::{StandardAeadTail, ZCPacket};
 
-use super::{Encryptor, Error};
+use super::{AeadBinding, Encryptor, Error, open_aad, seal_aad};
 
 #[derive(Clone)]
 pub struct OpenSslCipher {
@@ -52,6 +52,7 @@ impl Encryptor for OpenSslCipher {
         if !header.is_encrypted() {
             return Ok(());
         }
+        let aad = open_aad(packet);
 
         let payload_len = packet.payload().len();
         if payload_len < StandardAeadTail::SIZE {
@@ -65,6 +66,11 @@ impl Encryptor for OpenSslCipher {
         decrypter
             .set_tag(&tail.tag)
             .map_err(|_| Error::DecryptionFailed)?;
+        if let Some(aad) = aad.as_deref() {
+            decrypter
+                .aad_update(aad)
+                .map_err(|_| Error::DecryptionFailed)?;
+        }
 
         let text_len = payload_len - StandardAeadTail::SIZE;
         let mut output = vec![0; text_len + cipher.block_size()];
@@ -76,10 +82,9 @@ impl Encryptor for OpenSslCipher {
             .map_err(|_| Error::DecryptionFailed)?;
 
         packet.mut_payload()[..written].copy_from_slice(&output[..written]);
-        packet
-            .mut_peer_manager_header()
-            .unwrap()
-            .set_encrypted(false);
+        let header = packet.mut_peer_manager_header().unwrap();
+        header.set_encrypted(false);
+        header.set_header_aad(false);
         let old_len = packet.buf_len();
         packet
             .mut_inner()
@@ -87,16 +92,22 @@ impl Encryptor for OpenSslCipher {
         Ok(())
     }
 
-    fn encrypt(&self, packet: &mut ZCPacket) -> Result<(), Error> {
-        self.encrypt_with_nonce(packet, None)
+    fn encrypt(&self, packet: &mut ZCPacket, binding: AeadBinding) -> Result<(), Error> {
+        self.encrypt_with_nonce(packet, None, binding)
     }
 
-    fn encrypt_with_nonce(&self, packet: &mut ZCPacket, nonce: Option<&[u8]>) -> Result<(), Error> {
+    fn encrypt_with_nonce(
+        &self,
+        packet: &mut ZCPacket,
+        nonce: Option<&[u8]>,
+        binding: AeadBinding,
+    ) -> Result<(), Error> {
         let header = packet.peer_manager_header().unwrap();
         if header.is_encrypted() {
             tracing::warn!(?packet, "packet is already encrypted");
             return Ok(());
         }
+        let aad = seal_aad(packet, binding)?;
 
         let (cipher, key) = self.cipher_and_key();
         let mut tail = StandardAeadTail::new_zeroed();
@@ -109,6 +120,11 @@ impl Encryptor for OpenSslCipher {
 
         let mut encrypter = Crypter::new(cipher, Mode::Encrypt, key, Some(&tail.nonce))
             .map_err(|_| Error::EncryptionFailed)?;
+        if let Some(aad) = aad.as_deref() {
+            encrypter
+                .aad_update(aad)
+                .map_err(|_| Error::EncryptionFailed)?;
+        }
         let payload_len = packet.payload().len();
         let mut output = vec![0; payload_len + cipher.block_size()];
         let mut written = encrypter
@@ -141,7 +157,11 @@ mod tests {
         packet.fill_peer_manager_hdr(1, 2, 1);
 
         cipher
-            .encrypt_with_nonce(&mut packet, Some(&[3; StandardAeadTail::NONCE_SIZE]))
+            .encrypt_with_nonce(
+                &mut packet,
+                Some(&[3; StandardAeadTail::NONCE_SIZE]),
+                AeadBinding::None,
+            )
             .unwrap();
         assert!(packet.peer_manager_header().unwrap().is_encrypted());
 

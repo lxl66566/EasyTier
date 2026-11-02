@@ -18,7 +18,7 @@ use zerocopy::FromBytes as _;
 use crate::packet::{StandardAeadTail, ZCPacket};
 
 use super::{
-    Encryptor, Error,
+    AeadBinding, Encryptor, Error,
     replay_window::{ReplayWindow256, now_ms},
 };
 
@@ -402,19 +402,21 @@ impl ReplayProtectedEncryptor {
 }
 
 impl Encryptor for ReplayProtectedEncryptor {
-    fn encrypt(&self, zc_packet: &mut ZCPacket) -> Result<(), Error> {
+    fn encrypt(&self, zc_packet: &mut ZCPacket, binding: AeadBinding) -> Result<(), Error> {
         let nonce = self.tx.next();
-        self.inner.encrypt_with_nonce(zc_packet, Some(&nonce))
+        self.inner
+            .encrypt_with_nonce(zc_packet, Some(&nonce), binding)
     }
 
     fn encrypt_with_nonce(
         &self,
         zc_packet: &mut ZCPacket,
         _nonce: Option<&[u8]>,
+        binding: AeadBinding,
     ) -> Result<(), Error> {
         // The wrapper owns nonce selection; caller-supplied nonces are
         // ignored so the counter invariant cannot be violated from outside.
-        self.encrypt(zc_packet)
+        self.encrypt(zc_packet, binding)
     }
 
     fn decrypt(&self, zc_packet: &mut ZCPacket) -> Result<(), Error> {
@@ -585,9 +587,9 @@ mod tests {
         let receiver = legacy_aes256();
 
         let mut first = sealed_packet(b"first");
-        sender.encrypt(&mut first).unwrap();
+        sender.encrypt(&mut first, AeadBinding::None).unwrap();
         let mut second = sealed_packet(b"second");
-        sender.encrypt(&mut second).unwrap();
+        sender.encrypt(&mut second, AeadBinding::None).unwrap();
         let mut replayed = first.clone();
 
         receiver.decrypt(&mut first).unwrap();
@@ -651,7 +653,7 @@ mod tests {
         let sealed: Vec<_> = (0..100u32)
             .map(|i| {
                 let mut packet = sealed_packet(format!("packet {i}").as_bytes());
-                sender.encrypt(&mut packet).unwrap();
+                sender.encrypt(&mut packet, AeadBinding::None).unwrap();
                 packet
             })
             .collect();
@@ -683,7 +685,7 @@ mod tests {
             nonce[11] = i.wrapping_mul(3);
             let mut packet = sealed_packet(b"old peer payload");
             old_peer
-                .encrypt_with_nonce(&mut packet, Some(&nonce))
+                .encrypt_with_nonce(&mut packet, Some(&nonce), AeadBinding::None)
                 .unwrap();
             receiver.decrypt(&mut packet).unwrap();
             assert_eq!(packet.payload(), b"old peer payload");
@@ -692,7 +694,7 @@ mod tests {
             // nonces keep flowing.
             let mut resent = sealed_packet(b"old peer payload");
             old_peer
-                .encrypt_with_nonce(&mut resent, Some(&nonce))
+                .encrypt_with_nonce(&mut resent, Some(&nonce), AeadBinding::None)
                 .unwrap();
             assert!(matches!(
                 receiver.decrypt(&mut resent),
@@ -762,7 +764,7 @@ mod tests {
         let old_receiver = raw_aes256();
 
         let mut packet = sealed_packet(b"to old receiver");
-        sender.encrypt(&mut packet).unwrap();
+        sender.encrypt(&mut packet, AeadBinding::None).unwrap();
         old_receiver.decrypt(&mut packet).unwrap();
         assert_eq!(packet.payload(), b"to old receiver");
     }
@@ -778,7 +780,7 @@ mod tests {
         let receiver = create_legacy_encryptor("chacha20", KEY_128, KEY_256);
 
         let mut first = sealed_packet(b"chacha20 packet");
-        sender.encrypt(&mut first).unwrap();
+        sender.encrypt(&mut first, AeadBinding::None).unwrap();
         let mut replayed = first.clone();
         receiver.decrypt(&mut first).unwrap();
         assert_eq!(first.payload(), b"chacha20 packet");
@@ -795,19 +797,23 @@ mod tests {
         let receiver = legacy_aes256();
 
         let mut slow_first = sealed_packet(b"slow first");
-        slow_sender.encrypt(&mut slow_first).unwrap();
+        slow_sender
+            .encrypt(&mut slow_first, AeadBinding::None)
+            .unwrap();
         receiver.decrypt(&mut slow_first).unwrap();
 
         // The fast sender pushes its own window far beyond the slow one's
         // counter; a shared window would starve the slow sender out.
         for i in 0..600u32 {
             let mut packet = sealed_packet(format!("fast {i}").as_bytes());
-            fast_sender.encrypt(&mut packet).unwrap();
+            fast_sender.encrypt(&mut packet, AeadBinding::None).unwrap();
             receiver.decrypt(&mut packet).unwrap();
         }
 
         let mut slow_second = sealed_packet(b"slow second");
-        slow_sender.encrypt(&mut slow_second).unwrap();
+        slow_sender
+            .encrypt(&mut slow_second, AeadBinding::None)
+            .unwrap();
         receiver.decrypt(&mut slow_second).unwrap();
         assert_eq!(slow_second.payload(), b"slow second");
     }
@@ -860,7 +866,7 @@ mod tests {
         let receiver = legacy_aes256();
 
         let mut packet = sealed_packet(b"real packet");
-        sender.encrypt(&mut packet).unwrap();
+        sender.encrypt(&mut packet, AeadBinding::None).unwrap();
         // Extract the nonce before decryption truncates the tail.
         let sender_nonce = aead_tail_nonce(&packet).unwrap();
         receiver.decrypt(&mut packet).unwrap();
@@ -873,7 +879,7 @@ mod tests {
         nonce[COUNTER_OFFSET_V2..].copy_from_slice(&1_000_000u32.to_be_bytes());
         let mut forged = sealed_packet(b"attacker controlled bytes");
         raw_aes256()
-            .encrypt_with_nonce(&mut forged, Some(&nonce))
+            .encrypt_with_nonce(&mut forged, Some(&nonce), AeadBinding::None)
             .unwrap();
         forged.mut_payload()[0] ^= 0xff;
 
@@ -883,7 +889,7 @@ mod tests {
         ));
 
         let mut next = sealed_packet(b"next real packet");
-        sender.encrypt(&mut next).unwrap();
+        sender.encrypt(&mut next, AeadBinding::None).unwrap();
         receiver.decrypt(&mut next).unwrap();
         assert_eq!(next.payload(), b"next real packet");
     }
