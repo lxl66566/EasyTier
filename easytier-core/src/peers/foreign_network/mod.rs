@@ -49,9 +49,7 @@ use super::{
         PeerContextEvent, PeerStunInfoSource, TrustedKeySource,
     },
     error::Error,
-    peer_manager::{
-        CryptoRegime, PacketLogLimiter, PlaintextDelivery, network_plaintext_policy,
-    },
+    peer_manager::{CryptoRegime, PacketLogLimiter, PlaintextDelivery, network_plaintext_policy},
     peer_rpc::{PeerRpcManager, PeerRpcManagerTransport},
     public_ipv6::{DisabledPublicIpv6Runtime, PublicIpv6Runtime},
     relay_peer_map::RelayPeerMap,

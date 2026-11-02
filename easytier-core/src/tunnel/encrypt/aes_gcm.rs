@@ -2,8 +2,8 @@ use aes_gcm::{AeadInPlace, Aes128Gcm, Aes256Gcm, Key, KeyInit};
 use rand::{RngCore, rngs::OsRng};
 use zerocopy::{AsBytes, FromBytes};
 
-use crate::packet::{StandardAeadTail, ZCPacket};
 use super::{AeadBinding, Encryptor, Error, open_aad, seal_aad};
+use crate::packet::{StandardAeadTail, ZCPacket};
 
 #[derive(Clone)]
 pub struct AesGcmCipher {
