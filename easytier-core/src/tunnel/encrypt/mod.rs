@@ -20,6 +20,9 @@ mod ring;
 #[cfg(all(target_os = "wasi", feature = "wasi-crypto-offload"))]
 mod wasi_host;
 
+mod legacy_aead;
+pub(crate) mod replay_window;
+
 pub mod xor;
 
 // The disabled backends keep the same error Interface as the AEAD backends.
@@ -36,6 +39,8 @@ pub enum Error {
     InvalidAlgorithm(String),
     #[error("encryption algorithm is unavailable in this build: {0}")]
     AlgorithmUnavailable(String),
+    #[error("replayed packet rejected")]
+    ReplayDetected,
 }
 
 pub trait Encryptor: Send + Sync + 'static {
@@ -308,6 +313,30 @@ pub fn create_encryptor(
         EncryptionAlgorithm::AesGcm => create_aes_128(key_128),
         EncryptionAlgorithm::Aes256Gcm => create_aes_256(key_256),
         EncryptionAlgorithm::ChaCha20 => create_chacha20(key_256),
+    }
+}
+
+/// Creates the legacy data-plane encryptor (crypto-review S1.3 / S1.4).
+///
+/// AEAD backends are wrapped with counter-nonce generation and replay
+/// filtering; the wire format is unchanged so upgraded and old peers
+/// interoperate freely. XOR keeps its historical behavior: it has no
+/// authentication tag and no nonce on the wire, so neither nonce management
+/// nor replay filtering applies. Invalid algorithms return the plain error
+/// cipher unchanged.
+pub fn create_legacy_encryptor(
+    algorithm: &str,
+    key_128: [u8; 16],
+    key_256: [u8; 32],
+) -> Arc<dyn Encryptor> {
+    let inner = create_encryptor(algorithm, key_128, key_256);
+    let uses_aead = algorithm
+        .parse::<EncryptionAlgorithm>()
+        .is_ok_and(is_aead_algorithm);
+    if uses_aead {
+        Arc::new(legacy_aead::ReplayProtectedEncryptor::new(inner))
+    } else {
+        inner
     }
 }
 
