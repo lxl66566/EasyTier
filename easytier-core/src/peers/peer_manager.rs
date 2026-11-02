@@ -501,7 +501,11 @@ impl PeerPacketFilter for PeerRpcPacketProcessor {
             || hdr.packet_type == PacketType::RpcReq as u8
             || hdr.packet_type == PacketType::RpcResp as u8
         {
-            self.peer_rpc_tspt_sender.send(packet).unwrap();
+            // The RPC recv task may already be gone in the shutdown window;
+            // dropping the packet beats aborting the process.
+            if self.peer_rpc_tspt_sender.send(packet).is_err() {
+                tracing::warn!("peer rpc receiver closed, dropping rpc packet");
+            }
             PeerPacketFilterResult::Consumed
         } else {
             PeerPacketFilterResult::Pass(packet)
@@ -1896,7 +1900,10 @@ impl PeerManagerCore {
     }
 
     async fn start_peer_recv(&self) {
-        let packet_recv = self.packet_recv.lock().await.take().unwrap();
+        let Some(packet_recv) = self.packet_recv.lock().await.take() else {
+            tracing::warn!("start_peer_recv called more than once, skip");
+            return;
+        };
         let is_credential_node =
             self.context.network_identity().network_secret.is_none() && self.is_secure_mode_enabled;
         let router = PeerPacketRouter::new(
@@ -4938,5 +4945,30 @@ mod tests {
 
         assert!(tracker.has(peer_id, Instant::now(), |_| false));
         tracker.mark(peer_id, false, true, |_| false);
+    }
+
+    #[tokio::test]
+    async fn peer_rpc_processor_drops_packet_when_receiver_dropped() {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let processor = PeerRpcPacketProcessor {
+            peer_rpc_tspt_sender: sender,
+        };
+
+        let mut packet = ZCPacket::new_with_payload(b"rpc");
+        packet.fill_peer_manager_hdr(1, 2, PacketType::TaRpc as u8);
+
+        let ret = processor.try_process_packet_from_peer(packet).await;
+
+        assert!(matches!(ret, PeerPacketFilterResult::Consumed));
+    }
+
+    #[tokio::test]
+    async fn start_peer_recv_called_twice_does_not_panic() {
+        let core = build_portable_for_test(portable_runtime_config("portable-net")).unwrap();
+
+        core.start_peer_recv().await;
+        core.start_peer_recv().await;
+        core.stop().await;
     }
 }
