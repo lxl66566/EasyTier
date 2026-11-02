@@ -1,6 +1,11 @@
-//! This example demonstrates how to make a QUIC connection that ignores the server certificate.
+//! QUIC tunnels built on a custom quinn crypto session.
 //!
-//! Checkout the `README.md` for guidance.
+//! The session performs no handshake and no key exchange: packets are only
+//! guarded by an unkeyed SeaHash checksum, so `quic://` links provide
+//! integrity against accidental corruption but **no confidentiality or
+//! origin authentication** despite the QUIC/TLS name. Confidentiality must
+//! come from the EasyTier data plane (`enable_encryption`, or secure mode).
+//! Dialing or listening warns once per process (see [`warn_unencrypted`]).
 
 use crate::proto::common::TunnelInfo;
 use anyhow::Context;
@@ -148,6 +153,13 @@ mod crypto {
             header: &[u8],
             payload: &mut BytesMut,
         ) -> Result<(), CryptoError> {
+            // quinn does not guarantee a minimum payload length before
+            // decryption: a large Initial token field can shrink the packet
+            // payload below the tag, and 1-RTT packets carry no floor at all.
+            // Reject short packets instead of underflowing the split offset.
+            if payload.len() < self.tag_len() {
+                return Err(CryptoError);
+            }
             let tag = payload.split_off(payload.len() - self.tag_len()).get_u64();
             trace!(tag, ?payload);
             let checksum = self.checksum_for(packet, &[header, payload]);
@@ -342,6 +354,24 @@ mod crypto {
             // decode window, must fail authentication.
             assert!(roundtrip(true, 100, 356).is_err());
         }
+
+        #[test]
+        fn short_packet_fails_closed_instead_of_panicking() {
+            // A payload shorter than the 8-byte checksum tag must be rejected,
+            // not underflow the split offset. Reachable pre-handshake: Initial
+            // datagrams only need the 1200-byte floor for the whole datagram,
+            // so a large token field can leave a tiny payload.
+            let key = CryptoKey { pn_bound: true };
+            let header = [0u8; 8];
+            for len in 0..key.tag_len() {
+                let mut payload = BytesMut::from(&vec![0u8; len][..]);
+                assert!(
+                    quinn_proto::crypto::PacketKey::decrypt(&key, 1, &header, &mut payload)
+                        .is_err(),
+                    "payload of {len} bytes must fail closed"
+                );
+            }
+        }
     }
 }
 
@@ -363,6 +393,22 @@ mod crypto {
 /// [`client_config`] on `VersionMismatch` (see [`connect_with_etq1`]).
 pub const QUIC_VERSION_ETQ1: u32 = 0x45545131;
 
+/// Warn once per process that QUIC tunnels are not transport-encrypted.
+///
+/// Fires from both [`client_config`] and [`server_config`], which every QUIC
+/// endpoint (tunnel dial/listen, QUIC proxy) goes through.
+fn warn_unencrypted() {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    WARNED.get_or_init(|| {
+        tracing::warn!(
+            "quic tunnels are not encrypted: EasyTier's QUIC transport uses a \
+             checksum-only session without TLS, so on-path attackers can read \
+             and inject packets. Confidentiality relies on EasyTier's own \
+             data-plane encryption (enable_encryption / secure mode)."
+        );
+    });
+}
+
 pub fn transport_config() -> Arc<TransportConfig> {
     let mut config = TransportConfig::default();
 
@@ -379,12 +425,14 @@ pub fn transport_config() -> Arc<TransportConfig> {
 }
 
 pub fn server_config() -> ServerConfig {
+    warn_unencrypted();
     let mut config = ServerConfig::with_crypto(Arc::new(crypto::CryptoConfig));
     config.transport_config(transport_config());
     config
 }
 
 pub fn client_config() -> ClientConfig {
+    warn_unencrypted();
     let mut config = ClientConfig::new(Arc::new(crypto::CryptoConfig));
     config.transport_config(transport_config());
     config

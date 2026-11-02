@@ -294,6 +294,10 @@ sudo easytier-core --network-name mysharednode --network-secret mysharednode
 
 #### Transport Security
 
+#### Transport Security
+
+Despite the name, EasyTier's `quic://` tunnels are **not encrypted by the transport**: the QUIC layer uses a checksum-only session without a TLS handshake, so anyone on the network path can read and inject packets. Confidentiality and integrity should come from EasyTier's data-plane encryption — keep `enable_encryption` enabled (default) or, ideally, enable secure mode.
+
 `wss://` tunnels do run TLS, but by default the client accepts any server certificate, so an active man-in-the-middle can still impersonate the server. To prevent that, pin the server certificate fingerprint in the peer URL fragment:
 
 ```bash

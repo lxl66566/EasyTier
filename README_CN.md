@@ -293,6 +293,10 @@ sudo easytier-core --network-name mysharednode --network-secret mysharednode
 
 #### 传输层安全
 
+#### 传输层安全
+
+与名称给人的印象不同，EasyTier 的 `quic://` 隧道**在传输层并不加密**：QUIC 层使用仅带校验和的自定义会话，没有 TLS 握手，网络路径上的任何人都可以读取和注入报文。机密性与完整性应由 EasyTier 自身的数据面加密提供——保持 `enable_encryption` 开启（默认）或更优的 secure mode。
+
 `wss://` 隧道虽然使用 TLS，但默认情况下客户端接受任意服务器证书，主动中间人仍可冒充服务器。可在节点 URL 的 fragment 中固定服务器证书指纹来防范：
 
 ```bash
@@ -303,13 +307,13 @@ sudo easytier-core -p 'wss://server.example.com:11010#fingerprint=sha256:<64位�
 
 关于数据面加密算法选项 `encryption_algorithm`：`aes-gcm`（默认）、`aes-256-gcm`、`chacha20` 均为带认证的加密；而 `xor` 仅为混淆手段——没有完整性与防重放保护，报文可被被动篡改而不被发现。该选项仅为兼容旧版本节点而保留，选中时会打印警告，除非确有旧对端需要，否则应避免使用。
 
-连接中央配置服务器（`easytier-web`）的节点也有类似问题：Web 管理隧道虽经 Noise 加密，但若不认证服务器身份，主动中间人可以中继会话并截获提交的管理凭证。较新的服务端因此改用带服务端静态密钥的 Noise_XX 认证握手。在配置服务器 URL 的 fragment 中固定其密钥指纹即可启用 fail-closed 校验：
+连接中心配置服务器（`easytier-web`）时也有同样的问题：Web 管理隧道虽然经过 Noise 加密，但在没有服务器身份认证的情况下，主动中间人可以中转会话并截获提交的管理凭据。较新的服务器使用带持久化服务器密钥的认证版 Noise_XX 握手。在配置服务器 URL 的 fragment 中固定服务器密钥指纹即可启用 fail-closed 校验：
 
 ```bash
 sudo easytier-core --config-server 'udp://config-server.example.com:22020/mytoken#fingerprint=sha256:<64位十六进制>'
 ```
 
-`easytier-web` 启动时会在日志中打印该指纹（密钥持久化在数据库旁的 `<db>.noise-static-key` 文件中，重启后保持不变）。配置了 pin 的客户端在服务端不支持认证握手或指纹不匹配时会拒绝连接（fail-closed）；未配置 pin 的客户端会在服务端支持时自动升级，对旧服务端回退到旧的未认证握手并打印警告。
+指纹由 `easytier-web` 在启动时打印（持久化在数据库旁的 `<db>.noise-static-key` 中，重启后保持不变）。设置了指纹的客户端在服务器无法完成认证握手或指纹不匹配时会拒绝连接；未设置指纹时，客户端会在服务器支持时自动升级，对较旧的服务器回退到传统未认证握手（并打印警告）。
 
 ## 相关项目
 
