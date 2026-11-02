@@ -2080,6 +2080,7 @@ mod tests {
             "delete-test",
             false,
             None,
+            false,
             core.clone(),
             None,
         );

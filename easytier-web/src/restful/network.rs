@@ -1014,6 +1014,7 @@ mod tests {
             "test-device",
             false,
             None,
+            false,
             core.clone(),
             None,
         );

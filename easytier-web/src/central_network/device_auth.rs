@@ -154,6 +154,7 @@ mod tests {
             "local-device",
             false,
             None,
+            false,
             core.clone(),
             None,
         );
@@ -224,6 +225,7 @@ mod tests {
             "blocked-device",
             false,
             None,
+            false,
             Arc::new(native_instance_manager()),
             None,
         );
