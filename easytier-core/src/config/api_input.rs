@@ -134,6 +134,7 @@ const FORM_MANAGED_TOML_FIELDS: &[&str] = &[
     "socks5_proxy",
     "port_forward",
     "secure_mode",
+    "strict_crypto",
     "acl",
     "credential_file",
     "managed_credentials",
@@ -549,6 +550,8 @@ impl NetworkConfigExt for NetworkConfig {
             instance_recv_bps_limit: self.instance_recv_bps_limit,
             ..Default::default()
         });
+
+        cfg.set_strict_crypto(self.strict_crypto.unwrap_or_default());
         Ok(cfg)
     }
 
@@ -676,6 +679,7 @@ impl NetworkConfigExt for NetworkConfig {
         }
 
         result.secure_mode = config.get_secure_mode();
+        result.strict_crypto = Some(config.get_strict_crypto());
         result.credential_file = config
             .get_credential_file()
             .map(|path| path.to_string_lossy().into_owned());
@@ -1032,6 +1036,26 @@ mod tests {
         let output = NetworkConfig::new_from_config(&config).unwrap();
         assert_eq!(output.disable_relay_data, Some(false));
         assert_eq!(output.prefer_peer_relay, Some(true));
+    }
+
+    #[test]
+    fn strict_crypto_round_trips_through_toml_model() {
+        assert!(
+            !standalone_config()
+                .gen_config()
+                .unwrap()
+                .get_strict_crypto()
+        );
+
+        let input = NetworkConfig {
+            strict_crypto: Some(true),
+            ..standalone_config()
+        };
+        let config = input.gen_config().unwrap();
+        assert!(config.get_strict_crypto());
+
+        let output = NetworkConfig::new_from_config(&config).unwrap();
+        assert_eq!(output.strict_crypto, Some(true));
     }
 
     #[test]

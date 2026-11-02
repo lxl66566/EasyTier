@@ -34,6 +34,7 @@ message InstanceConfigPatch {
   // Applies with routes: true preserves an empty manual list; false restores
   // automatic routes. Omission preserves legacy RoutePatch behavior.
   optional bool enable_manual_routes = 18;
+  optional bool strict_crypto = 19;
 }
 
 message VpnPortalClientPatch {

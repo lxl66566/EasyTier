@@ -243,6 +243,10 @@ pub struct PeerRuntimeSnapshot {
     pub ospf_update_my_foreign_network_interval_sec: u64,
     pub max_direct_conns_per_peer_in_foreign_network: usize,
     pub hmac_secret_digest: bool,
+    /// Reject legacy handshakes that did not negotiate the full
+    /// `secret-challenge-v2` + `kdf-v2` + `header-aad-v1` suite. See
+    /// [`PeerConn::enforce_strict_crypto`].
+    pub strict_crypto: bool,
 }
 
 impl PeerRuntimeSnapshot {
@@ -259,6 +263,7 @@ impl PeerRuntimeSnapshot {
             ospf_update_my_foreign_network_interval_sec: 10,
             max_direct_conns_per_peer_in_foreign_network: 3,
             hmac_secret_digest: false,
+            strict_crypto: false,
         }
     }
 }
