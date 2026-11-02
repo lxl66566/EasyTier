@@ -2644,6 +2644,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "arc-swap",
+ "argon2",
  "ariadne",
  "async-ringbuf",
  "async-trait",

@@ -23,10 +23,13 @@ mod ring;
 #[cfg(all(target_os = "wasi", feature = "wasi-crypto-offload"))]
 mod wasi_host;
 
+pub(crate) mod kdf;
 mod legacy_aead;
 pub(crate) mod replay_window;
 
 pub mod xor;
+
+pub use kdf::{KdfSuite, NegotiatedKdfEncryptor, derive_key_pair_argon2id};
 
 // The disabled backends keep the same error Interface as the AEAD backends.
 #[allow(dead_code)]
@@ -101,6 +104,20 @@ pub trait Encryptor: Send + Sync + 'static {
         zc_packet: &mut ZCPacket,
         _nonce: Option<&[u8]>,
         binding: AeadBinding,
+    ) -> Result<(), Error> {
+        self.encrypt(zc_packet, binding)
+    }
+    /// Seals under a chosen key-derivation suite (crypto-review S1.1).
+    ///
+    /// Backends that do not derive keys from the network secret (secure-mode
+    /// session ciphers, single-suite encryptors) ignore the suite; only
+    /// [`NegotiatedKdfEncryptor`] acts on it, recording the choice in the
+    /// packet header (see [`crate::packet::KDF_V2_MARKER`]).
+    fn encrypt_with_suite(
+        &self,
+        zc_packet: &mut ZCPacket,
+        binding: AeadBinding,
+        _kdf: KdfSuite,
     ) -> Result<(), Error> {
         self.encrypt(zc_packet, binding)
     }
