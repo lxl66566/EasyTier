@@ -54,6 +54,9 @@ impl Encryptor for AesGcmCipher {
         let tag = aes_tail.tag.into();
         let aad = aad.as_ref().map(|b| &b[..]).unwrap_or(&[]);
 
+        // The factory wraps this backend with the shared decrypt-failure
+        // debug log (see `DecryptLoggingCipher`); backends only return
+        // errors so no path can log twice.
         let rs = match &self.cipher {
             AesGcmEnum::AES128GCM(aes_gcm) => aes_gcm.decrypt_in_place_detached(
                 &nonce,
@@ -69,10 +72,7 @@ impl Encryptor for AesGcmCipher {
             ),
         };
 
-        if let Err(e) = rs {
-            println!("error: {:?}", e.to_string());
-            return Err(Error::DecryptionFailed);
-        }
+        rs.map_err(|_| Error::DecryptionFailed)?;
 
         let pm_header = zc_packet.mut_peer_manager_header().unwrap();
         pm_header.set_encrypted(false);
@@ -169,6 +169,19 @@ mod tests {
         cipher.decrypt(&mut packet).unwrap();
         assert_eq!(packet.payload(), text);
         assert!(!packet.peer_manager_header().unwrap().is_encrypted());
+    }
+
+    #[test]
+    fn decrypt_is_noop_for_plaintext_packets() {
+        // The ENCRYPTED flag lives in the plaintext header and is controlled
+        // by the sender, so the AEAD layer cannot reject plaintext on its
+        // own; the packet router enforces the network's encryption policy.
+        let key = [0u8; 16];
+        let cipher = AesGcmCipher::new_128(key);
+        let mut packet = ZCPacket::new_with_payload(b"plain");
+        packet.fill_peer_manager_hdr(1, 2, 1);
+        cipher.decrypt(&mut packet).unwrap();
+        assert_eq!(packet.payload(), b"plain");
     }
 
     #[test]

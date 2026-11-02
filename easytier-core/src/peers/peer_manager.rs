@@ -35,7 +35,7 @@ use crate::{
     foundation::task::ExternalTaskSignal,
     host::packet::{HostPacket, HostPacketSender},
     packet::{
-        CompressorAlgo, PacketType, ZCPacket,
+        CompressorAlgo, PacketCryptoClass, PacketType, ZCPacket,
         compressor::{Compressor as _, DefaultCompressor},
     },
     proto::common::{Flags, PeerFeatureFlag, StunInfo, Url as ProtoUrl},
@@ -3068,6 +3068,7 @@ struct PeerPacketRouterCounters {
     compress_tx_bytes_after: CounterHandle,
     compress_rx_bytes_before: CounterHandle,
     compress_rx_bytes_after: CounterHandle,
+    plaintext_dropped: CounterHandle,
 }
 
 pub(crate) struct PeerPacketRouter {
@@ -3088,8 +3089,10 @@ pub(crate) struct PeerPacketRouter {
     traffic_metrics: Arc<TrafficMetricRecorder>,
     stats_mgr: Arc<StatsManager>,
     counters: PeerPacketRouterCounters,
+    crypto_regime: CryptoRegime,
     decrypt_fail_log: PacketLogLimiter,
     forward_fail_log: PacketLogLimiter,
+    plaintext_drop_log: PacketLogLimiter,
 }
 
 impl PeerPacketRouter {
@@ -3118,6 +3121,13 @@ impl PeerPacketRouter {
         compress_tx_bytes_after: CounterHandle,
     ) -> Self {
         let label_set = LabelSet::new().with_label_type(LabelType::NetworkName(network_name));
+        let crypto_regime = if secure_mode_enabled {
+            CryptoRegime::SecureMode
+        } else if context.flags().enable_encryption {
+            CryptoRegime::LegacyEncryption
+        } else {
+            CryptoRegime::Unencrypted
+        };
         Self {
             packet_recv,
             my_peer_id,
@@ -3157,10 +3167,14 @@ impl PeerPacketRouter {
                 compress_rx_bytes_before: stats_mgr
                     .get_counter(MetricName::CompressionBytesRxBefore, label_set.clone()),
                 compress_rx_bytes_after: stats_mgr
-                    .get_counter(MetricName::CompressionBytesRxAfter, label_set),
+                    .get_counter(MetricName::CompressionBytesRxAfter, label_set.clone()),
+                plaintext_dropped: stats_mgr
+                    .get_counter(MetricName::SecurityPacketsPlaintextDropped, label_set),
             },
+            crypto_regime,
             decrypt_fail_log: PacketLogLimiter::new(),
             forward_fail_log: PacketLogLimiter::new(),
+            plaintext_drop_log: PacketLogLimiter::new(),
         }
     }
 
@@ -3193,6 +3207,22 @@ impl PeerPacketRouter {
         }
         // The packet channel closing is the only normal exit of this task.
         tracing::debug!("done_peer_recv");
+    }
+
+    /// Counts and rate-limited-logs a protected packet that arrived without
+    /// the encryption the network regime requires.
+    fn reject_plaintext_packet(&self, from_peer_id: PeerId, to_peer_id: PeerId, packet_type: u8) {
+        self.counters.plaintext_dropped.inc();
+        if let Some(drops) = self.plaintext_drop_log.hit() {
+            tracing::warn!(
+                drops,
+                ?from_peer_id,
+                ?to_peer_id,
+                packet_type,
+                ?self.crypto_regime,
+                "dropping unencrypted packet of protected type"
+            );
+        }
     }
 
     async fn handle_packet(
@@ -3333,6 +3363,20 @@ impl PeerPacketRouter {
                     }
                     return;
                 }
+                // The static decryptor passes plaintext through unchanged, so
+                // enforce the encryption policy for data-plane packets here.
+                if !is_encrypted
+                    && plaintext_delivery_policy(
+                        packet_type,
+                        from_peer_id,
+                        self.my_peer_id,
+                        ingress,
+                        self.crypto_regime,
+                    ) == PlaintextDelivery::Reject
+                {
+                    self.reject_plaintext_packet(from_peer_id, to_peer_id, packet_type);
+                    return;
+                }
             } else if is_encrypted {
                 match self.relay_peer_map.decrypt_if_needed(&mut ret).await {
                     Ok(true) => {}
@@ -3345,6 +3389,20 @@ impl PeerPacketRouter {
                         return;
                     }
                 }
+            } else if plaintext_delivery_policy(
+                packet_type,
+                from_peer_id,
+                self.my_peer_id,
+                ingress,
+                self.crypto_regime,
+            ) == PlaintextDelivery::Reject
+            {
+                // Secure mode with is_encrypted == false: only bootstrap
+                // traffic and packets already decrypted by the connection's
+                // session filter may proceed; anything else is injected or
+                // downgraded and must not reach the processing pipeline.
+                self.reject_plaintext_packet(from_peer_id, to_peer_id, packet_type);
+                return;
             }
 
             self.counters.self_rx_bytes.add(buf_len as u64);
@@ -3448,6 +3506,99 @@ fn should_drop_relay_data(
 /// Nth occurrence so attacker-triggered or missing-route events cannot
 /// flood the log.
 pub(crate) const PACKET_LOG_INTERVAL: u64 = 64;
+
+/// Encryption regime of the receiving network, deciding how plaintext
+/// (is_encrypted == false) locally delivered packets are treated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CryptoRegime {
+    /// Secure mode: every protected packet is encrypted end-to-end, either by
+    /// the direct-connection Noise session or by a relay session.
+    SecureMode,
+    /// Legacy mode with enable_encryption: the static network-key encryptor
+    /// protects data-plane packets. RPC is exempt because public servers relay
+    /// RPC in plaintext (they cannot hold every member network's key).
+    LegacyEncryption,
+    /// Encryption explicitly disabled by configuration; plaintext is accepted.
+    Unencrypted,
+}
+
+/// Verdict for a locally delivered packet that arrived without encryption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlaintextDelivery {
+    Allow,
+    Reject,
+}
+
+impl From<bool> for PlaintextDelivery {
+    fn from(allowed: bool) -> Self {
+        if allowed { Self::Allow } else { Self::Reject }
+    }
+}
+
+/// Policy for packets that arrived from a network connection without
+/// encryption.
+///
+/// - Bootstrap traffic (handshakes, liveness) always passes: it is exchanged
+///   before any crypto session exists.
+/// - In secure mode, a packet whose from_peer_id matches the connection's
+///   peer has already been decrypted (and thereby authenticated) by the
+///   connection's session filter, which cleared the ENCRYPTED flag; anything
+///   else claimed a foreign sender and must have stayed encrypted for the
+///   relay session to decrypt.
+/// - In legacy mode there is no per-connection session: the static encryptor
+///   already ran, so any remaining plaintext data-plane packet violates the
+///   encryption policy and is rejected. This also rejects peers that disabled
+///   encryption while the local node requires it.
+/// - Legacy RPC is exempt: RpcTransport::send leaves RPC to public-server
+///   destinations unencrypted, and the receiver cannot distinguish that path
+///   from a forged one. Secure mode closes this gap via session encryption.
+pub(crate) fn network_plaintext_policy(
+    packet_type: u8,
+    from_peer_id: PeerId,
+    conn_peer_id: PeerId,
+    regime: CryptoRegime,
+) -> PlaintextDelivery {
+    if regime == CryptoRegime::Unencrypted {
+        return PlaintextDelivery::Allow;
+    }
+    let class =
+        PacketType::from_u8(packet_type).map_or(PacketCryptoClass::Protected, |t| t.crypto_class());
+    if class == PacketCryptoClass::Bootstrap {
+        return PlaintextDelivery::Allow;
+    }
+    if regime == CryptoRegime::LegacyEncryption
+        && matches!(
+            PacketType::from_u8(packet_type),
+            Some(PacketType::RpcReq) | Some(PacketType::RpcResp)
+        )
+    {
+        return PlaintextDelivery::Allow;
+    }
+    match regime {
+        CryptoRegime::SecureMode => (from_peer_id == conn_peer_id).into(),
+        CryptoRegime::LegacyEncryption => PlaintextDelivery::Reject,
+        CryptoRegime::Unencrypted => PlaintextDelivery::Allow,
+    }
+}
+
+/// Full plaintext policy for the peer packet router, additionally covering
+/// locally injected packets, which never crossed the network and are trusted.
+/// Only loopback packets originated by this node are expected on the Local
+/// ingress; anything else fails closed.
+pub(crate) fn plaintext_delivery_policy(
+    packet_type: u8,
+    from_peer_id: PeerId,
+    my_peer_id: PeerId,
+    ingress: PeerPacketIngress,
+    regime: CryptoRegime,
+) -> PlaintextDelivery {
+    match ingress {
+        PeerPacketIngress::Local => (from_peer_id == my_peer_id).into(),
+        PeerPacketIngress::Peer { peer_id, .. } => {
+            network_plaintext_policy(packet_type, from_peer_id, peer_id, regime)
+        }
+    }
+}
 
 /// Per-packet log rate limiter: emits the 1st and every
 /// [`PACKET_LOG_INTERVAL`]-th occurrence of an event.
@@ -4907,6 +5058,199 @@ mod tests {
         packet
     }
 
+    fn network_ingress(peer_id: PeerId) -> PeerPacketIngress {
+        PeerPacketIngress::Peer {
+            peer_id,
+            conn_id: PeerConnId::new_v4(),
+            origin: PeerConnectionOrigin::Direct,
+        }
+    }
+
+    #[test]
+    fn plaintext_policy_allows_bootstrap_traffic_in_every_regime() {
+        for regime in [
+            CryptoRegime::SecureMode,
+            CryptoRegime::LegacyEncryption,
+            CryptoRegime::Unencrypted,
+        ] {
+            for packet_type in [
+                PacketType::HandShake,
+                PacketType::NoiseHandshakeMsg1,
+                PacketType::NoiseHandshakeMsg2,
+                PacketType::NoiseHandshakeMsg3,
+                PacketType::RelayHandshake,
+                PacketType::RelayHandshakeAck,
+                PacketType::Ping,
+                PacketType::Pong,
+            ] {
+                // Even a spoofed source cannot turn bootstrap traffic into a
+                // policy violation; these types carry no data-plane state.
+                assert_eq!(
+                    plaintext_delivery_policy(packet_type as u8, 77, 1, network_ingress(2), regime),
+                    PlaintextDelivery::Allow,
+                    "{packet_type:?} in {regime:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plaintext_policy_rejects_forged_secure_mode_packets() {
+        // Data with a spoofed from_peer_id: skipped by the connection session
+        // filter, not relay-session encrypted, must be dropped.
+        for packet_type in [
+            PacketType::Data,
+            PacketType::KcpSrc,
+            PacketType::QuicDst,
+            PacketType::DataWithKcpSrcModified,
+            PacketType::RpcReq,
+            PacketType::RpcResp,
+        ] {
+            assert_eq!(
+                plaintext_delivery_policy(
+                    packet_type as u8,
+                    77,
+                    1,
+                    network_ingress(2),
+                    CryptoRegime::SecureMode
+                ),
+                PlaintextDelivery::Reject,
+                "{packet_type:?} with spoofed source"
+            );
+        }
+
+        // from_peer_id == 0 bypasses the session filter as well.
+        assert_eq!(
+            plaintext_delivery_policy(
+                PacketType::Data as u8,
+                0,
+                1,
+                network_ingress(2),
+                CryptoRegime::SecureMode
+            ),
+            PlaintextDelivery::Reject
+        );
+
+        // Packets from the connection's own peer were decrypted (and
+        // authenticated) by the session filter; the cleared ENCRYPTED flag
+        // is expected here.
+        assert_eq!(
+            plaintext_delivery_policy(
+                PacketType::Data as u8,
+                2,
+                1,
+                network_ingress(2),
+                CryptoRegime::SecureMode
+            ),
+            PlaintextDelivery::Allow
+        );
+
+        // Locally originated loopback never crossed the network.
+        assert_eq!(
+            plaintext_delivery_policy(
+                PacketType::Data as u8,
+                1,
+                1,
+                PeerPacketIngress::Local,
+                CryptoRegime::SecureMode
+            ),
+            PlaintextDelivery::Allow
+        );
+        // A Local ingress claiming a foreign sender has no legitimate
+        // producer and fails closed.
+        assert_eq!(
+            plaintext_delivery_policy(
+                PacketType::Data as u8,
+                77,
+                1,
+                PeerPacketIngress::Local,
+                CryptoRegime::SecureMode
+            ),
+            PlaintextDelivery::Reject
+        );
+    }
+
+    #[test]
+    fn plaintext_policy_rejects_legacy_plaintext_data_plane() {
+        // Legacy mode has no per-connection session: remaining plaintext
+        // data-plane packets violate the encryption policy, even when the
+        // claimed source matches the connection peer.
+        for packet_type in [
+            PacketType::Data,
+            PacketType::KcpSrc,
+            PacketType::KcpDst,
+            PacketType::QuicSrc,
+            PacketType::QuicDst,
+            PacketType::DataWithQuicSrcModified,
+        ] {
+            assert_eq!(
+                plaintext_delivery_policy(
+                    packet_type as u8,
+                    2,
+                    1,
+                    network_ingress(2),
+                    CryptoRegime::LegacyEncryption
+                ),
+                PlaintextDelivery::Reject,
+                "{packet_type:?} legacy plaintext"
+            );
+        }
+
+        // RPC is exempt: public servers relay RPC in plaintext because they
+        // cannot hold every member network's key.
+        for packet_type in [PacketType::RpcReq, PacketType::RpcResp] {
+            assert_eq!(
+                plaintext_delivery_policy(
+                    packet_type as u8,
+                    77,
+                    1,
+                    network_ingress(2),
+                    CryptoRegime::LegacyEncryption
+                ),
+                PlaintextDelivery::Allow,
+                "{packet_type:?} legacy rpc exemption"
+            );
+        }
+
+        // Local loopback stays trusted.
+        assert_eq!(
+            plaintext_delivery_policy(
+                PacketType::Data as u8,
+                1,
+                1,
+                PeerPacketIngress::Local,
+                CryptoRegime::LegacyEncryption
+            ),
+            PlaintextDelivery::Allow
+        );
+    }
+
+    #[test]
+    fn plaintext_policy_unencrypted_network_accepts_plaintext() {
+        for packet_type in [PacketType::Data, PacketType::RpcReq] {
+            assert_eq!(
+                plaintext_delivery_policy(
+                    packet_type as u8,
+                    77,
+                    1,
+                    network_ingress(2),
+                    CryptoRegime::Unencrypted
+                ),
+                PlaintextDelivery::Allow
+            );
+        }
+    }
+
+    #[test]
+    fn plaintext_policy_fails_closed_on_unknown_packet_types() {
+        for regime in [CryptoRegime::SecureMode, CryptoRegime::LegacyEncryption] {
+            assert_eq!(
+                plaintext_delivery_policy(42, 77, 1, network_ingress(2), regime),
+                PlaintextDelivery::Reject
+            );
+        }
+    }
+
     #[test]
     fn forged_attached_source_header_does_not_bypass_relay_disable() {
         let packet = data_packet(77, 3);
@@ -5176,7 +5520,11 @@ mod tests {
             Err(crate::tunnel::encrypt::Error::DecryptionFailed)
         }
 
-        fn encrypt(&self, _zc_packet: &mut ZCPacket) -> Result<(), crate::tunnel::encrypt::Error> {
+        fn encrypt(
+            &self,
+            _zc_packet: &mut ZCPacket,
+            _binding: AeadBinding,
+        ) -> Result<(), crate::tunnel::encrypt::Error> {
             Ok(())
         }
     }
