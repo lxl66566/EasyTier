@@ -1459,6 +1459,7 @@ mod tests {
             std::sync::Arc::new(crate::webhook::WebhookConfig::new(
                 None, None, None, None, None,
             )),
+            None,
         ));
         (
             CentralNetworkService::new(db, client_manager),
@@ -1493,6 +1494,7 @@ mod tests {
             Arc::new(crate::webhook::WebhookConfig::new(
                 None, None, None, None, None,
             )),
+            None,
         ));
         (
             CentralNetworkService::with_gateway(db, client_manager, Some(instances)),
@@ -1533,6 +1535,7 @@ mod tests {
             Arc::new(crate::webhook::WebhookConfig::new(
                 None, None, None, None, None,
             )),
+            None,
         ));
         (
             CentralNetworkService::with_gateway(db, client_manager, Some(instances)),
@@ -2025,6 +2028,7 @@ mod tests {
             HeartbeatPolicy::from_millis(1000, 10000).unwrap(),
             Arc::new(FeatureFlags::default()),
             Arc::new(webhook),
+            None,
         );
         let url = manager
             .add_listener(runtime_udp_tunnel_listener(
@@ -2075,6 +2079,7 @@ mod tests {
             device,
             "delete-test",
             false,
+            None,
             core.clone(),
             None,
         );

@@ -31,6 +31,7 @@ mod client_manager;
 mod config_server_listener_tests;
 mod db;
 mod migrator;
+mod noise_key;
 mod restful;
 mod webhook;
 
@@ -333,7 +334,20 @@ async fn main() {
     }
 
     // let db = db::Db::new(":memory:").await.unwrap();
-    let db = db::Db::new(cli.db).await.unwrap();
+    let db = db::Db::new(cli.db.clone()).await.unwrap();
+    // The noise v2 static key is persisted next to the database so its
+    // fingerprint survives restarts; clients pin it via the URL fragment.
+    let noise_static_key = noise_key::load_or_generate(&cli.db).unwrap_or_else(|error| {
+        eprintln!("Failed to load noise static key: {error}");
+        std::process::exit(1);
+    });
+    if let Some(key) = noise_static_key.as_ref() {
+        tracing::info!(
+            fingerprint = %key.public_fingerprint(),
+            "loaded web noise v2 static key; clients can pin it via \
+             '#fingerprint=sha256:<hash>' in the config server URL"
+        );
+    }
     let feature_flags = Arc::new(cli.feature_flags);
     let mut webhook_config = webhook::WebhookConfig::new(
         cli.webhook.webhook_url,
@@ -383,6 +397,7 @@ async fn main() {
         heartbeat_policy,
         feature_flags.clone(),
         webhook_config.clone(),
+        noise_static_key,
     );
     for listener in
         get_config_server_listeners(&cli.config_server_protocol, cli.config_server_port).unwrap()

@@ -1518,6 +1518,7 @@ mod tests {
             Arc::new(crate::FeatureFlags::default()),
             data.read().await.webhook_config.clone(),
             0,
+            false,
         );
         session.data = data.clone();
         let old_epoch = data.read().await.webhook_validation_change_epoch;

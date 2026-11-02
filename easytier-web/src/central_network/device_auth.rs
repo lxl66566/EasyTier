@@ -129,6 +129,7 @@ mod tests {
             HeartbeatPolicy::from_millis(1_000, 10_000).unwrap(),
             Arc::new(FeatureFlags::default()),
             Arc::new(webhook),
+            None,
         );
         let listener = runtime_udp_tunnel_listener(
             "udp://127.0.0.1:0".parse().unwrap(),
@@ -152,6 +153,7 @@ mod tests {
             machine_id,
             "local-device",
             false,
+            None,
             core.clone(),
             None,
         );
@@ -221,6 +223,7 @@ mod tests {
             machine_id,
             "blocked-device",
             false,
+            None,
             Arc::new(native_instance_manager()),
             None,
         );

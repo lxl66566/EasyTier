@@ -83,6 +83,7 @@ async fn ring_session(storage: &Storage, port: u16, epoch: u64) -> (Arc<Session>
             None,
         )),
         epoch,
+        false,
     );
     let (server, peer) = create_ring_tunnel_pair();
     session.serve(server).await;
@@ -122,6 +123,7 @@ async fn pruning_retires_live_udp_duplicates_only_after_authentication() {
             ..Default::default()
         }),
         Arc::new(WebhookConfig::new(None, None, None, None, None)),
+        None,
     );
     let listener_url = manager
         .add_listener(runtime_udp_tunnel_listener(

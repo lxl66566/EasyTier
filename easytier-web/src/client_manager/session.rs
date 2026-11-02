@@ -497,6 +497,9 @@ pub type SharedSessionData = Arc<RwLock<SessionData>>;
 pub(super) struct SessionRpcService {
     data: SharedSessionData,
     heartbeat_policy: HeartbeatPolicy,
+    /// Whether this server can perform the authenticated noise v2
+    /// handshake; advertised via GetFeature so clients can pin.
+    noise_v2_supported: bool,
 }
 
 impl SessionRpcService {
@@ -938,6 +941,7 @@ impl WebServerService for SessionRpcService {
     ) -> rpc_types::error::Result<easytier::proto::web::GetFeatureResponse> {
         Ok(easytier::proto::web::GetFeatureResponse {
             support_encryption: easytier_core::tunnel::web_security::web_secure_tunnel_supported(),
+            support_noise_v2: self.noise_v2_supported,
         })
     }
 }
@@ -971,6 +975,7 @@ impl Session {
         feature_flags: Arc<FeatureFlags>,
         webhook_config: SharedWebhookConfig,
         session_epoch: u64,
+        noise_v2_supported: bool,
     ) -> Self {
         let mut session_data =
             SessionData::new(storage, client_url, location, feature_flags, webhook_config);
@@ -984,6 +989,7 @@ impl Session {
             WebServerServiceServer::new(SessionRpcService {
                 data: data.clone(),
                 heartbeat_policy,
+                noise_v2_supported,
             }),
             "",
         );
@@ -1757,6 +1763,7 @@ mod tests {
         let service = SessionRpcService {
             data: data.clone(),
             heartbeat_policy: HeartbeatPolicy::default(),
+            noise_v2_supported: false,
         };
 
         service
@@ -1900,6 +1907,7 @@ mod tests {
         let service = SessionRpcService {
             data: session_data.clone(),
             heartbeat_policy: HeartbeatPolicy::default(),
+            noise_v2_supported: false,
         };
 
         let err = service
@@ -1969,6 +1977,7 @@ mod tests {
         let service = SessionRpcService {
             data: session_data,
             heartbeat_policy: HeartbeatPolicy::default(),
+            noise_v2_supported: false,
         };
 
         let err = service
@@ -2186,6 +2195,7 @@ mod tests {
         let service = SessionRpcService {
             data: session_data.clone(),
             heartbeat_policy: HeartbeatPolicy::default(),
+            noise_v2_supported: false,
         };
 
         service
@@ -2232,6 +2242,7 @@ mod tests {
         let service = SessionRpcService {
             data: session_data,
             heartbeat_policy: HeartbeatPolicy::default(),
+            noise_v2_supported: false,
         };
 
         service

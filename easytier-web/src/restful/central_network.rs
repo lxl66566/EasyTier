@@ -373,6 +373,7 @@ mod tests {
             Arc::new(crate::webhook::WebhookConfig::new(
                 None, None, None, None, None,
             )),
+            None,
         ));
         let service = Arc::new(CentralNetworkService::new(db, manager));
         let Json(info) = CentralNetworkApi::gateway_info(Extension(service)).await;
@@ -400,6 +401,7 @@ mod tests {
             Arc::new(crate::webhook::WebhookConfig::new(
                 None, None, None, None, None,
             )),
+            None,
         ));
         let service = Arc::new(CentralNetworkService::with_gateway(
             db,

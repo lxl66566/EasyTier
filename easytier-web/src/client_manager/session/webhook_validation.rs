@@ -651,6 +651,7 @@ mod tests {
         SessionRpcService {
             data: session_data.clone(),
             heartbeat_policy: super::super::HeartbeatPolicy::default(),
+            noise_v2_supported: false,
         }
         .handle_heartbeat(fresh)
         .await

@@ -212,7 +212,8 @@ mod tests {
     use easytier_core::tunnel::{
         ring::create_ring_tunnel_pair,
         web_security::{
-            accept_or_upgrade_server_tunnel, upgrade_client_tunnel, web_secure_tunnel_supported,
+            ClientHandshakeMode, accept_or_upgrade_server_tunnel, upgrade_client_tunnel,
+            web_secure_tunnel_supported,
         },
     };
     use futures::SinkExt;
@@ -312,7 +313,9 @@ mod tests {
         let AcceptedTunnelRoute::Web(web_tunnel) = server_task.await.unwrap().unwrap() else {
             panic!("RPC packet must remain on the Web route");
         };
-        let (web_tunnel, secure) = accept_or_upgrade_server_tunnel(web_tunnel).await.unwrap();
+        let (web_tunnel, secure) = accept_or_upgrade_server_tunnel(web_tunnel, None)
+            .await
+            .unwrap();
         assert!(!secure);
         let (mut stream, _sink) = web_tunnel.split();
         assert_eq!(
@@ -341,9 +344,11 @@ mod tests {
             else {
                 panic!("Web Noise handshake must remain on the Web route");
             };
-            accept_or_upgrade_server_tunnel(tunnel).await.unwrap()
+            accept_or_upgrade_server_tunnel(tunnel, None).await.unwrap()
         });
-        let client_tunnel = upgrade_client_tunnel(client_tunnel).await.unwrap();
+        let client_tunnel = upgrade_client_tunnel(client_tunnel, ClientHandshakeMode::V1)
+            .await
+            .unwrap();
         let (server_tunnel, secure) = server_task.await.unwrap();
         assert!(secure);
 

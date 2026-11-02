@@ -1001,6 +1001,7 @@ mod tests {
             Arc::new(
                 WebhookConfig::new(None, None, None, None, None).with_handler(webhook.clone()),
             ),
+            None,
         );
         let (connections, listener) = tokio::sync::mpsc::unbounded_channel();
         manager.add_listener(Listener(listener)).await.unwrap();
@@ -1012,6 +1013,7 @@ mod tests {
             machine_id,
             "test-device",
             false,
+            None,
             core.clone(),
             None,
         );

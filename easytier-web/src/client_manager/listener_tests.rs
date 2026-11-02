@@ -1,4 +1,5 @@
 use super::*;
+use easytier_core::tunnel::web_security::ClientHandshakeMode;
 
 use easytier::proto::rpc::standalone::{
     RuntimeRpcListener, runtime_rpc_dialer, runtime_rpc_listener, runtime_udp_tunnel_listener,
@@ -91,6 +92,7 @@ async fn manager() -> ClientManager {
         Arc::new(crate::webhook::WebhookConfig::new(
             None, None, None, None, None,
         )),
+        None,
     )
 }
 
@@ -114,7 +116,7 @@ async fn accept_errors_rebind_listener_with_fixed_delay() {
         let client = runtime_rpc_dialer(url).connect().await.unwrap();
         let _client = timeout(
             Duration::from_secs(1),
-            web_security::upgrade_client_tunnel(client),
+            web_security::upgrade_client_tunnel(client, ClientHandshakeMode::V1),
         )
         .await
         .expect("listener did not recover after accept errors")
@@ -172,7 +174,7 @@ async fn slow_handshakes_do_not_block_other_clients() {
     let client = runtime_rpc_dialer(url).connect().await.unwrap();
     let _client = timeout(
         Duration::from_secs(1),
-        web_security::upgrade_client_tunnel(client),
+        web_security::upgrade_client_tunnel(client, ClientHandshakeMode::V1),
     )
     .await
     .expect("healthy client was blocked by idle connections")
@@ -239,7 +241,7 @@ async fn completed_handshake_does_not_cancel_pending_accept() {
 
     let _first = timeout(
         Duration::from_secs(1),
-        web_security::upgrade_client_tunnel(first),
+        web_security::upgrade_client_tunnel(first, ClientHandshakeMode::V1),
     )
     .await
     .unwrap()
@@ -248,7 +250,7 @@ async fn completed_handshake_does_not_cancel_pending_accept() {
     ready.notify_one();
     let _second = timeout(
         Duration::from_secs(1),
-        web_security::upgrade_client_tunnel(second),
+        web_security::upgrade_client_tunnel(second, ClientHandshakeMode::V1),
     )
     .await
     .expect("pending accept was cancelled when the first handshake completed")
